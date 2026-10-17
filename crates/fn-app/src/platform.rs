@@ -94,9 +94,21 @@ pub fn audit_capture(captured: bool, clip: Option<Rect>, client: Rect, cursor: O
     (ok, format!("{} clip={clip:?} client={client:?} cursor={cursor:?}: {why}", if captured { "captured" } else { "released" }))
 }
 
+/// Where to put the hidden pointer, or `None` to leave it alone: there must be a capture, a known client centre and an OS
+/// that reports the pointer's position (Windows). Off Windows the position is unreadable, so the pointer is never warped
+/// (the grab pins it anyway).
+pub fn recenter_target(captured: bool, center: Option<(f64, f64)>, cursor: Option<(i32, i32)>, client: Option<Rect>) -> Option<(f64, f64)> {
+    if !captured { return None; }
+    let c = center?;
+    let (p, cl) = (cursor?, client?);
+    let want = (cl.0 + c.0 as i32, cl.1 + c.1 as i32);
+    (p != want).then_some(c)
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // winit
 // ---------------------------------------------------------------------------------------------------------------------------------
+
 /// [`CursorOps`] over a real window.
 struct WindowCursor<'a> { window: &'a Window }
 impl WindowCursor<'_> {
@@ -230,13 +242,14 @@ impl WinitPlatform {
     pub fn is_exclusive(&self) -> bool { matches!(self.window.fullscreen(), Some(Fullscreen::Exclusive(_))) }
     /// Client centre in physical pixels (None for an empty / minimised client).
     pub fn client_center(&self) -> Option<PhysicalPosition<f64>> { WindowCursor { window: &self.window }.client_center().map(|(x, y)| PhysicalPosition::new(x, y)) }
-    /// Keeps the hidden pointer on the client centre. The grab already pins it there, so this only acts when the pointer is somewhere else (and so
-    /// does not flood the window with `CursorMoved` events every frame).
+    /// Keeps the hidden pointer on the client centre. The grab already pins it there, so this only acts when the OS can
+    /// report the pointer's position and it is somewhere else — see [`recenter_target`]. Without a verifiable position the
+    /// pointer is left alone: a blind warp every frame fights the device (on macOS `set_cursor_position` re-associates the
+    /// mouse with the cursor, so the reported motion cancels the warp and the view snaps back to where it started).
     pub fn recenter(&self) {
         if !self.captured { return; }
-        let Some(c) = self.client_center() else { return };
-        if let (Some(p), Some(cl)) = (sys::cursor_pos(), client_screen_rect(&self.window)) { if p == (cl.0 + c.x as i32, cl.1 + c.y as i32) { return; } }
-        let _ = self.window.set_cursor_position(c);
+        let target = recenter_target(true, self.client_center().map(|c| (c.x, c.y)), sys::cursor_pos(), client_screen_rect(&self.window));
+        if let Some((x, y)) = target { let _ = self.window.set_cursor_position(PhysicalPosition::new(x, y)); }
     }
     /// Reads the real OS clip rectangle and judges it (see [`audit_capture`]).
     pub fn audit(&self) -> Option<CaptureAudit> {
@@ -386,6 +399,19 @@ mod tests {
         fn set_visible(&mut self, v: bool) { self.log.borrow_mut().push(format!("visible {v}")); }
         fn release_clip(&mut self) { self.log.borrow_mut().push("release_clip".into()); }
         fn clip_ok(&self) -> Option<bool> { self.clip_ok }
+    }
+    #[test] fn the_pointer_is_only_warped_when_its_position_is_known_and_off_centre() {
+        let client = Some((100, 50, 1380, 770));
+        // captured, pointer readable and elsewhere -> warp to the client centre (640,360 absolute 740,410)
+        assert_eq!(recenter_target(true, Some((640., 360.)), Some((700, 400)), client), Some((640., 360.)));
+        // already at the centre -> nothing to do
+        assert_eq!(recenter_target(true, Some((640., 360.)), Some((740, 410)), client), None);
+        // no capture / no client centre -> nothing to do
+        assert_eq!(recenter_target(false, Some((640., 360.)), Some((0, 0)), client), None);
+        assert_eq!(recenter_target(true, None, Some((0, 0)), client), None);
+        // the OS cannot say where the pointer is (macOS, Linux): never warp blindly
+        assert_eq!(recenter_target(true, Some((640., 360.)), None, client), None);
+        assert_eq!(recenter_target(true, Some((640., 360.)), Some((0, 0)), None), None);
     }
     #[test] fn capture_centres_first_then_grabs_then_hides() {
         let mut m = Mock::ready();

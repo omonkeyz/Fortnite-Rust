@@ -47,8 +47,13 @@ use loader::Source;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Files needed in pak mode (everything else comes out of the paks).
-const PAK_MODE_REQUIRED: &[&str] = &["T_Grasslands_D.png", "dome_optimized.bin", "sunmoon.bin"];
+/// Files the runtime must have from the exported tree when running from paks (everything else is decoded in-process): the
+/// ground texture, the two sky meshes and the sky pass' textures (`fn_render::sky::TEXTURES`).
+fn pak_mode_required() -> Vec<&'static str> {
+    let mut v = vec!["T_Grasslands_D.png", "dome_optimized.bin", "sunmoon.bin"];
+    for (p, _) in fn_render::sky::TEXTURES { v.push(p.rsplit('/').next().unwrap_or(p)); }
+    v
+}
 
 /// Why start-up cannot continue, and how it is reported.
 #[derive(Debug)]
@@ -84,16 +89,17 @@ fn resolve(opts: &Options) -> Result<(AssetRoots, Source), Startup> {
     };
     let (n_paks, n_entries) = assets::probe_paks(&paks_dir).map_err(Startup::Other)?;
     eprintln!("[paks] {} : {n_paks} pak files, {n_entries} entries", paks_dir.display());
-    let still_missing = missing_in(&roots, PAK_MODE_REQUIRED);
+    let pak_required = pak_mode_required();
+    let still_missing = missing_in(&roots, &pak_required);
     if !still_missing.is_empty() {
         // textures / sky meshes are not decoded in-process: let fn-export produce them into a cache that is searched first
         let cache = assets::exe_dir().join("assets-cache");
-        let manifest = assets::find_manifest(opts.manifest.as_deref()).ok_or_else(|| Startup::MissingAssets(missing_assets_text(&still_missing, &format!("No asset-manifest.json was found for fn-export (use --manifest, FN_MANIFEST, or put it beside the exe), so the files cannot be exported from the paks.\n{}", assets::describe_search(opts.assets.as_deref(), opts.paks.as_deref())))))?;
+        let manifest = assets::find_manifest(opts.manifest.as_deref()).ok_or_else(|| Startup::MissingAssets(missing_assets_text(&still_missing, &format!("No asset-manifest.json was found for fn-export (use --manifest, FN_MANIFEST, or put it beside the exe or at tools/asset-manifest.json), so the files cannot be exported from the paks.\n{}", assets::describe_search(opts.assets.as_deref(), opts.paks.as_deref())))))?;
         eprintln!("[paks] exporting the missing files with fn-export into {} ...", cache.display());
         assets::export_from_paks(&paks_dir, &manifest, &cache, |l| eprintln!("[fn-export] {l}")).map_err(Startup::Other)?;
         let mut r = vec![cache]; r.extend(roots.roots.iter().cloned());
         roots = AssetRoots::open(r);
-        let still = missing_in(&roots, PAK_MODE_REQUIRED);
+        let still = missing_in(&roots, &pak_required);
         if !still.is_empty() { return Err(Startup::MissingAssets(missing_assets_text(&still, "The export from the paks finished but these files are still not there.\n"))); }
     }
     Ok((roots, Source::Paks(paks_dir)))

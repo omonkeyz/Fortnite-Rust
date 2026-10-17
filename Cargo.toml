@@ -10,7 +10,7 @@ version = "0.1.0"
 glam = "0.32.1"
 serde_json = "1"
 gltf = "1.4.1"
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl", "metal", "gles"] }
 winit = "0.30"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }

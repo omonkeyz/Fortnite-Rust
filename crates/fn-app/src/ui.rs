@@ -16,6 +16,7 @@ use fn_ui::screens::startup_loading::StartupLoadingScreen;
 use fn_ui::screens::{put_text, Snap};
 use fn_ui::text::FontId;
 use fn_ui_wgpu::UiRenderer;
+use std::path::PathBuf;
 
 pub struct UiLayer {
     pub ctx: UiContext,
@@ -39,10 +40,19 @@ pub fn pad_status(available: bool, connected: bool, last: Option<fn_game::inputd
 }
 
 impl UiLayer {
-    /// overlay = images the start-up worker decodes from the paks (front-end art); it is the first layer of the UI's asset source, the asset roots follow.
-    pub fn new(roots: &AssetRoots, device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, overlay: crate::app::startup::Overlay) -> Result<UiLayer, String> {
-        let source = fn_ui::assets::LayeredAssets::new(vec![Box::new(overlay), roots.ui_source()]);
-        let ctx = UiContext::new(Box::new(source))?;
+    /// overlay = images the start-up worker decodes from the paks (front-end art); it is the first layer of the UI's asset source, then the Fortnite
+    /// install itself when running from a `--paks` folder (fonts are only in the paks: `NotoSans-*.ufont`), then the asset roots.
+    pub fn new(roots: &AssetRoots, device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, overlay: crate::app::startup::Overlay, install: Option<PathBuf>) -> Result<UiLayer, String> {
+        let mut layers: Vec<Box<dyn fn_ui::assets::AssetSource>> = vec![Box::new(overlay)];
+        if let Some(dir) = install {
+            // the install may be missing/broken: the UI then falls back to the asset folders (and its message names the font it needs)
+            match fn_ui::pak_assets::PakAssets::open(&dir) {
+                Ok(pak) => layers.push(Box::new(pak)),
+                Err(e) => eprintln!("[ui] the Fortnite install is not usable for UI assets ({e}); using the asset folders only"),
+            }
+        }
+        layers.push(roots.ui_source());
+        let ctx = UiContext::new(Box::new(fn_ui::assets::LayeredAssets::new(layers)))?;
         let renderer = UiRenderer::with_device(device.clone(), queue, format);
         let mut menu = MenuSystem::new(ctx.fonts.clone());
         pages::register_all_into(&mut menu);

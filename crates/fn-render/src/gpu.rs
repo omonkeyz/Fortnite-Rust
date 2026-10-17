@@ -1,5 +1,5 @@
 //! Device / adapter setup and an offscreen render target with CPU read-back.
-//! Backends: Vulkan and DX12 only (no GL, no system C dependencies beyond the GPU driver).
+//! Backends: Metal on macOS, Vulkan and DX12 on Windows (no GL, no system C dependencies beyond the GPU driver).
 use std::sync::Arc;
 
 pub struct Gpu {
@@ -19,13 +19,24 @@ impl GpuErrorSink {
     pub fn total(&self) -> u64 { self.total.load(std::sync::atomic::Ordering::Relaxed) }
 }
 
-/// Backend selection: env `FN_BACKEND` (or wgpu's own `WGPU_BACKEND`) = `vulkan` | `dx12` restricts it, default is both (wgpu picks).
+/// The platform's native backends: Metal on macOS, Vulkan + DX12 elsewhere.
+pub fn default_backends() -> wgpu::Backends {
+    if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN | wgpu::Backends::DX12
+    }
+}
+
+/// Backend selection: env `FN_BACKEND` (or wgpu's own `WGPU_BACKEND`) = a single backend restricts it, default is the platform's own ([`default_backends`]).
 pub fn backends_from_env() -> wgpu::Backends {
     let v = std::env::var("FN_BACKEND").or_else(|_| std::env::var("WGPU_BACKEND"));
     match v.map(|s| s.to_ascii_lowercase()).as_deref() {
         Ok("vulkan") | Ok("vk") => wgpu::Backends::VULKAN,
         Ok("dx12") | Ok("d3d12") => wgpu::Backends::DX12,
-        _ => wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+        Ok("metal") | Ok("mtl") => wgpu::Backends::METAL,
+        Ok("gles") | Ok("gl") => wgpu::Backends::GL,
+        _ => default_backends(),
     }
 }
 

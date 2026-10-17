@@ -199,7 +199,7 @@ impl App {
         if sw > 0 && sh > 0 { gfx.resize(sw, sh); }
         window.set_visible(true);
         window.focus_window();
-        let ui = UiLayer::new(&self.roots, gfx.gpu.device.clone(), gfx.gpu.queue.clone(), gfx.format(), self.overlay.clone())?;
+        let ui = UiLayer::new(&self.roots, gfx.gpu.device.clone(), gfx.gpu.queue.clone(), gfx.format(), self.overlay.clone(), self.install_dir())?;
         eprintln!("[gpu] {}  [window] {}x{} {:?}  [vsync] {}", gfx.describe(), sw, sh, self.settings.video.window_mode, gfx.vsync);
         self.input.focused = window.has_focus() || self.opts.scripted();
         self.gfx = Some(gfx); self.platform = Some(platform); self.ui = Some(ui);

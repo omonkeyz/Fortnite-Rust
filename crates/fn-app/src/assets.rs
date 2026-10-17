@@ -138,12 +138,12 @@ pub fn probe_paks(paks_dir: &Path) -> Result<(usize, usize), String> {
 
 /// Runs `fn-export --md5` into `cache` (the pak -> glTF/PNG/md5anim/sky pipeline of the `fn-export` crate). `progress` receives its stdout lines.
 pub fn export_from_paks(paks_dir: &Path, manifest: &Path, cache: &Path, mut progress: impl FnMut(&str)) -> Result<(), String> {
-    let exe = exe_dir().join(if cfg!(windows) { "fn-export.exe" } else { "fn-export" });
-    if !exe.is_file() { return Err(format!("fn-export not found beside the game ({}); build it with `cargo build -p fn-export --release` or use --assets", exe.display())); }
+    let exe = find_fn_export();
     std::fs::create_dir_all(cache).map_err(|e| format!("{}: {e}", cache.display()))?;
     let mut child = std::process::Command::new(&exe)
         .args(["--paks".as_ref(), paks_dir.as_os_str(), "--manifest".as_ref(), manifest.as_os_str(), "--out".as_ref(), cache.as_os_str(), "--md5".as_ref(), "all".as_ref()])
-        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn()
+        .map_err(|e| format!("cannot start fn-export ({}: {e}); build it with `cargo build -p fn-export --release`, keep it beside the game, or set FN_EXPORT, or use --assets", exe.display()))?;
     if let Some(out) = child.stdout.take() {
         use std::io::BufRead;
         for line in std::io::BufReader::new(out).lines().map_while(Result::ok) { progress(&line); }
@@ -152,13 +152,35 @@ pub fn export_from_paks(paks_dir: &Path, manifest: &Path, cache: &Path, mut prog
     if status.success() { Ok(()) } else { Err(format!("fn-export exited with {status}")) }
 }
 
-/// The manifest `fn-export` needs: `--manifest`, env `FN_MANIFEST`, or `asset-manifest.json` beside the executable.
+/// The manifest `fn-export` needs: `--manifest`, env `FN_MANIFEST`, `asset-manifest.json` beside the executable, then a
+/// development checkout's `tools/asset-manifest.json` (and `asset-manifest.json`) relative to the current directory.
 pub fn find_manifest(explicit: Option<&Path>) -> Option<PathBuf> {
     let mut c: Vec<PathBuf> = Vec::new();
     if let Some(p) = explicit { c.push(p.to_path_buf()); }
     if let Some(p) = std::env::var_os("FN_MANIFEST") { c.push(PathBuf::from(p)); }
     c.push(exe_dir().join("asset-manifest.json"));
+    c.push(PathBuf::from("tools").join("asset-manifest.json"));
+    c.push(PathBuf::from("asset-manifest.json"));
     c.into_iter().find(|p| p.is_file())
+}
+
+/// Where the `fn-export` executable may be, in priority order: beside the game, `FN_EXPORT`, then the sibling cargo
+/// profile directories of a development checkout (`target/<profile>`), then bare `fn-export` (resolved through `PATH`).
+pub fn fn_export_locations(exe_dir: &Path, env_export: Option<PathBuf>) -> Vec<PathBuf> {
+    let name = if cfg!(windows) { "fn-export.exe" } else { "fn-export" };
+    let mut c = vec![exe_dir.join(name)];
+    if let Some(p) = env_export { c.push(p); }
+    if let Some(target) = exe_dir.parent() {
+        for profile in ["release", "debug"] { c.push(target.join(profile).join(name)); }
+    }
+    c.push(PathBuf::from(name));
+    c
+}
+
+/// The `fn-export` executable to run: the first existing candidate of [`fn_export_locations`] (bare `fn-export` when
+/// none exists, so the spawn error names it).
+pub fn find_fn_export() -> PathBuf {
+    fn_export_locations(&exe_dir(), std::env::var_os("FN_EXPORT").map(PathBuf::from)).into_iter().find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "fn-export.exe" } else { "fn-export" }))
 }
 #[cfg(test)]
 mod tests {
@@ -183,6 +205,15 @@ mod tests {
         // no developer path may be compiled into the binary's discovery code
         let src = include_str!("assets.rs");
         for needle in [["Users", "Brady"].join("\\"), ["Fortnite", "Runtime", "assets"].join("\\"), "CARGO_MANIFEST_DIR\")).join".to_owned()] { assert!(!src.split("mod tests").next().unwrap().contains(&needle), "baked developer path {needle}"); }
+    }
+    #[test] fn fn_export_locations_prefer_beside_the_exe_then_env_then_the_dev_target() {
+        let exe = Path::new("/g/target/fast");
+        let l = fn_export_locations(exe, Some(PathBuf::from("/opt/fn-export")));
+        let name = if cfg!(windows) { "fn-export.exe" } else { "fn-export" };
+        assert_eq!(l, vec![exe.join(name), PathBuf::from("/opt/fn-export"), Path::new("/g/target/release").join(name), Path::new("/g/target/debug").join(name), PathBuf::from(name)]);
+        let bare = fn_export_locations(Path::new("."), None);
+        assert_eq!(bare.first(), Some(&PathBuf::from(".").join(name)));
+        assert_eq!(bare.last(), Some(&PathBuf::from(name)));
     }
     #[test] fn the_search_description_names_every_place_and_its_state() {
         let d = describe_search(Some(Path::new("Z:/definitely/not/here")), None);
