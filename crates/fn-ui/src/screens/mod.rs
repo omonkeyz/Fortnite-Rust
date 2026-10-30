@@ -43,10 +43,15 @@ pub mod athena_locker; // LOCKER: the BR Locker tab (AthenaCustomizationTab) + t
 pub mod inventory_panel; // WIDGETS3 HOOK: AthenaInventoryPanel
 pub mod inventory_cooked; // INVENTORY FIX2: AthenaInventoryPanel / QuantitySelector composed from the cooked widget trees (generic UMG runtime of athena_lobby)
 pub mod item_header; // PICKUP CARD: ItemDetailsHeader_C runtime fill shared by the inventory details and the pickup card
+pub mod team_indicator_cooked;
 pub mod interaction_cooked; // PICKUP CARD: InteractionIndicator_C (+ HUD-PickupItemWidget) composed from the cooked widget trees
 pub mod frontend_cooked; // FRONT END: LoginScreen_C ("Logging In...") + SubgameSelectScreen_C (game picker) composed from the cooked widget trees
 pub mod build_quickbar; // BUILD HUD: AthenaQuickbarSecondary (building quickbar)
 pub mod aerial_feedback;
+pub mod radial_picker_cooked;
+pub mod hud_cooked;
+pub mod pickup_stream;
+pub mod health_bar;
 pub mod hold_ring; // CONTAINERS: KeybindWidget hold ring (HollowCircularProgressBar) of a hold interaction
 
 use crate::assets::{Sampler, TexInfo};

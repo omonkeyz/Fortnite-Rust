@@ -6,7 +6,30 @@
 //! (offset 24) gives the slice length.  The stream's byte offset inside the file is the shader id used by the old reports (`shader_<id>`).
 
 use crate::container::{resign, Container};
-use miniz_oxide::inflate::decompress_to_vec_zlib_with_limit;
+use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
+use miniz_oxide::inflate::TINFLStatus;
+
+fn decompress_to_vec_zlib_with_limit(mut input: &[u8], max_output_size: usize) -> Result<Vec<u8>, TINFLStatus> {
+    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    let mut ret: Vec<u8> = vec![0; input.len().saturating_mul(2).min(max_output_size).min(32 << 10)];
+    let mut decomp = Box::<DecompressorOxide>::default();
+    let mut out_pos = 0;
+    loop {
+        let (status, in_consumed, out_consumed) = decompress(&mut decomp, input, &mut ret, out_pos, flags);
+        out_pos += out_consumed;
+        match status {
+            TINFLStatus::Done => { ret.truncate(out_pos); return Ok(ret); }
+            TINFLStatus::HasMoreOutput => {
+                if in_consumed > input.len() { return Err(status); }
+                input = &input[in_consumed..];
+                if ret.len() >= max_output_size { return Err(status); }
+                let new_len = ret.len().saturating_mul(2).min(max_output_size);
+                ret.resize(new_len, 0);
+            }
+            _ => return Err(status),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Blob {

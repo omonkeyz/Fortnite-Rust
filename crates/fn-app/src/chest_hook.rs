@@ -10,7 +10,7 @@
 //!   6 on disk): `OnLoot` (211) = `pushflow 272` -> `Closed_Chest.Deactivate`, `SetLightVisibility(false)`, `jump 15` = `Chest_Ambient_Sound.FadeOut(3, 0)`,
 //!   pop -> the burst; `OnSetSearched` / `ReceiveDestroyed` (846 / 841) `jump 216` = the same Deactivate / light off / FadeOut chain: the hum fades out over
 //!   3 s when the chest is searched. `TrasureLight` (PointLightComponent, 1700 / 300 cm / (255,192,139), destroyed by the
-//!   construction script below High effects) is NOT DRAWN: the world renderer has no local-light path ([`report`]).
+//!   construction script below High effects) is lit by `local_lights_hook` (fn-render local_lights.rs) while the chest is live and unsearched ([`trasure_light_states`]).
 //! * the search: the Use hold on the focused container (the interaction trace of the pickups / doors), `SearchingSoundCueLoop` on the container while it runs
 //!   (`FadeOut(1.0)` when it ends), the prompt "Search" with the KeybindWidget hold ring; on completion the chest's `OnLoot` (`Tiered_Chest_Open_T01_Cue`
 //!   at the actor, `Closed_Chest.Deactivate`, light off, `P_Loot_Chest_T1` at the actor turned pitch + 90 with `color` = `RarityData[HighestRarity].Color2`),
@@ -66,12 +66,14 @@ pub struct Data {
     pub rarity_color2: Vec<[f32; 4]>,
     pub classes: HashMap<String, Arc<ClassDef>>,
     pub search_speed: HashMap<String, f32>,
+    pub jiggle: [Option<fn_building::visual::RichCurve>; 4],
 }
 impl Data {
     /// The loot tier of a class (the `LootTier` of its Athena tier group's rows: AthenaTreasure 0, AthenaAmmoLarge 1 in 1.8).
     pub fn tier(&self, d: &ClassDef) -> i32 { ct::athena_tier_group(&d.tier_group).and_then(|g| self.tables.tiers_of(g).next()).map_or(0, |r| r.loot_tier) }
 }
 static DATA: OnceLock<Result<Arc<Data>, String>> = OnceLock::new();
+pub fn data_ready() -> Option<Result<Arc<Data>, String>> { DATA.get().cloned() }
 pub fn data() -> Result<Arc<Data>, String> {
     DATA.get_or_init(|| {
         let t = std::time::Instant::now();
@@ -79,10 +81,12 @@ pub fn data() -> Result<Arc<Data>, String> {
         let tables = LootTables::load(&set)?;
         let rarity_color2 = ct::rarity_color2(&set)?;
         let search_speed = ct::search_speed_table(&set)?;
+        let jiggle = [ct::JIGGLE_LOOT_MAGNITUDE, ct::JIGGLE_LOOT_ANGLE, ct::JIGGLE_EMPTY_MAGNITUDE, ct::JIGGLE_EMPTY_ANGLE].map(|p| match fn_building::visual::load_float_curve(&set, p) { Ok(c) => Some(c), Err(e) => { eprintln!("[chests] {e}: no search jiggle"); None } });
         let mut classes = HashMap::new();
         for c in CLASSES { match ct::load_class(&set, c) { Ok(d) => { classes.insert(c.to_owned(), Arc::new(d)); } Err(e) => eprintln!("[chests] {c}: {e}") } }
+        match ct::load_class_at(&set, crate::floor_loot_hook::FLOOR_LOOT_PACKAGE, crate::floor_loot_hook::FLOOR_LOOT_CLASS) { Ok(d) => { classes.insert(crate::floor_loot_hook::FLOOR_LOOT_CLASS.to_owned(), Arc::new(d)); } Err(e) => eprintln!("[floor-loot] {e}") }
         eprintln!("[chests] loot tables: {} tier rows, {} package rows; {} container classes; read in {:.0} ms", tables.tiers.len(), tables.packages.len(), classes.len(), t.elapsed().as_secs_f32() * 1000.);
-        Ok(Arc::new(Data { tables, rarity_color2, classes, search_speed }))
+        Ok(Arc::new(Data { tables, rarity_color2, classes, search_speed, jiggle }))
     }).clone()
 }
 
@@ -136,6 +140,7 @@ struct Cont {
     search_loop_on: bool,
     light_visible: bool,
     destroyed: bool,
+    bounce: Option<f64>,
 }
 impl Cont { fn live(&self) -> bool { self.spawned && kind_enabled(self.kind) } }
 
@@ -157,8 +162,11 @@ struct State {
     errors: std::collections::HashSet<String>,
     counts: (usize, usize, usize, usize),
     opened: usize,
+    clock: f64,
+    equip: Option<(usize, bool)>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> { let mut g = STATE.lock().unwrap_or_else(|p| p.into_inner()); g.as_mut().map(f) }
 
 /// FX space (UE cm about the game origin) <-> sim metres.
@@ -191,8 +199,9 @@ pub fn init(install: Option<PathBuf>, roots: &[PathBuf]) {
     };
     let seed = fn_live::var("FN_CHEST_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64));
     std::thread::spawn(|| { if let Err(e) = data() { eprintln!("[chests] cooked data unavailable ({e}): containers cannot be searched"); } });
+    WARMED.store(false, std::sync::atomic::Ordering::Relaxed);
     *STATE.lock().unwrap() = Some(State { poi: None, data: None, conts: vec![], catalog, install, dxbc: None, bursts: vec![], seed, props_len: usize::MAX, focus: None, use_was_down: false,
-        eye_ue: Vec3::ZERO, serial: 0, log: vec![], errors: Default::default(), counts: (0, 0, 0, 0), opened: 0 });
+        eye_ue: Vec3::ZERO, serial: 0, log: vec![], errors: Default::default(), counts: (0, 0, 0, 0), opened: 0, clock: 0., equip: None });
 }
 
 fn dxbc<'a>(slot: &'a mut Option<Result<Dxbc, String>>, install: &Option<PathBuf>, fx: &mut FxRenderer) -> Option<&'a mut Dxbc> {
@@ -217,6 +226,7 @@ fn draw(dx: &mut Dxbc, fx: &mut FxRenderer, cat: &Catalog, inst: &Instance, eye:
 
 /// FIRST USE: builds the chest particle materials under the loading screen (one throw-away frame of both systems).
 pub fn prebuild(fx: &mut FxRenderer) {
+    if WARMED.load(std::sync::atomic::Ordering::Relaxed) { return; }
     with(|st| {
         let Some(cat) = st.catalog.clone() else { return };
         let t = std::time::Instant::now();
@@ -230,6 +240,7 @@ pub fn prebuild(fx: &mut FxRenderer) {
             draw(dx, fx, &cat, &i, [0., 2., 3.], 1. / 60., &mut st.errors);
         }
         let _ = dx.take_frame();
+        WARMED.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[chests] warm-up: chest particle materials built in {:.0} ms", t.elapsed().as_secs_f32() * 1000.);
     });
 }
@@ -243,7 +254,7 @@ fn sync(st: &mut State, sim: &mut GameSim) {
         st.conts = poi.containers.iter().enumerate().map(|(i, c)| {
             let def = d.classes.get(&c.class).cloned();
             let kind = kind_of(def.as_deref(), &c.class);
-            Cont { poi: i, kind, def, spawned: true, search: ct::Search::default(), prop: None, searched_prop: None, closed: None, closed_active: false, ambient_on: false, search_loop_on: false, light_visible: false, destroyed: false }
+            Cont { poi: i, kind, def, spawned: true, search: ct::Search::default(), prop: None, searched_prop: None, closed: None, closed_active: false, ambient_on: false, search_loop_on: false, light_visible: false, destroyed: false, bounce: None }
         }).collect();
         st.poi = Some(poi.clone());
         st.props_len = usize::MAX;
@@ -284,13 +295,22 @@ fn sync(st: &mut State, sim: &mut GameSim) {
 
 /// One frame (after the doors): the Use hold, the search, the open, the loot, the loops. `use_down` = the Use binding is held; `blocked` = a pickup or a
 /// door has the focus this frame (CHOSEN as the doors: one interaction per press, earlier hooks first). Returns the sounds.
-pub fn frame(sim: &mut GameSim, use_down: bool, blocked: bool, dt: f32) -> Vec<SoundEvent> {
+pub fn frame(sim: &mut GameSim, use_down: bool, blocked: bool, equip: (usize, bool), dt: f32) -> Vec<SoundEvent> {
     let mut sounds = vec![];
     let mut tosses: Vec<(String, u32, Vec3, Vec3)> = vec![];
     let gravity_cm = { let p = fn_movement::cmc::Params::default().with_tuning(&sim.tuning); (p.world_gravity_z * p.gravity_scale).abs() };
     with(|st| {
+        st.clock += dt as f64;
+        let equip_changed = st.equip.is_some_and(|e| e != equip);
+        st.equip = Some(equip);
         sync(st, sim);
         let (Some(poi), Some(d)) = (st.poi.clone(), st.data.clone()) else { return };
+        for i in BOT_OPENS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default() {
+            if !st.conts.get(i).is_some_and(|c| c.live() && !c.search.searched() && !c.destroyed) { continue; }
+            st.conts[i].search = ct::Search { state: ct::SearchState::Searched, elapsed: 0., duration: 0. };
+            let top_cm = st.conts[i].prop.and_then(|pi| sim.world.props.get(pi)).map(|h| (h.pos.y + h.height) * 100.);
+            open(st, i, &poi, &d, sim.frames, gravity_cm, top_cm, &mut sounds, &mut tosses);
+        }
         for i in 0..st.conts.len() {
             let c = &st.conts[i];
             if c.destroyed || !c.live() || c.search.searched() { continue; }
@@ -342,7 +362,7 @@ pub fn frame(sim: &mut GameSim, use_down: bool, blocked: bool, dt: f32) -> Vec<S
             if !focused && !st.conts[i].search.active() { continue; }
             let def = st.conts[i].def.clone();
             let duration = def.as_deref().map_or(ct::SEARCH_TIME_FALLBACK, |c| ct::search_time(c, d.tier(c), &d.search_speed));
-            let ev = st.conts[i].search.update(&ct::SearchInput { use_down: down, use_pressed: pressed, focused, duration }, dt);
+            let ev = st.conts[i].search.update(&ct::SearchInput { use_down: down, use_pressed: pressed, focused, duration, cancel: equip_changed }, dt);
             let pc = &poi.containers[st.conts[i].poi];
             let at = to_game(pc.t);
             let key = LOOP_KEY_BASE + 2 * i as u32 + 1;
@@ -354,7 +374,7 @@ pub fn frame(sim: &mut GameSim, use_down: bool, blocked: bool, dt: f32) -> Vec<S
                     }
                     ct::SearchEvent::Interrupted | ct::SearchEvent::Complete => {
                         if st.conts[i].search_loop_on { sounds.push(SoundEvent::ContainerLoopStop { key, fade: ct::SEARCH_LOOP_FADE }); st.conts[i].search_loop_on = false; }
-                        if e == ct::SearchEvent::Interrupted { st.log.push(format!("[chests] f{} search interrupted: {} #{i}", sim.frames, pc.class)); }
+                        if e == ct::SearchEvent::Interrupted { st.log.push(format!("[chests] f{} search interrupted: {} #{i}{}", sim.frames, pc.class, if equip_changed { " (equipment changed)" } else { "" })); }
                         else { let top_cm = st.conts[i].prop.and_then(|pi| props.get(pi)).map(|h| (h.pos.y + h.height) * 100.); open(st, i, &poi, &d, sim.frames, gravity_cm, top_cm, &mut sounds, &mut tosses); }
                     }
                 }
@@ -369,10 +389,38 @@ pub fn frame(sim: &mut GameSim, use_down: bool, blocked: bool, dt: f32) -> Vec<S
             if want && !c.ambient_on { if let Some(cue) = fn_audio_sink::container_cue(AMBIENT_CUE) { sounds.push(SoundEvent::ContainerLoop { cue, key: LOOP_KEY_BASE + 2 * i as u32, pos: Some(to_game(pc.t)) }); c.ambient_on = true; } }
             if !want && c.ambient_on { sounds.push(SoundEvent::ContainerLoopStop { key: LOOP_KEY_BASE + 2 * i as u32, fade: 0. }); c.ambient_on = false; }
         }
+        let fwd_ue = to_ue(fwd);
+        let pawn_yaw = fwd_ue.y.atan2(fwd_ue.x).to_degrees();
+        jiggle_mids(st, &poi, &d, pawn_yaw);
         for l in st.log.drain(..) { eprintln!("{l}"); }
     });
     for (item, count, a, b) in tosses { crate::pickups_hook::queue_toss(&item, count, a, b); }
     sounds
+}
+
+fn jiggle_mids(st: &mut State, poi: &crate::poi::PoiSet, d: &Data, pawn_yaw: f32) {
+    let loot_curves = fn_live::var("FN_CHEST_JIGGLE").is_ok_and(|v| v == "loot");
+    let (mi, ai) = if loot_curves { (0, 1) } else { (2, 3) };
+    let (Some(mag), Some(ang)) = (d.jiggle[mi].as_ref(), d.jiggle[ai].as_ref()) else { return };
+    let mut m = HashMap::new();
+    for c in st.conts.iter_mut() {
+        let Some(t0) = c.bounce else { continue };
+        let since = (st.clock - t0) as f32;
+        if since >= ct::BOUNCE_WINDOW || c.destroyed { c.bounce = None; continue; }
+        let Some(def) = c.def.as_deref() else { continue };
+        let pc = &poi.containers[c.poi];
+        let center = ct::bounce_center(def, pc.t, pc.q, pc.s);
+        let radius = ct::bounce_radius(def);
+        let (v, hit) = ct::jiggle(&|t| mag.eval(t), mag.time_range(), &|t| ang.eval(t), ang.time_range(), since, pawn_yaw);
+        let mid = Arc::new(crate::statics_render::ActorMid {
+            scalars: vec![("Code_HitAnimation", hit), ("WSDamageRadius", if radius <= 0. { 0. } else { 1. / radius }), ("InvertDamageFalloff", 0.)],
+            vectors: vec![("WSDeformationCenter", [center.x, center.y, center.z, 1.]), ("Code_DeformationVector", [v.x, v.y, v.z, 1.])],
+        });
+        if trace_on() { st.log.push(format!("[chests] jiggle {} t {since:.3} s: Code_DeformationVector ({:.3}, {:.3}, {:.3}) Code_HitAnimation {hit:.3} centre ({:.0}, {:.0}, {:.0}) radius {radius:.0} (pawn yaw {pawn_yaw:.1}, {} curves)", pc.class, v.x, v.y, v.z, center.x, center.y, center.z, if loot_curves { "SeachLoot" } else { "SeachEmptyLoot" })); }
+        if pc.searched_actor != crate::poi::NO_CLUSTER { m.insert(pc.searched_actor, mid.clone()); }
+        m.insert(pc.actor, mid);
+    }
+    crate::statics_render::set_actor_mids(m);
 }
 
 /// Search complete: `OnLoot` (chest), the loot, the searched mesh.
@@ -413,6 +461,7 @@ fn open(st: &mut State, i: usize, poi: &crate::poi::PoiSet, d: &Data, frame: u32
         }
     }
     // vfunc_428: marked searched, SearchedMesh swapped in (the harvestables swap on the next sync)
+    st.conts[i].bounce = Some(st.clock);
     st.props_len = usize::MAX;
     st.opened += 1;
 }
@@ -473,6 +522,27 @@ pub fn prompt(key: &str) -> Option<(String, String, Vec3, f32)> {
 }
 
 /// A container search hold runs this frame (`GA_DefaultPlayer_InteractSearch` active: the pawn plays its Search montage, see `Arms::set_interact_search`).
+pub fn trasure_light_states() -> Vec<(u32, bool)> {
+    with(|st| { let Some(poi) = st.poi.clone() else { return vec![] }; st.conts.iter().filter(|c| c.kind == Kind::Chest).map(|c| (poi.containers[c.poi].actor, c.live() && !c.search.searched() && !c.destroyed)).collect() }).unwrap_or_default()
+}
+pub const BOT_CHEST_BASE: u64 = 0x4348_0000_0000_0000;
+static BOT_OPENS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+pub fn bot_list(center: Vec3, r: f32, out: &mut Vec<(u64, Vec3)>) {
+    with(|st| {
+        let Some(poi) = st.poi.clone() else { return };
+        for (i, c) in st.conts.iter().enumerate() {
+            if c.kind != Kind::Chest || !c.live() || c.search.searched() || c.destroyed { continue; }
+            let p = to_game(poi.containers[c.poi].t);
+            if (p - center).length() <= r { out.push((BOT_CHEST_BASE + i as u64, p)); }
+        }
+    });
+}
+pub fn bot_open(id: u64) -> bool {
+    let Some(i) = id.checked_sub(BOT_CHEST_BASE).map(|i| i as usize) else { return false };
+    let ok = with(|st| st.conts.get(i).is_some_and(|c| c.live() && !c.search.searched() && !c.destroyed)).unwrap_or(false);
+    if ok { if let Ok(mut q) = BOT_OPENS.lock() { q.push(i); } }
+    ok
+}
 pub fn searching() -> bool { with(|st| st.conts.iter().any(|c| c.search.active())).unwrap_or(false) }
 
 /// Run report line.
@@ -481,13 +551,25 @@ pub fn report() -> String {
         if st.conts.is_empty() { return String::new(); }
         let (cp, cs, ap, asp) = st.counts;
         let lights: usize = st.poi.as_ref().map_or(0, |p| st.conts.iter().filter(|c| c.spawned).map(|c| p.containers[c.poi].lights.len()).sum());
-        format!("chests: {cp} chests placed / {cs} spawned, {ap} ammo boxes placed / {asp} spawned, {} searched; closed-chest FX live {}; TrasureLight NOT DRAWN ({lights} point lights: no local-light path in the world renderer)\n", st.opened, st.conts.iter().filter(|c| c.closed.is_some()).count())
+        format!("chests: {cp} chests placed / {cs} spawned, {ap} ammo boxes placed / {asp} spawned, {} searched; closed-chest FX live {}; {lights} TrasureLight point lights on spawned chests, lit by the local-light path until searched\n", st.opened, st.conts.iter().filter(|c| c.closed.is_some()).count())
     }).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn the_container_materials_take_the_search_jiggle() {
+        let Ok(set) = fn_pak::PakSet::open_install(fn_fx::default_install()) else { return };
+        for m in ["/Game/Environments/Props/Boxes/Materials/MI_TreasureChestlvl1.MI_TreasureChestlvl1", "/Game/Environments/Props/Boxes/Materials/MI_LOOT_ShortAmmoCrate.MI_LOOT_ShortAmmoCrate"] {
+            let mat = fn_fx::material::Material::load(&set, m).unwrap();
+            let (a, x, b) = fn_fx::data::package_files(&set, &mat.shader_map_package).unwrap();
+            let p = fn_ueio::Package::parse(&a, &x, &b).unwrap();
+            let fl = fn_fx::uniform::compilation_flags(&x, &p.names);
+            let u = format!("{:?}", mat.uniform);
+            assert!(fl.is_some_and(|f| f.uses_world_position_offset && f.modifies_mesh_position), "{m}: {fl:?}");
+            for n in ["WSDeformationCenter", "Code_DeformationVector", "Code_HitAnimation", "WSDamageRadius"] { assert!(u.contains(&format!("\"{n}\"")), "{m}: {n}"); }
+        }
+    }
     #[test] fn the_open_burst_points_up_from_an_upright_chest() {
         let q = Quat::from_rotation_z(30f32.to_radians());
         let (yaw, pitch, roll) = rotator(q);

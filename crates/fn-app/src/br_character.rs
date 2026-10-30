@@ -55,15 +55,20 @@ fn image(t: &Option<fn_pose::br_character::RgbaTexture>) -> Option<image::RgbaIm
     let t = t.as_ref()?;
     image::RgbaImage::from_raw(t.width as u32, t.height as u32, t.rgba.clone())
 }
+pub(crate) fn stub_image() -> image::RgbaImage { image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255])) }
+fn image_or_cooked(t: &Option<fn_pose::br_character::RgbaTexture>) -> (Option<image::RgbaImage>, Option<Arc<fn_render::mesh::CookedTexture>>) {
+    match t.as_ref().and_then(cooked_of) { Some(c) => (Some(stub_image()), Some(c)), None => (image(t), None) }
+}
 
 /// TEXTURE MEMORY (2026-10-06): the cooked mip chain of a texture as the renderer uploads it (`MaterialImages::cooked`, `FixedTexture::cooked`): what UE
 /// draws instead of mips generated from the top mip. The BC blocks as they are when the device takes them (`fn_render::fx::bc_native_hint`, level 0 a
 /// multiple of 4), else every stored mip decoded to RGBA8 with the decode `decode_texture` uses for the top mip. `None` (no chain, a level that does not
 /// decode) keeps the old upload.
-fn cooked_of(t: &fn_pose::br_character::RgbaTexture) -> Option<Arc<fn_render::mesh::CookedTexture>> {
+pub(crate) fn cooked_of(t: &fn_pose::br_character::RgbaTexture) -> Option<Arc<fn_render::mesh::CookedTexture>> { cooked_chain(t.cooked.as_ref()?) }
+pub(crate) fn cooked_texture(t: &fn_texture::Texture2D) -> Option<Arc<fn_render::mesh::CookedTexture>> { cooked_chain(&fn_pose::br_character::CookedChain::of(t)?) }
+pub(crate) fn cooked_chain(c: &fn_pose::br_character::CookedChain) -> Option<Arc<fn_render::mesh::CookedTexture>> {
     use fn_render::fx::FxTexFormat as F;
     use fn_texture::PixelFormat as P;
-    let c = t.cooked.as_ref()?;
     let (w0, h0, _) = c.levels.first()?;
     let bc = match c.format { P::Dxt1 => Some(F::Bc1), P::Dxt3 => Some(F::Bc2), P::Dxt5 => Some(F::Bc3), P::Bc4 => Some(F::Bc4), P::Bc5 => Some(F::Bc5), P::Bc7 => Some(F::Bc7), _ => None };
     if let Some(format) = bc.filter(|_| fn_render::fx::bc_native_hint() && w0 % 4 == 0 && h0 % 4 == 0) {
@@ -81,7 +86,9 @@ fn cooked_of(t: &fn_pose::br_character::RgbaTexture) -> Option<Arc<fn_render::me
 fn fixed(t: &fn_pose::br_material::FixedTex) -> Option<fn_render::char_material::FixedTexture> {
     use fn_render::char_material::{Addr, FixedTexture};
     let addr = |s: &str| match s { "TA_Clamp" => Addr::Clamp, "TA_Mirror" => Addr::Mirror, _ => Addr::Wrap };
-    Some(FixedTexture { image: image::RgbaImage::from_raw(t.tex.width as u32, t.tex.height as u32, t.tex.rgba.clone())?, srgb: t.srgb, address: [addr(&t.address[0]), addr(&t.address[1])], cooked: cooked_of(&t.tex) })
+    let cooked = cooked_of(&t.tex);
+    let image = if cooked.is_some() { stub_image() } else { image::RgbaImage::from_raw(t.tex.width as u32, t.tex.height as u32, t.tex.rgba.clone())? };
+    Some(FixedTexture { image, srgb: t.srgb, address: [addr(&t.address[0]), addr(&t.address[1])], cooked })
 }
 
 /// The original compiled material of a section (head / hair / body skin shader, or the eyeshadow modulate overlay), when the section has one.
@@ -89,7 +96,7 @@ fn ue_material(prim: &fn_pose::SkinPrim, s: &SectionTextures) -> Option<Arc<fn_r
     use fn_render::char_material::{CharMaterial, CharPerm, EyeshadowOverlay, UeMaterial};
     if let Some(u) = &s.ue {
         let perm = match u.perm { "head" => CharPerm::Head, "hair" => CharPerm::Hair, _ => CharPerm::Body };
-        return Some(Arc::new(UeMaterial::Char(CharMaterial { perm, cb: u.cb.clone(), noise: fixed(&u.noise)?, res_in: [fixed(&u.res_in[0])?, fixed(&u.res_in[1])?, fixed(&u.res_in[2])?] })));
+        return Some(Arc::new(UeMaterial::Char(CharMaterial { perm, cb: u.cb.clone(), noise: fixed(&u.noise)?, res_in: [fixed(&u.res_in[0])?, fixed(&u.res_in[1])?, fixed(&u.res_in[2])?], tangents: prim.tangents.clone() })));
     }
     if let Some(e) = &s.eyeshadow {
         // vertex colour of the painted eyeshadow mask (a mesh without vertex colours supplies white)
@@ -103,8 +110,8 @@ fn ue_material(prim: &fn_pose::SkinPrim, s: &SectionTextures) -> Option<Arc<fn_r
 pub fn primitives(p: &BrPart) -> Vec<SkinnedPrimitive> {
     p.part.prims.iter().zip(&p.sections).filter(|(_, s): &(_, &SectionTextures)| s.hidden.is_none()).map(|(prim, s)| {
         let vertices = (0..prim.positions.len()).map(|i| SkinnedVertex { pos: prim.positions[i], normal: prim.normals[i], uv: prim.uvs[i], joints: prim.joints[i], weights: prim.weights[i] }).collect();
-        let cooked = |t: &Option<fn_pose::br_character::RgbaTexture>| t.as_ref().and_then(cooked_of); // TEXTURE MEMORY: the cooked mip chains
-        let material = MaterialImages { diffuse: image(&s.diffuse), normal: image(&s.normal), spec: image(&s.spec), mask: image(&s.mask), ue: ue_material(prim, s), two_sided: s.two_sided, cooked: [cooked(&s.diffuse), cooked(&s.normal), cooked(&s.spec), cooked(&s.mask)] };
+        let ((di, dc), (ni, nc), (si, sc), (mi, mc)) = (image_or_cooked(&s.diffuse), image_or_cooked(&s.normal), image_or_cooked(&s.spec), image_or_cooked(&s.mask));
+        let material = MaterialImages { diffuse: di, normal: ni, spec: si, mask: mi, ue: ue_material(prim, s), two_sided: s.two_sided, cooked: [dc, nc, sc, mc] };
         SkinnedPrimitive { vertices, indices: prim.indices.clone(), material, kind: MaterialKind::Character }
     }).collect()
 }
@@ -119,6 +126,7 @@ pub fn from_character(ch: &BrCharacter) -> BrModel {
         }
     }
     report.extend(ch.notes.iter().cloned());
+    crate::elim_fx::set_shell_parts(ch.parts.iter().take(2).map(|p| crate::elim_fx::ShellPart { mesh: p.def.skeletal_mesh.clone(), joints: p.part.joints.iter().map(|j| p.part.tree.names[*j].clone()).collect(), materials: p.section_materials.clone() }).collect());
     BrModel { hero: ch.hero.clone(), rig_parts: ch.rig_parts(), body: primitives(&ch.parts[0]), head: primitives(&ch.parts[1]), report }
 }
 
@@ -136,7 +144,7 @@ pub fn load_for(source: &Source, paks: Option<&Arc<fn_pak::PakSet>>) -> Option<B
         }
     };
     let hero = selected_hero(set);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| BrCharacter::load(&ClipSourceDir::Pak(set), &hero)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fn_pose::br_character::with_cooked_only(|| BrCharacter::load(&ClipSourceDir::Pak(set), &hero))));
     match result {
         Ok(Ok(ch)) => {
             crate::part_anim_glue::install(&ch, &ClipSourceDir::Pak(set)); // PART ANIM HOOK

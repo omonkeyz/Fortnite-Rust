@@ -292,7 +292,8 @@ impl App {
                     glue.sync(profile, &mut self.state.locker);
                     if slot == lobby_ui::LockerSlot::Outfit { self.request_hero(); }
                 }
-                UiEvent::PickerOpened(_) | UiEvent::PickerClosed | UiEvent::PlaylistChanged(_) | UiEvent::FillChanged(_) | UiEvent::Cancel => {}
+                UiEvent::BannerApply { icon, color } => { if let Some(p) = self.profile.as_mut() { p.set_banner(&icon, &color); let _ = p.flush(); } }
+                UiEvent::Preview { .. } | UiEvent::PickerOpened(_) | UiEvent::PickerClosed | UiEvent::PlaylistChanged(_) | UiEvent::FillChanged(_) | UiEvent::OptionChanged { .. } | UiEvent::Cancel => {}
             }
         }
     }

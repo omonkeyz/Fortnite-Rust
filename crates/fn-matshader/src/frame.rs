@@ -69,7 +69,7 @@ pub fn bone_buffer(skin: &[Mat4], slots: &[Option<usize>], vec4s: usize) -> Vec<
     out
 }
 
-pub fn bytes(v: &[[f32; 4]]) -> Vec<u8> { v.iter().flat_map(|r| r.iter().flat_map(|f| f.to_le_bytes())).collect() }
+pub fn bytes(v: &[[f32; 4]]) -> Vec<u8> { let mut b = Vec::with_capacity(v.len() * 16); for r in v { for f in r { b.extend_from_slice(&f.to_le_bytes()); } } b }
 
 #[cfg(test)]
 mod tests {

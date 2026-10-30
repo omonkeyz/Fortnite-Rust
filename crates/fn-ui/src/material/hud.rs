@@ -37,6 +37,8 @@ impl Img {
     /// Pixels of a store texture (straight RGBA8). `None` for missing ids.
     pub fn from_texture(store: &TextureStore, id: TextureId, srgb: bool) -> Option<Img> {
         let t = store.get(id)?;
+        t.mark_cpu();
+        if !t.has_pixels() { return None; }
         Some(Img::from_rgba8(t.w as usize, t.h as usize, &t.rgba, srgb))
     }
     pub fn solid(c: [f32; 4]) -> Img { Img { w: 1, h: 1, px: vec![c] } }

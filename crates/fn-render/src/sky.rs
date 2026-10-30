@@ -147,8 +147,9 @@ pub const TEXTURES: [(&str, bool); 6] = [
     ("Game/Packages/Fortress_Sky/Materials/FinalCloudNormalAndHeightMap.png", false),
 ];
 /// CPU-side sky assets (read from `<assets>/sky`).
-pub struct SkyAssets { pub dome: Mesh, pub sun: Mesh, pub textures: Vec<image::RgbaImage> }
+pub struct SkyAssets { pub dome: Mesh, pub sun: Mesh, pub textures: Vec<image::RgbaImage>, pub mips: Vec<Vec<image::RgbaImage>> }
 impl SkyAssets {
+    pub fn prepare_mips(&mut self) { self.mips = self.textures.iter().zip(TEXTURES).map(|(img, (_, srgb))| texture::mip_chain(img, srgb, MipFilter::Box)).collect(); }
     /// `root` is the `assets/sky` folder of the prototype (contains dome_optimized.bin, sunmoon.bin and Game/...).
     pub fn load(root: &Path) -> Result<SkyAssets, String> {
         let read = |n: &str| std::fs::read(root.join(n)).map_err(|e| format!("{}: {e}", root.join(n).display()));
@@ -159,7 +160,7 @@ impl SkyAssets {
             let p: PathBuf = root.join(name);
             textures.push(std::fs::read(&p).map_err(image::ImageError::IoError).and_then(|b| image::load_from_memory(&b)).map_err(|e| format!("{}: {e}", p.display()))?.to_rgba8());
         }
-        Ok(SkyAssets { dome, sun, textures })
+        Ok(SkyAssets { dome, sun, textures, mips: vec![] })
     }
 }
 
@@ -310,8 +311,8 @@ fn sky_pipelines(device: &wgpu::Device, hdr_format: wgpu::TextureFormat, dome_bg
 impl SkyRenderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, assets: &SkyAssets, hdr_format: wgpu::TextureFormat) -> SkyRenderer {
         // textures (6): galaxy, galaxy tile, storm, stars, noise, cloud
-        let views: Vec<wgpu::TextureView> = assets.textures.iter().zip(TEXTURES).map(|(img, (name, srgb))| {
-            texture::upload_rgba8(device, queue, img, srgb, MipFilter::Box, name).create_view(&Default::default())
+        let views: Vec<wgpu::TextureView> = assets.textures.iter().zip(TEXTURES).enumerate().map(|(i, (img, (name, srgb)))| {
+            match assets.mips.get(i) { Some(l) => texture::upload_mip_chain(device, queue, img, l, srgb, name), None => texture::upload_rgba8(device, queue, img, srgb, MipFilter::Box, name) }.create_view(&Default::default())
         }).collect::<Vec<_>>();
         let _ = views.len();
         let sampler = texture::repeat_sampler(device, 8, "sky sampler");

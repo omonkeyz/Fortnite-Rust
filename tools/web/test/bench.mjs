@@ -15,7 +15,8 @@ const [W, H] = opt('--size', '2544x1353').split('x').map(Number);
 const walkSecs = Number(opt('--walk-secs', '60'));
 const label = opt('--label', path.basename(out));
 const basePage = 'fnweb_fullscreen=off&fnweb_note=off&FN_TOD_HOUR=12&fnweb_quality=hold&fnweb_rung=3';
-const pageArgs = opt('--page-args', '') ? basePage + '&' + opt('--page-args') : basePage;
+const pageArgs0 = opt('--page-args', '') ? basePage + '&' + opt('--page-args') : basePage;
+const pageArgs = /(^|&)FN_LOBBY=/.test(pageArgs0) ? pageArgs0 : pageArgs0 + (pageArgs0 ? '&' : '') + 'FN_LOBBY=0';
 fs.mkdirSync(out, { recursive: true });
 const keep = opt('--profile-dir');
 const profile = keep ? path.resolve(keep) : fs.mkdtempSync(path.join(os.tmpdir(), 'fnweb-bench-'));
@@ -57,12 +58,10 @@ try {
     log('headless Brave ' + W + 'x' + H + ' ' + server.url + (result.cold ? ' (cold profile)' : ' (warm profile)'));
     const visible = (sel) => page.evaluate((s) => { const e = document.querySelector(s); return !!e && getComputedStyle(e).display !== 'none' && e.offsetParent !== null; }, sel).catch(() => false);
     const waitVisible = async (sel, secs) => { const end = Date.now() + secs * 1000; while (Date.now() < end) { if (await visible(sel)) return true; if (await visible('#fnweb-login')) throw new Error('the password form appeared (the Worker asked for a password)'); await sleep(200); } throw new Error('not visible: ' + sel); };
-    await waitVisible('#fnweb-launch-go', 60);
+    for (let k = 0; k < 120 && !(await page.evaluate(() => !!window.__fnwebReady).catch(() => false)); k++) await new Promise((r) => setTimeout(r, 500));
     result.launchReadySec = (Date.now() - tNav) / 1000;
-    await page.click('#fnweb-launch-go');
-    if (await waitVisible('#fnweb-notice-go', 3).catch(() => false)) await page.click('#fnweb-notice-go');
-    for (let k = 0; k < 60; k++) { if (await visible('#fnweb-mode-solo')) { await page.click('#fnweb-mode-solo'); log('mode: Solo'); break; } const ph = await within(page.evaluate(() => (window.__fnwebPhaseLog || []).length), 5000, 'ph').catch(() => 0); if (ph) break; await sleep(250); }
-    log('Click to Launch + Continue');
+    await page.mouse.click(W / 2, H / 2);
+    log('first click on the game (the user gesture)');
     let phases = [];
     const phaseT = async () => within(page.evaluate(() => (window.__fnwebPhaseLog || []).map((x) => [x.p, x.t])), 5000, 'phases').catch(() => null);
     const waitPhase = async (p, secs) => {

@@ -39,7 +39,7 @@ fn texture_map() -> &'static HashMap<String, String> {
 const TEXTURE_ALIASES: [(&str, &str); 1] = [("t-logo-wordmark-1024x512", "t-logo-wordmark-1024")];
 
 /// File extensions served as raw bytes by name (fonts).
-const RAW_EXTS: [&str; 4] = ["ufont", "ttf", "otf", "ini"];
+const RAW_EXTS: [&str; 5] = ["ufont", "ttf", "otf", "ini", "locres"];
 
 pub struct PakAssets {
     set: PakSet,
@@ -123,7 +123,17 @@ impl PakAssets {
     }
 
     fn raw_bytes(&self, name: &str, dir_hint: Option<&str>) -> Option<Vec<u8>> {
-        let v = self.raw().get(&name.to_ascii_lowercase())?;
+        let lower = name.to_ascii_lowercase();
+        if self.raw.get().is_none() {
+            if !lower.rsplit('.').next().is_some_and(|x| RAW_EXTS.contains(&x)) { return None; }
+            let mut v: Vec<String> = self.set.by_file_name(&lower).into_iter().map(|(_, e)| e.rel_path().to_owned()).filter(|p| p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase() == lower).collect();
+            if v.is_empty() { return None; }
+            v.sort();
+            let hint = dir_hint.map(|h| h.to_ascii_lowercase().replace('\\', "/"));
+            let p = hint.as_ref().and_then(|h| v.iter().find(|p| p.to_ascii_lowercase().contains(h.as_str()))).or(v.first())?;
+            return self.set.read(p).ok().map(|c| c.into_owned());
+        }
+        let v = self.raw().get(&lower)?;
         let hint = dir_hint.map(|h| h.to_ascii_lowercase().replace('\\', "/"));
         let p = hint.as_ref().and_then(|h| v.iter().find(|p| p.to_ascii_lowercase().contains(h.as_str()))).or(v.first())?;
         self.set.read(p).ok().map(|c| c.into_owned())

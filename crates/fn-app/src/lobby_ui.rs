@@ -25,6 +25,8 @@ impl LobbyUi {
         let ui = AthenaLobbyUi::load(install)?;
         Ok(LobbyUi { ui, ctx })
     }
+    pub fn load_context(install: &Path) -> Result<UiContext, String> { UiContext::from_install(install, None) }
+    pub fn with_context(ctx: UiContext, install: &Path) -> Result<LobbyUi, String> { Ok(LobbyUi { ui: AthenaLobbyUi::load(install)?, ctx }) }
     pub fn ctx_mut(&mut self) -> &mut UiContext { &mut self.ctx }
     pub fn locres(&self) -> Option<std::rc::Rc<fn_ui::screens::athena_lobby::store::Locres>> { self.ui.ui.store.locres() }
     pub fn tab_labels(&self) -> &[String] { self.ui.tab_labels() }

@@ -29,9 +29,11 @@ pub mod drop_in;
 pub mod containers; // CONTAINERS (fn-game): BR chests / ammo boxes: search, spawn selection, Athena loot roll (containers.rs)
 pub mod pickups; // PICKUPS (fn-game): AFortPickup world item logic (toss physics, touch / Use pickup, fly to the pawn)
 pub mod traps;
+pub mod bounce;
 pub mod sim;
 pub mod storm_state; // STORM HOOK (fn-game): static safe zone (centre, radius, fade-in) the storm visuals read; F2 `storm`
 pub mod storm_zones;
+pub mod supply_drop;
 pub mod sim_tick;
 pub mod tick_driver;
 pub mod time_audit;

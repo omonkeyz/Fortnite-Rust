@@ -66,7 +66,12 @@ pub struct Particle {
     pub collisions: u32, pub stopped: bool, pub age: f32,
     /// Spawn serial number inside the emitter (diagnostics, stable ordering).
     pub serial: u64,
+    pub trail: TrailPoint,
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrailPoint { pub tangent: Vec3, pub spawn_time: f32, pub tiled_u: f32, pub up: Vec3, pub interpolated: bool, pub spawned_tess: i32 }
+#[derive(Clone, Copy, Debug, Default)]
+struct RibbonState { running: f32, last_src: Vec3, last_tan: Vec3, cur_src: Vec3, cur_tan: Vec3, trail_spawn_time: f32, src_dist: f32, tiled_dist: f32, inv_life: f32, size: f32, started: bool }
 #[derive(Clone, Copy, Debug)]
 pub struct LightPayload { pub color_scale: [f32; 3], pub radius_scale: f32, pub exponent: f32, pub valid: bool }
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +80,7 @@ pub struct Orbit { pub offset: Vec3, pub rotation: Vec3, pub rate: Vec3 }
 impl Particle {
     fn fresh(origin: Vec3, serial: u64) -> Particle {
         Particle { loc: origin, vel: Vec3::ZERO, base_vel: Vec3::ZERO, size: Vec3::ZERO, base_size: Vec3::ZERO, color: [1.0; 4], base_color: [1.0; 4], rot: 0.0, rot_rate: 0.0, base_rot_rate: 0.0,
-            mesh_rot: Vec3::ZERO, mesh_rot_rate: Vec3::ZERO, rel_time: 0.0, inv_life: 0.0, sub_image: 0.0, cam_offset: 0.0, orbit: None, dynamic: [0.0; 4], light: None, collisions: 0, stopped: false, age: 0.0, serial }
+            mesh_rot: Vec3::ZERO, mesh_rot_rate: Vec3::ZERO, rel_time: 0.0, inv_life: 0.0, sub_image: 0.0, cam_offset: 0.0, orbit: None, dynamic: [0.0; 4], light: None, collisions: 0, stopped: false, age: 0.0, serial, trail: TrailPoint::default() }
     }
 }
 
@@ -104,6 +109,7 @@ pub struct EmitterInstance {
     has_location: bool,
     /// `FParticleSpawnPerUnitInstancePayload::CurrentDistanceTravelled` per module index.
     spu_leftover: Vec<f32>,
+    rib: RibbonState,
 }
 
 pub struct Instance {
@@ -128,7 +134,7 @@ impl EmitterInstance {
         let seeded = l.map(|l| l.modules.iter().map(|m| m.seed.map(Rng::new)).collect()).unwrap_or_default();
         EmitterInstance { index, lod, particles: Vec::new(), rng: Rng::from_pair(seed, index as u64 + 1), seeded, spawn_fraction: 0.0, emitter_time: 0.0, delay_left: l.map_or(0.0, |l| l.required.emitter_delay), loops_done: 0,
             burst_fired: vec![false; nb], completed: l.is_none(), spawned_total: 0, dropped: 0, bursts_fired: 0, halted: false,
-            halted_external: false, location: Vec3::ZERO, old_location: Vec3::ZERO, has_location: false, spu_leftover: Vec::new() }
+            halted_external: false, location: Vec3::ZERO, old_location: Vec3::ZERO, has_location: false, spu_leftover: Vec::new(), rib: RibbonState::default() }
     }
 }
 
@@ -227,7 +233,7 @@ impl Instance {
             // Tick_EmitterTimeSetup: OldLocation = Location; Location = component location (both the new one on the first tick, `bJustRegistered`)
             e.old_location = if e.has_location { e.location } else { xf.pos }; e.location = xf.pos; e.has_location = true;
             let Some(lod) = lod_of(&sys.emitters[e.index], e.lod) else { e.completed = true; continue };
-            tick_emitter(e, lod, &xf, psv, dt, env);
+            if let TypeData::Ribbon(r) = &lod.type_data { tick_ribbon(e, lod, r, &xf, psv, dt, env); } else { tick_emitter(e, lod, &xf, psv, dt, env); }
         }
     }
 
@@ -286,6 +292,244 @@ fn tick_emitter(e: &mut EmitterInstance, lod: &Lod, xf: &Transform, psv: Vec3, d
     if looping && e.emitter_time >= duration {
         e.loops_done += 1;
         if req.emitter_loops > 0 && e.loops_done >= req.emitter_loops { e.completed = true; } else { e.emitter_time -= duration; for f in &mut e.burst_fired { *f = false; } }
+    }
+}
+
+pub fn cubic_interp(p0: Vec3, t0: Vec3, p1: Vec3, t1: Vec3, a: f32) -> Vec3 {
+    let (a2, a3) = (a * a, a * a * a);
+    p0 * (2.0 * a3 - 3.0 * a2 + 1.0) + t0 * (a3 - 2.0 * a2 + a) + t1 * (a3 - a2) + p1 * (-2.0 * a3 + 3.0 * a2)
+}
+pub fn cubic_interp_derivative(p0: Vec3, t0: Vec3, p1: Vec3, t1: Vec3, a: f32) -> Vec3 {
+    let a2 = a * a;
+    p0 * (6.0 * a2 - 6.0 * a) + t0 * (3.0 * a2 - 4.0 * a + 1.0) + t1 * (3.0 * a2 - 2.0 * a) + p1 * (-6.0 * a2 + 6.0 * a)
+}
+
+fn tick_ribbon(e: &mut EmitterInstance, lod: &Lod, r: &RibbonInfo, xf: &Transform, psv: Vec3, dt: f32, env: &Env) {
+    let req = &lod.required;
+    let first = !e.rib.started;
+    let pos = xf.pos;
+    if first { e.rib.last_src = pos; e.rib.last_tan = Vec3::ZERO; e.rib.trail_spawn_time = e.rib.running; e.rib.started = true; }
+    e.rib.cur_src = pos;
+    let since = e.rib.running - e.rib.trail_spawn_time;
+    e.rib.cur_tan = if since != 0.0 { (e.rib.cur_src - e.rib.last_src) / since } else { Vec3::X };
+    e.particles.retain(|p| p.rel_time <= 1.0);
+    let mut active = !(e.completed || e.halted);
+    if active && e.delay_left > 0.0 { e.delay_left -= dt; if e.delay_left > 0.0 { active = false; } }
+    if active {
+        e.emitter_time += dt;
+        let cx = Ctx { lod, xf, local: false, t: e.emitter_time, psv };
+        if !e.halted_external { spawn_ribbon(e, lod, r, &cx, xf, dt); }
+        let looping = req.emitter_duration > 0.0;
+        let duration = req.emitter_duration.max(1e-4);
+        if looping && e.emitter_time >= duration {
+            e.loops_done += 1;
+            if req.emitter_loops > 0 && e.loops_done >= req.emitter_loops { e.completed = true; } else { e.emitter_time -= duration; }
+        }
+    }
+    for p in &mut e.particles {
+        p.vel = p.base_vel; p.size = p.base_size; p.rot_rate = p.base_rot_rate; p.color = p.base_color;
+        p.rel_time += p.inv_life * dt; p.age += dt;
+    }
+    let cx = Ctx { lod, xf, local: false, t: e.emitter_time, psv };
+    update_particles(e, &cx, dt);
+    for p in &mut e.particles { if p.stopped { continue; } p.loc += p.vel * dt; p.rot += p.rot_rate * dt * TAU; }
+    collide(e, &cx, env);
+    if r.tangent_recalculation_every_frame { recalc_tangents(&mut e.particles); }
+    e.rib.running += dt;
+}
+
+fn recalc_tangents(ps: &mut [Particle]) {
+    let n = ps.len();
+    if n < 2 { return; }
+    for i in 0..n {
+        let (a, b) = if i == n - 1 { (n - 1, n - 2) } else if i == 0 { (1, 0) } else { (i + 1, i - 1) };
+        let td = ps[a].trail.spawn_time - ps[b].trail.spawn_time;
+        if td.abs() > 1e-8 { ps[i].trail.tangent = (ps[a].loc - ps[b].loc) / td; }
+    }
+}
+
+fn spawn_ribbon(e: &mut EmitterInstance, lod: &Lod, r: &RibbonInfo, cx: &Ctx, xf: &Transform, dt: f32) {
+    let t = cx.t;
+    let Some((unit_scalar, spu, max_frame_distance)) = lod.modules.iter().find_map(|m| if let (true, ModuleKind::SpawnPerUnit { unit_scalar, spawn_per_unit, max_frame_distance, .. }) = (m.enabled, &m.kind) { Some((*unit_scalar, spawn_per_unit, *max_frame_distance)) } else { None }) else { return };
+    let ppu = spu.eval1(t, &mut e.rng) / unit_scalar;
+    let mut count = 0i32;
+    if ppu >= 0.0 {
+        let leftover = e.rib.src_dist;
+        let travel = e.rib.cur_src - e.rib.last_src;
+        let mut dist = travel.length();
+        if max_frame_distance > 0.0 && dist > max_frame_distance { dist = 0.0; e.rib.last_src = e.rib.cur_src; }
+        let mut check = 0.0;
+        if r.tangent_spawning_scalar > 0.0 {
+            let mut el = e.rib.running;
+            if e.particles.is_empty() { if el == 0.0 { el = 1e-4; } e.rib.last_tan = (e.rib.cur_src - e.rib.last_src) / el; }
+            let mut div = el - e.rib.trail_spawn_time;
+            if div == 0.0 { div = 1e-4; }
+            check = ((travel / div).normalize_or_zero().dot(e.rib.last_tan.normalize_or_zero()) - 1.0) * -0.5;
+        }
+        if dist > 0.0 {
+            let nl = (dist + leftover) * ppu + check * r.tangent_spawning_scalar;
+            count = if r.spawn_initial_particle && e.particles.is_empty() && nl < 1.0 { 1 } else { nl.floor() as i32 };
+            e.rib.src_dist = ((dist + leftover) - count as f32 * unit_scalar).max(0.0);
+        }
+    }
+    if r.max_particle_in_trail_count > 0 {
+        let n = e.particles.len() as i32;
+        let kill = count + n - r.max_particle_in_trail_count;
+        if kill > 0 { let k = (kill as usize).min(e.particles.len()); e.particles.drain(0..k); }
+        let n = e.particles.len() as i32;
+        if count + n > r.max_particle_in_trail_count { count = (r.max_particle_in_trail_count - n).max(0); }
+    }
+    if count <= 0 { return; }
+    let el = e.rib.running;
+    if r.enable_previous_tangent_recalculation && !r.tangent_recalculation_every_frame {
+        let spawned: Vec<usize> = (0..e.particles.len()).rev().filter(|&i| !e.particles[i].trail.interpolated).take(2).collect();
+        if spawned.len() == 2 {
+            let (ns, nn) = (spawned[0], spawned[1]);
+            let td = el - e.particles[nn].trail.spawn_time;
+            let new_tan = if td > 1e-8 { (e.rib.cur_src - e.particles[nn].loc) / td } else { Vec3::ZERO };
+            let tess = e.particles[ns].trail.spawned_tess;
+            if tess > 0 {
+                let diff = e.particles[ns].trail.spawn_time - e.particles[nn].trail.spawn_time;
+                let (p0, t0, p1) = (e.particles[nn].loc, e.particles[nn].trail.tangent, e.particles[ns].loc);
+                let inv = 1.0 / tess as f32;
+                for k in 0..tess as usize {
+                    let i = nn + 1 + k;
+                    if i >= e.particles.len() || i > ns { break; }
+                    let ts = inv * (k + 1) as f32;
+                    e.particles[i].loc = cubic_interp(p0, t0, p1, new_tan * diff, ts);
+                    e.particles[i].trail.tangent = cubic_interp_derivative(p0, t0, p1, new_tan * diff, ts) * inv;
+                }
+            }
+            e.rib.last_tan = new_tan;
+        }
+    }
+    let diff = el - e.rib.trail_spawn_time;
+    let inv = 1.0 / count as f32;
+    let incr = dt / count as f32;
+    let (ls, lt, cs, ct) = (e.rib.last_src, e.rib.last_tan * diff, e.rib.cur_src, e.rib.cur_tan * diff);
+    let tiling = r.tiling_distance.abs() > 1e-8;
+    for i in 0..count {
+        let ts = (inv * (i + 1) as f32).clamp(0.0, 1.0);
+        let pos = cubic_interp(ls, lt, cs, ct, ts);
+        let tan = cubic_interp_derivative(ls, lt, cs, ct, ts);
+        let spawn_time = dt - i as f32 * incr;
+        if e.particles.len() >= MAX_ACTIVE_PER_EMITTER { e.dropped += 1; continue; }
+        let serial = e.spawned_total;
+        e.spawned_total += 1;
+        let sxf = Transform { pos, rot: xf.rot, scale: xf.scale };
+        let scx = Ctx { lod, xf: &sxf, local: false, t: cx.t, psv: cx.psv };
+        let mut p = Particle::fresh(pos, serial);
+        for (mi, m) in lod.modules.iter().enumerate() {
+            if !m.enabled { continue; }
+            let rng = match e.seeded.get_mut(mi) { Some(Some(r)) => r, _ => &mut e.rng };
+            spawn_module(&m.kind, &mut p, &scx, rng);
+        }
+        if p.size == Vec3::ZERO { p.size = Vec3::ONE; }
+        let newest = e.particles.last().map(|q| q.loc);
+        if newest.is_none() {
+            let mut inv_life = p.inv_life;
+            if inv_life == 0.0 { inv_life = 1.0; }
+            if 1.0 / inv_life < 0.001 { inv_life = 1.0 / 0.001; }
+            e.rib.inv_life = inv_life;
+            e.rib.size = p.size.x;
+        }
+        p.inv_life = e.rib.inv_life;
+        p.size.x = e.rib.size;
+        p.size.y = p.size.x;
+        p.base_size = p.size;
+        p.vel = p.base_vel;
+        p.rel_time = spawn_time * p.inv_life;
+        p.age = spawn_time;
+        p.trail = TrailPoint { tangent: tan * inv, spawn_time: el - diff * (1.0 - ts), tiled_u: 0.0, up: Vec3::Z, interpolated: i != count - 1, spawned_tess: count };
+        match newest {
+            None => { e.rib.tiled_dist = 0.0; }
+            Some(prev) => if tiling { e.rib.tiled_dist += (pos - prev).length(); p.trail.tiled_u = e.rib.tiled_dist / r.tiling_distance; },
+        }
+        update_particle(&mut p, &scx, 0.0, &mut e.rng);
+        e.particles.push(p);
+    }
+    e.rib.last_src = e.rib.cur_src;
+    e.rib.last_tan = e.rib.cur_tan;
+    e.rib.trail_spawn_time = el;
+}
+
+pub const RIBBON_VERTEX_FLOATS: usize = 24;
+
+fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] { [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t] }
+
+#[allow(clippy::too_many_arguments)]
+fn ribbon_vertex(verts: &mut Vec<f32>, pos: Vec3, size: f32, u: f32, v: f32, u2: f32, rot: f32, color: [f32; 4], dynp: [f32; 4], rel: f32) {
+    verts.extend_from_slice(&[pos.x, pos.y, pos.z, rel, pos.x, pos.y, pos.z, 0.0, size, size, rot, 0.0, u, v, u2, v]);
+    verts.extend_from_slice(&color);
+    verts.extend_from_slice(&dynp);
+}
+
+pub fn ribbon_geometry(ps: &[Particle], r: &RibbonInfo, scale: f32, cam: Vec3, cam_up: Vec3, verts: &mut Vec<f32>, indices: &mut Vec<u32>) {
+    let n = ps.len();
+    if n < 2 { return; }
+    let check_tan = r.tangent_tessellation_scalar.abs() > 1e-8 || r.enable_tangent_diff_interp_scale;
+    let dist_tess = r.distance_tessellation_step_size.abs() > 1e-8;
+    let mut interp = vec![1i32; n];
+    for i in 0..n - 1 {
+        let (c, pv) = (&ps[i], &ps[i + 1]);
+        let d = (c.loc - pv.loc).length();
+        let ct = if check_tan { (c.trail.tangent.normalize_or_zero().dot(pv.trail.tangent.normalize_or_zero()) - 1.0) * -0.5 } else { 0.0 };
+        let mut dd = 0.0;
+        if dist_tess { dd = d / r.distance_tessellation_step_size; if r.enable_tangent_diff_interp_scale && ct < 0.5 { dd *= 2.0 * ct.clamp(0.0, 0.5); } }
+        let k = dd.trunc() as i32 + (ct * r.tangent_tessellation_scalar).trunc() as i32;
+        interp[i] = k.max(1);
+    }
+    let total: i32 = interp.iter().map(|k| 2 * k).sum::<i32>();
+    let tri = total - 2;
+    if tri <= 0 { return; }
+    let tex_inc = 1.0 / (tri as f32 / 2.0);
+    let up_of = |p: &Particle| -> Vec3 {
+        if r.render_axis != 0 { return p.trail.up; }
+        let dc = (p.loc - cam).normalize_or_zero();
+        let u = p.trail.tangent.normalize_or_zero().cross(dc);
+        if u.length_squared() < 1e-8 { cam_up } else { u.normalize() }
+    };
+    let tiling = r.tiling_distance.abs() > 1e-8;
+    let base = (verts.len() / RIBBON_VERTEX_FLOATS) as u32;
+    let mut tex_u = 0.0f32;
+    let mut prev: Option<(usize, Vec3)> = None;
+    for i in (0..n).rev() {
+        let p = &ps[i];
+        let up = up_of(p);
+        let size = p.size.x * scale;
+        let rel = p.rel_time.clamp(0.0, 1.0);
+        let k = interp[i];
+        match prev {
+            Some((qi, qup)) if k > 1 => {
+                let q = &ps[qi];
+                let qsize = q.size.x * scale;
+                let invc = 1.0 / k as f32;
+                for s in (0..k).rev() {
+                    let ts = invc * s as f32;
+                    let ip = cubic_interp(p.loc, p.trail.tangent, q.loc, q.trail.tangent, ts);
+                    let iu = up.lerp(qup, ts);
+                    let ic = lerp4(p.color, q.color, ts);
+                    let isz = size + (qsize - size) * ts;
+                    let id = lerp4(p.dynamic, q.dynamic, ts);
+                    let u2 = if tiling { p.trail.tiled_u + (q.trail.tiled_u - p.trail.tiled_u) * ts } else { tex_u };
+                    ribbon_vertex(verts, ip + iu * isz, isz, tex_u, 0.0, u2, p.rot, ic, id, rel);
+                    ribbon_vertex(verts, ip - iu * isz, isz, tex_u, 1.0, u2, p.rot, ic, id, rel);
+                    tex_u += tex_inc;
+                }
+            }
+            _ => {
+                let u2 = if tiling { p.trail.tiled_u } else { tex_u };
+                ribbon_vertex(verts, p.loc + up * size, size, tex_u, 0.0, u2, p.rot, p.color, p.dynamic, rel);
+                ribbon_vertex(verts, p.loc - up * size, size, tex_u, 1.0, u2, p.rot, p.color, p.dynamic, rel);
+                tex_u += tex_inc;
+            }
+        }
+        prev = Some((i, up));
+    }
+    let count = (verts.len() / RIBBON_VERTEX_FLOATS) as u32 - base;
+    for k in 0..count.saturating_sub(2) {
+        let a = base + k;
+        if k % 2 == 0 { indices.extend([a, a + 1, a + 2]); } else { indices.extend([a + 1, a, a + 2]); }
     }
 }
 
@@ -519,7 +763,7 @@ fn update_module(kind: &ModuleKind, p: &mut Particle, cx: &Ctx, dt: f32, rng: &m
         }
         ModuleKind::ColorScaleOverLife { color, alpha } => {
             let c = color.eval3(rel, rng); let a = alpha.eval1(rel, rng);
-            p.color = [p.base_color[0] * c[0], p.base_color[1] * c[1], p.base_color[2] * c[2], p.base_color[3] * a];
+            p.color = [p.color[0] * c[0], p.color[1] * c[1], p.color[2] * c[2], p.color[3] * a];
         }
         ModuleKind::SizeScale { scale } => { p.size = p.base_size * v(scale.eval3(rel, rng)); }
         ModuleKind::SizeMultiplyLife { mult, x, y, z } => {
@@ -612,10 +856,11 @@ pub struct DrawParticle {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DrawKind { Sprite, Mesh }
+pub enum DrawKind { Sprite, Mesh, Ribbon }
 
 pub struct EmitterDraw {
     pub system: String,
+    pub package: String,
     pub emitter: String,
     pub emitter_index: usize,
     pub kind: DrawKind,
@@ -641,6 +886,8 @@ pub struct EmitterDraw {
     /// LOD level the instance draws this emitter at.
     pub lod_level: usize,
     pub particles: Vec<DrawParticle>,
+    pub ribbon_vertices: Vec<f32>,
+    pub ribbon_indices: Vec<u32>,
 }
 
 fn euler_matrix(rot: Vec3) -> Mat3 {
@@ -655,7 +902,7 @@ impl Instance {
         for e in &self.emitters {
             if e.particles.is_empty() { continue; }
             let Some(lod) = lod_of(&self.system.emitters[e.index], e.lod) else { continue };
-            let (kind, mesh) = match &lod.type_data { TypeData::Mesh { mesh, .. } => (DrawKind::Mesh, mesh.clone()), _ => (DrawKind::Sprite, String::new()) };
+            let (kind, mesh) = match &lod.type_data { TypeData::Mesh { mesh, .. } => (DrawKind::Mesh, mesh.clone()), TypeData::Ribbon(_) => (DrawKind::Ribbon, String::new()), _ => (DrawKind::Sprite, String::new()) };
             let material_override = lod.modules.iter().find_map(|m| if let (true, ModuleKind::MeshMaterial { materials }) = (m.enabled, &m.kind) { Some(materials.clone()) } else { None }).unwrap_or_default();
             let pivot = lod.modules.iter().find_map(|m| if let (true, ModuleKind::PivotOffset { offset }) = (m.enabled, &m.kind) { Some(*offset) } else { None }).unwrap_or([0.0; 2]);
             let xf = &self.xf;
@@ -674,7 +921,7 @@ impl Instance {
                 let depth = (world - cam).length_squared();
                 let size = p.size * xf.scale;
                 let (size_out, orient) = match kind {
-                    DrawKind::Sprite => ([size.x * 0.01, (if matches!(lod.required.screen_alignment, Alignment::Square) { size.x } else { size.y }) * 0.01, size.z * 0.01], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+                    DrawKind::Sprite | DrawKind::Ribbon => ([size.x * 0.01, (if matches!(lod.required.screen_alignment, Alignment::Square) { size.x } else { size.y }) * 0.01, size.z * 0.01], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
                     DrawKind::Mesh => {
                         let rpy = if let TypeData::Mesh { roll_pitch_yaw, .. } = &lod.type_data { v(roll_pitch_yaw.mean(0.0, 3)) } else { Vec3::ZERO };
                         let m = Mat3::from_rotation_z(rpy.z.to_radians()) * euler_matrix(p.mesh_rot);
@@ -686,10 +933,12 @@ impl Instance {
                 };
                 list.push((depth, DrawParticle { pos: ue_to_game(world), size: size_out, rotation: p.rot, color: p.color, sub_image: p.sub_image, velocity: ue_to_game(wvel), orient, dynamic: p.dynamic, rel_time: p.rel_time.clamp(0.0, 1.0) }));
             }
-            if lod.required.sort_mode != SortMode::None { list.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); }
-            out.push(EmitterDraw { system: self.system.name.clone(), emitter: self.system.emitters[e.index].name.clone(), emitter_index: e.index, kind, material: lod.required.material.clone(), material_override, mesh,
+            if lod.required.sort_mode != SortMode::None && kind != DrawKind::Ribbon { list.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); }
+            let (mut ribbon_vertices, mut ribbon_indices) = (vec![], vec![]);
+            if let TypeData::Ribbon(r) = &lod.type_data { ribbon_geometry(&e.particles, r, xf.scale, cam, Vec3::Z, &mut ribbon_vertices, &mut ribbon_indices); }
+            out.push(EmitterDraw { system: self.system.name.clone(), package: self.system.package.clone(), emitter: self.system.emitters[e.index].name.clone(), emitter_index: e.index, kind, material: lod.required.material.clone(), material_override, mesh,
                 sub_images: (lod.required.sub_images_h, lod.required.sub_images_v), interpolation: lod.required.interpolation, alignment: lod.required.screen_alignment, sort: lod.required.sort_mode, pivot_offset: pivot, axis_lock, axis_lock_axes, use_local_space: lod.required.use_local_space, mesh_override_material: matches!(&lod.type_data, TypeData::Mesh { override_material: true, .. }), lod_level: e.lod,
-                particles: list.into_iter().map(|x| x.1).collect() });
+                particles: list.into_iter().map(|x| x.1).collect(), ribbon_vertices, ribbon_indices });
         }
     }
 }
@@ -835,6 +1084,29 @@ mod tests {
         i.run(0.3, 1.0 / 60.0, &Env::none()); assert_eq!(i.spawned_total(), 3); assert!(i.emitters[0].completed);
         i.reactivate(); i.run(0.3, 1.0 / 60.0, &Env::none()); assert_eq!(i.spawned_total(), 6, "the burst fires again on Activate(true)"); assert_eq!(i.live_count(), 6, "earlier particles stay");
         i.reactivate(); i.deactivate(); i.run(0.3, 1.0 / 60.0, &Env::none()); assert_eq!(i.spawned_total(), 6, "Deactivate: no new particles"); assert_eq!(i.live_count(), 6);
+    }
+    #[test] fn a_ribbon_spawns_per_unit_distance_and_builds_one_strip_from_the_newest_point() {
+        let mods = vec![ModuleKind::Lifetime { lifetime: Dist::constant(2.0) }, ModuleKind::Size { start: Dist::constant3([0.5, 0.0, 0.0]) },
+            ModuleKind::SpawnPerUnit { unit_scalar: 100.0, spawn_per_unit: Dist::constant(1.0), max_frame_distance: 0.0, ignore_spawn_rate_when_moving: false, movement_tolerance: 30.0, ignore_movement: [false; 3] }];
+        let mut s = (*sys(mods, rate(0.0), req(1.0, 0, false))).clone();
+        s.emitters[0].lods[0].type_data = TypeData::Ribbon(RibbonInfo { tiling_distance: 1000.0, ..Default::default() });
+        let mut i = Instance::new(Arc::new(s), Transform::identity(), 3, 0.0);
+        for k in 0..10 { i.xf.pos = Vec3::new(k as f32 * 300.0, 0.0, 0.0); i.tick(1.0 / 60.0, &Env::none()); }
+        let n = i.emitters[0].particles.len();
+        assert!((26..=27).contains(&n), "one point per 100 cm over 2700 cm: {n}");
+        assert!(i.emitters[0].particles.iter().all(|p| (p.size.x - 0.5).abs() < 1e-6 && p.inv_life == 0.5));
+        let ps = &i.emitters[0].particles;
+        assert!(ps.windows(2).all(|w| w[1].loc.x > w[0].loc.x), "chronological order along the path");
+        let mut d = vec![];
+        i.draw([0.0, 10.0, 0.0], &mut d);
+        let r = d.iter().find(|e| e.kind == DrawKind::Ribbon).expect("ribbon draw");
+        let verts = r.ribbon_vertices.len() / RIBBON_VERTEX_FLOATS;
+        assert!(verts > 2 * n, "distance tessellation adds points between particles: {verts}");
+        assert_eq!(r.ribbon_indices.len(), (verts - 2) * 3);
+        let first = &r.ribbon_vertices[0..RIBBON_VERTEX_FLOATS];
+        assert!((first[0] - ps[n - 1].loc.x).abs() < 1e-3 && first[12] == 0.0 && (first[8] - 0.5).abs() < 1e-6, "the strip starts at the newest point with U = 0");
+        let last = &r.ribbon_vertices[(verts - 1) * RIBBON_VERTEX_FLOATS..];
+        assert!(last[12] > 0.95 && last[12] <= 1.0 + 1e-4, "U runs 0..1 along the trail: {}", last[12]);
     }
     #[test] fn velocity_inherit_parent_adds_the_component_velocity() {
         let m = vec![ModuleKind::Lifetime { lifetime: Dist::constant(5.0) }, ModuleKind::VelocityInheritParent { scale: Dist::constant3([0.5; 3]) }];

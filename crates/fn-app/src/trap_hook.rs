@@ -72,7 +72,6 @@ struct State {
     script_read: bool,
     stats: (u32, u32, u32, f32),
     camera: Vec3,
-    launched_until: f32,
     floor_immune_until: f32,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -239,6 +238,17 @@ fn emitter_xf(data: &Loaded, d: &TrapDef, e: &tr::Emitter, loc: Vec3, yaw: f32) 
     let r = Mat3::from_rotation_z(yaw.to_radians());
     let er = Mat3::from_rotation_z(e.rotation[1].to_radians()) * Mat3::from_rotation_y(-e.rotation[0].to_radians()) * Mat3::from_rotation_x(e.rotation[2].to_radians());
     (world_to_fx(loc + r * local), r * er)
+}
+
+pub fn prebuild_catalog() { with(load_catalog); }
+pub fn warm_ribbons(fx: &mut FxRenderer) {
+    let Ok(mut g) = STATE.lock() else { return };
+    let Some(st) = g.as_mut() else { return };
+    let Some(cat) = st.catalog.clone() else { return };
+    let State { dxbc, install, .. } = st;
+    if dxbc.is_none() { *dxbc = Some(match install { Some(d) => Dxbc::load(d, fx), None => Err("no install".into()) }); }
+    let Some(Ok(dx)) = dxbc.as_mut() else { return };
+    for sys in cat.systems() { if sys.emitters.iter().any(|e| e.lods.iter().any(|l| matches!(l.type_data, fn_particles::model::TypeData::Ribbon(_)))) { dx.skip_non_normal_emitters(&sys.package); dx.warm_ribbon_materials(fx, &sys.package); } }
 }
 
 fn load_catalog(s: &mut State) {
@@ -411,7 +421,7 @@ pub fn frame(sim: &mut GameSim, input: &mut BuildInput, arms: Option<&mut crate:
                         let in_target = touching || tr::in_box(local, d.trace_location, d.target.half, radius, half);
                         match d.behavior {
                             Behavior::Damage if in_target && can_trigger => { damage.push((d.damage, loc + tr::rot_z(yaw, d.trace_location))); }
-                            Behavior::Launch { .. } if in_target && s.time >= s.launched_until => { s.launched_until = s.time + fn_live::f32("FN_TRAP_LAUNCHED_TAG_TIME", tr::LAUNCHED_TAG_TIME); s.floor_immune_until = s.time + fn_live::f32("FN_TRAP_FLOOR_IMMUNE_TIME", tr::FLOOR_TRAP_IMMUNE_TIME); let pv = Vec3::new(sim.controller.velocity.x, sim.controller.velocity.y, 0.) * 100.; launch = tr::launch_velocity(d.behavior, pv); }
+                            Behavior::Launch { .. } if in_target && !crate::bounce_hook::launched() => { crate::bounce_hook::mark_launched(); s.floor_immune_until = s.time + fn_live::f32("FN_TRAP_FLOOR_IMMUNE_TIME", tr::FLOOR_TRAP_IMMUNE_TIME); let pv = Vec3::new(sim.controller.velocity.x, sim.controller.velocity.y, 0.) * 100.; launch = tr::launch_velocity(d.behavior, pv); }
                             _ => {}
                         }
                     }
@@ -445,9 +455,9 @@ pub fn frame(sim: &mut GameSim, input: &mut BuildInput, arms: Option<&mut crate:
         }
     }
     if let Some(l) = launch {
-        sim.controller.vertical_speed = l.z / 100.;
-        sim.controller.velocity += glam::Vec2::new(l.x, l.y) / 100.;
-        with(|s| say(s, format!("launched the pawn with ({:.0}, {:.0}, {:.0}) cm/s", l.x, l.y, l.z)));
+        let fin = sim.controller.launch(l, false, true);
+        sim.fall.ignore_next = true;
+        with(|s| say(s, format!("LaunchCharacterJump(({:.0}, {:.0}, {:.0}), XY add, Z override, bIgnoreFallDamage): pawn velocity ({:.0}, {:.0}, {:.0}) cm/s", l.x, l.y, l.z, fin.x, fin.y, fin.z)));
     }
     sounds
 }

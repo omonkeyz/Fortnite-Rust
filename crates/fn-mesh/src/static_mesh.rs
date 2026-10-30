@@ -281,7 +281,7 @@ impl DistanceFieldVolumeData {
         let raw = if self.compressed_volume.len() == n || self.compressed_volume.len() == n * 2 {
             self.compressed_volume.clone()
         } else {
-            miniz_oxide::inflate::decompress_to_vec_zlib(&self.compressed_volume).ok()?
+            { let mut v = miniz_oxide::inflate::decompress_to_vec_zlib(&self.compressed_volume).ok()?; v.shrink_to_fit(); v }
         };
         let fmt = if raw.len() == n {
             DistanceFieldFormat::G8

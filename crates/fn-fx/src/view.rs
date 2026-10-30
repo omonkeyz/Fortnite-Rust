@@ -273,7 +273,8 @@ pub fn sprite_vf_buffer() -> Vec<[f32; 4]> {
     v
 }
 
-pub fn bytes(v: &[[f32; 4]]) -> Vec<u8> { v.iter().flat_map(|r| r.iter().flat_map(|f| f.to_le_bytes())).collect() }
+pub fn bytes(v: &[[f32; 4]]) -> Vec<u8> { let mut b = Vec::with_capacity(v.len() * 16); for r in v { for f in r { b.extend_from_slice(&f.to_le_bytes()); } } b }
+pub fn f32_bytes(v: &[f32]) -> Vec<u8> { let mut b = Vec::with_capacity(v.len() * 4); for f in v { b.extend_from_slice(&f.to_le_bytes()); } b }
 
 #[cfg(test)]
 mod tests {

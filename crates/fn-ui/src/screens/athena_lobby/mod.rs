@@ -14,6 +14,7 @@
 pub mod layout;
 pub mod paint;
 pub mod slate_mat;
+pub mod social;
 pub mod store;
 pub mod styles;
 pub mod umg;
@@ -30,6 +31,7 @@ use std::rc::Rc;
 use store::Store;
 use styles::BtnState;
 use umg::{Ui, Vis};
+pub use social::{ErrorDialogView, FinderButton, InviteRow, PartyFinderView};
 
 pub const FRONTEND: &str = "/Game/UI/Foundation/StateLayouts/FrontEnd.FrontEnd_C";
 pub const TABS_SCREEN: &str = "/Game/Athena/UI/Frontend/AthenaTabsScreen.AthenaTabsScreen_C";
@@ -87,10 +89,39 @@ pub struct LobbyState {
     pub quests: Vec<QuestRow>,
     pub season: Option<SeasonView>,
     pub chat: Option<(String, String)>,
+    pub chat_input: Option<String>,
+    pub join_code_input: Option<String>,
+    pub party_finder: Option<PartyFinderView>,
+    pub error_dialog: Option<ErrorDialogView>,
     pub mat_time: f32,
+    pub options: Vec<MatchOption>,
 }
 impl Default for LobbyState {
-    fn default() -> Self { LobbyState { selected_tab: 0, hovered_tab: None, playlist: 0, team_fill: 0, party_leader: true, mtx_balance: 0, player_panel: false, play_hovered: false, pads: vec![], hover_widget: None, press_widget: None, locker: Default::default(), can_matchmake: true, matchmaking: None, cancel_hovered: false, quests: vec![], season: None, chat: None, mat_time: 0.0 } }
+    fn default() -> Self { LobbyState { selected_tab: 0, hovered_tab: None, playlist: 0, team_fill: 0, party_leader: true, mtx_balance: 0, player_panel: false, play_hovered: false, pads: vec![], hover_widget: None, press_widget: None, locker: Default::default(), can_matchmake: true, matchmaking: None, cancel_hovered: false, quests: vec![], season: None, chat: None, chat_input: None, join_code_input: None, party_finder: None, error_dialog: None, mat_time: 0.0, options: MatchOption::defaults() } }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchOption { pub id: &'static str, pub label: &'static str, pub values: Vec<OptionText>, pub selected: usize }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionText { Locres { ns: &'static str, key: &'static str }, Literal(&'static str) }
+
+pub const ENHANCED_MODE: &str = "enhanced_mode";
+pub const BOTS: &str = "bots";
+pub const BOT_COUNTS: [usize; 5] = [0, 10, 25, 50, 99];
+pub const OPTION_BOTS: [OptionText; 5] = [OptionText::Literal("Off"), OptionText::Literal("10"), OptionText::Literal("25"), OptionText::Literal("50"), OptionText::Literal("99")];
+pub const OPTION_OFF_ON: [OptionText; 2] = [OptionText::Literal("Off"), OptionText::Literal("On")];
+
+impl MatchOption {
+    pub fn defaults() -> Vec<MatchOption> {
+        vec![MatchOption { id: ENHANCED_MODE, label: "Enhanced Mode", values: OPTION_OFF_ON.to_vec(), selected: 0 }, MatchOption { id: BOTS, label: "Bots", values: OPTION_BOTS.to_vec(), selected: 0 }]
+    }
+    pub fn step(&mut self, d: i8) { let n = self.values.len().max(1) as i32; self.selected = (self.selected as i32 + d as i32).rem_euclid(n) as usize; }
+    pub fn is_on(&self) -> bool { self.selected != 0 }
+}
+impl LobbyState {
+    pub fn option(&self, id: &str) -> Option<&MatchOption> { self.options.iter().find(|o| o.id == id) }
+    pub fn option_mut(&mut self, id: &str) -> Option<&mut MatchOption> { self.options.iter_mut().find(|o| o.id == id) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,7 +171,7 @@ fn group_digits(v: i64) -> String {
     if v < 0 { format!("-{out}") } else { out }
 }
 
-fn paint_chat_strip(uic: &mut UiContext, out: &mut RenderList, w: f32, h: f32, scale: f32, channel: &str, hint: &str) {
+fn paint_chat_strip(uic: &mut UiContext, out: &mut RenderList, w: f32, h: f32, scale: f32, channel: &str, hint: &str, input: Option<&str>) {
     use crate::text::FontId;
     let px = crate::screens::atlas_px(16.0, scale);
     let bar_top = h - 60.0 * scale;
@@ -153,9 +184,19 @@ fn paint_chat_strip(uic: &mut UiContext, out: &mut RenderList, w: f32, h: f32, s
     let cap = px as f32 * 0.714;
     let baseline = (y0 + (h - y0 + cap) * 0.5).round();
     crate::screens::put_text(uic, out, FontId::Bold, px, pad, baseline, channel, [1.0, 1.0, 1.0, 1.0], None, crate::screens::Snap::Pen);
-    crate::screens::put_text(uic, out, FontId::Bold, px, pad * 2.0 + cw + 14.0 * scale, baseline, hint, srgb(99.0, 101.0, 112.0), None, crate::screens::Snap::Pen);
+    let x = pad * 2.0 + cw + 14.0 * scale;
+    match input {
+        Some(t) => {
+            let tw = uic.fonts.measure(FontId::Bold, t, px as f32);
+            crate::screens::put_text(uic, out, FontId::Bold, px, x, baseline, t, [1.0, 1.0, 1.0, 1.0], None, crate::screens::Snap::Pen);
+            out.fill(Rect::new(x + tw + 1.0 * scale, baseline - cap - 2.0 * scale, (1.5 * scale).max(1.0), cap + 4.0 * scale), [1.0, 1.0, 1.0, 1.0]);
+        }
+        None => crate::screens::put_text(uic, out, FontId::Bold, px, x, baseline, hint, srgb(99.0, 101.0, 112.0), None, crate::screens::Snap::Pen),
+    }
     let _ = w;
 }
+
+pub const JOIN_CODE_LABEL: &str = "Join code";
 
 /// One drawn frame.
 pub struct Frame {
@@ -176,6 +217,10 @@ impl Frame {
     pub fn rect(&self, name: &str) -> Option<Rect> { self.rects.get(name).copied() }
 }
 
+pub fn tab_shown(r: &Value) -> bool {
+    !r.get("bHidden").and_then(|b| b.as_bool()).unwrap_or(false) && !r.get("TabContentType").and_then(|c| c.as_str()).map_or(false, |c| c.contains("StoreMain_Root"))
+}
+
 pub struct AthenaLobbyUi {
     pub ui: Ui,
     pub root: usize,
@@ -194,10 +239,14 @@ pub struct AthenaLobbyUi {
     pad_roots: HashMap<(usize, bool), usize>,
     mats: HashMap<String, Option<Rc<slate_mat::SlateMat>>>,
     card_mats: crate::screens::athena_locker::card::CardMats,
+    social: social::Social,
+    join_code: Option<usize>,
+    option_rows: Vec<(usize, usize)>,
     pub composition_log: Vec<String>,
 }
 
 impl AthenaLobbyUi {
+    pub fn release_material_cache(&mut self) -> usize { let n = self.mats.len(); self.mats.clear(); n }
     pub fn load(install: &Path) -> Result<AthenaLobbyUi, String> {
         let store = Rc::new(Store::open(install)?);
         Self::from_store(store)
@@ -222,7 +271,7 @@ impl AthenaLobbyUi {
         let mut labels = vec![];
         let mut content = vec![];
         for r in regs {
-            if r.get("bHidden").and_then(|b| b.as_bool()).unwrap_or(false) { continue; }
+            if !tab_shown(&r) { continue; }
             content.push(r.get("TabContentType").and_then(|c| c.as_str()).unwrap_or("").to_owned());
             let dn = r.get("TabLabelInfo").and_then(|l| l.get("DisplayName")).cloned().unwrap_or(json!(null));
             // AthenaTabsScreen::HandleTabCreated: SetStyle(ButtonStyle-Tab-Main); ButtonText = TextToUpper(ButtonText); ShowText()
@@ -235,8 +284,9 @@ impl AthenaLobbyUi {
         }
         let mut pages = vec![None; tabs.len()];
         if let Some(p) = pages.first_mut() { *p = Some(lobby_page); }
-        let mut me = AthenaLobbyUi { ui, root, tabs, tab_labels: labels, switcher, tab_content: content, pages, locker: None, last_hover: [None; 2], quest_rows: vec![], pad_roots: HashMap::new(), mats: HashMap::new(), card_mats: Default::default(), composition_log: vec![] };
+        let mut me = AthenaLobbyUi { ui, root, tabs, tab_labels: labels, switcher, tab_content: content, pages, locker: None, last_hover: [None; 2], quest_rows: vec![], pad_roots: HashMap::new(), mats: HashMap::new(), card_mats: Default::default(), social: Default::default(), join_code: None, option_rows: vec![], composition_log: vec![] };
         me.reflect_input_actions()?;
+        me.install_option_rows(MatchOption::defaults().len());
         me.composition_log = me.ui.log.clone();
         Ok(me)
     }
@@ -256,6 +306,11 @@ impl AthenaLobbyUi {
         let table = ui.store.pkg(INPUT_ACTIONS).and_then(|p| p.named("InputActionDataTable").map(|e| e.props.clone())).unwrap_or(Value::Null);
         let handler: [(&str, u8); 5] = [("Cancel", 3), ("Scroll", 3), ("AthenaNews", 0), ("PlaylistChange", 255), ("SquadFillChange", 255)];
         for (row, hs) in handler {
+            if row == "AthenaNews" {
+                let inst = json!({ "ButtonText": { "text": JOIN_CODE_LABEL }, "Style": style });
+                let slot = json!({ "HorizontalAlignment": "HAlign_Center", "VerticalAlignment": "VAlign_Center", "Padding": margin });
+                self.join_code = Some(ui.add_class_instance(&btn_class, Some(bbox), "HorizontalBoxSlot", slot, Some(inst)).ok_or("cannot compose the join code box")?);
+            }
             let Some(r) = table.get("Rows").and_then(|t| t.get(row)) else { continue };
             let state = if hs != 255 { hs } else {
                 match r.get("OverrrideStateForInputType").and_then(|s| s.as_str()).map(|s| s.rsplit("::").next().unwrap_or(s)) { Some("Enabled") => 0, Some("Disabled") => 1, Some("Hidden") => 2, _ => 3 }
@@ -271,6 +326,37 @@ impl AthenaLobbyUi {
     }
 
     pub fn tab_labels(&self) -> &[String] { &self.tab_labels }
+    pub fn option_rows(&self) -> &[(usize, usize)] { &self.option_rows }
+
+    fn install_option_rows(&mut self, n: usize) {
+        let Some(fill) = self.ui.find_by_name("TeamFillRow") else { return };
+        let Some(parent) = self.ui.w[fill].parent else { return };
+        for i in 0..n {
+            let row = self.ui.clone_subtree(fill, parent, &format!("MatchOptionRow{i}"));
+            let Some(rot) = self.ui.find_in(row, "TeamFillRotator") else { continue };
+            self.ui.w[rot].name = format!("MatchOptionRotator{i}");
+            self.option_rows.push((row, rot));
+        }
+    }
+
+    fn apply_options(&mut self, st: &LobbyState) {
+        let locres = self.ui.store.locres();
+        let enabled = st.party_leader && st.matchmaking.is_none();
+        for (i, &(row, rot)) in self.option_rows.clone().iter().enumerate() {
+            let Some(o) = st.options.get(i) else { self.ui.w[row].vis = Vis::Collapsed; continue };
+            self.ui.w[row].vis = Vis::Visible;
+            if let Some(label) = self.ui.w[row].kids.iter().copied().find(|&k| self.ui.w[k].class == "CommonTextBlock") { self.ui.w[label].text = Some(o.label.to_owned()); }
+            let value = match o.values.get(o.selected) {
+                Some(OptionText::Locres { ns, key }) => locres.as_ref().and_then(|l| l.get(ns, key)).map(|s| s.to_owned()).unwrap_or_default(),
+                Some(OptionText::Literal(s)) => (*s).to_owned(),
+                None => String::new(),
+            };
+            if let Some(t) = self.ui.var(rot, "MyText") { self.ui.w[t].text = Some(value); }
+            self.ui.w[rot].enabled = enabled;
+            self.ui.w[rot].btn_state = if enabled { BtnState::Normal } else { BtnState::Disabled };
+        }
+    }
+    pub fn join_code_widget(&self) -> Option<usize> { self.join_code }
     /// How many new item cards one `draw` may bake (see `athena_locker::card::CardMats`); `usize::MAX` for captures.
     pub fn set_card_budget(&mut self, n: usize) { self.card_mats.max_per_frame = n; }
     /// Some item cards were not baked yet this frame (budget): draw again.
@@ -308,6 +394,8 @@ impl AthenaLobbyUi {
         if self.tab_content.get(st.selected_tab).is_some_and(|c| c == crate::screens::athena_locker::TAB_CLASS) {
             if let Some(l) = self.locker.as_mut() { l.apply(&mut self.ui, uic, &st.locker, viewport, scale); }
         }
+        if self.locker.is_none() { if let Some(i) = self.tab_content.iter().position(|c| c == crate::screens::athena_locker::TAB_CLASS) { self.ensure_page(i); } }
+        if let Some(l) = self.locker.as_mut() { l.apply_banner(&mut self.ui, uic, &st.locker, scale); }
         let locres = self.ui.store.locres();
         let find = |ui: &Ui, n: &str| ui.find_by_name(n);
         let miss = |ui: &Ui, ns: &str, key: &str| { let m = format!("locres miss: {ns} / {key}"); let mut u = ui.unresolved.borrow_mut(); if !u.contains(&m) { u.push(m); } };
@@ -345,6 +433,8 @@ impl AthenaLobbyUi {
         }
         if let Some(pp) = find(&self.ui, "PlayerPanel") { self.ui.w[pp].vis = if st.player_panel { Vis::SelfHitTestInvisible } else { Vis::Hidden }; }
         if let Some(pb) = find(&self.ui, "PlayButton") { self.ui.w[pb].btn_state = if st.play_hovered { BtnState::Hovered } else { BtnState::Normal }; }
+        self.apply_join_code(st);
+        self.apply_options(st);
         self.apply_matchmaking(st);
         self.apply_season(st);
         self.apply_quests(st);
@@ -358,6 +448,14 @@ impl AthenaLobbyUi {
             self.ui.w[id].btn_state = match (sel, pressed) { (false, false) => BtnState::Hovered, (false, true) => BtnState::Pressed, (true, false) => BtnState::SelectedHovered, (true, true) => BtnState::SelectedPressed };
             self.ui.refresh_button_text(id);
         }
+    }
+
+    fn apply_join_code(&mut self, st: &LobbyState) {
+        let Some(b) = self.join_code else { return };
+        let text = match st.join_code_input.as_deref() { Some(t) => format!("{t}_"), None => JOIN_CODE_LABEL.to_owned() };
+        if let Some(tw) = self.ui.var(b, "CenterButtonTextWidget") { self.ui.w[tw].text = Some(text); self.ui.w[tw].vis = Vis::SelfHitTestInvisible; }
+        self.ui.w[b].btn_state = if st.join_code_input.is_some() { BtnState::Hovered } else { BtnState::Normal };
+        self.ui.refresh_button_text(b);
     }
 
     fn apply_season(&mut self, st: &LobbyState) {
@@ -496,7 +594,9 @@ impl AthenaLobbyUi {
         self.card_mats.pending = false;
         self.apply_state(uic, st, [w / scale, h / scale], scale);
         let pads = self.prepare_pads(st, scale);
-        let lay = layout::run(&mut self.ui, uic, self.root, [w / scale, h / scale], scale, &pads);
+        let mut overlays = self.apply_social(st.party_finder.as_ref(), st.error_dialog.as_ref());
+        if st.locker.banner_editor.is_some() { if let Some(m) = self.locker.as_ref().and_then(|l| l.banner.modal()) { overlays.push(m); } }
+        let lay = layout::run_with(&mut self.ui, uic, self.root, [w / scale, h / scale], scale, &pads, &overlays);
         let px = |r: [f32; 4]| Rect::new(r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale);
         let id_rects: Vec<Rect> = lay.rect.iter().map(|r| px(*r)).collect();
         let mut p = paint::Painter { c: layout::Ctx { ui: &mut self.ui, uic, lay }, out: RenderList::new(), mats: &mut self.mats, blur: vec![], missing: vec![], scale, disabled: false };
@@ -504,7 +604,8 @@ impl AthenaLobbyUi {
         for &(id, _, _) in &pads { p.paint(id, paint::Tf::ID, [1.0; 4]); }
         // the native item cards of the Locker (slot buttons and picker tiles) are painted over their (empty) `FortMultiSizeItemCard` rectangles
         if let Some(l) = self.locker.as_ref() { l.paint_cards(&*p.c.ui, &mut *p.c.uic, &mut self.card_mats, &mut p.out, &id_rects, &mut p.missing); }
-        if let Some((channel, hint)) = st.chat.as_ref() { paint_chat_strip(&mut *p.c.uic, &mut p.out, w, h, scale, channel, hint); }
+        if let Some((channel, hint)) = st.chat.as_ref() { paint_chat_strip(&mut *p.c.uic, &mut p.out, w, h, scale, channel, hint, st.chat_input.as_deref()); }
+        for &o in &overlays { p.paint(o, paint::Tf::ID, [1.0; 4]); }
         let (list, blur, mut missing) = (std::mem::take(&mut p.out), std::mem::take(&mut p.blur), std::mem::take(&mut p.missing));
         let lay = p.c.lay;
         missing.extend(self.ui.unresolved.borrow().iter().cloned());

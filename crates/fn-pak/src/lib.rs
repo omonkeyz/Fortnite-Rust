@@ -436,7 +436,8 @@ impl PakFile {
         #[cfg(target_arch = "wasm32")]
         {
             // an entry a `retain_reads` scope read earlier (e.g. on a loading thread) is not fetched again
-            if let Some(b) = retained::get(&self.name, e.offset) { return Ok(Cow::Owned(b.to_vec())); }
+            if retained::active() { if let Some(b) = retained::get(&self.name, e.offset) { return Ok(Cow::Owned(b.to_vec())); } }
+            else if let Some(b) = retained::take(&self.name, e.offset) { return Ok(Cow::Owned(std::sync::Arc::try_unwrap(b).unwrap_or_else(|b| b.to_vec()))); }
             if let Some(ix) = webcook::index() {
                 if let Some(l) = ix.find(&self.name, e.offset).filter(|l| l.size as u64 == e.size) {
                     match ix.read_entry(l) {
@@ -723,10 +724,15 @@ pub struct PakSet {
     pub skipped: Vec<(String, String)>,
 }
 
+impl Clone for PakSet {
+    fn clone(&self) -> PakSet { PakSet { inner: self.inner.clone(), skipped: self.skipped.clone() } }
+}
+
 struct Mounted {
     paks: Vec<PakFile>,
     /// normalised path -> winning entry
     lookup: HashMap<String, EntryRef>,
+    names: std::sync::OnceLock<HashMap<u64, Vec<(u32, u32)>>>,
 }
 
 /// BROWSER PORT (wasm32): entries read inside a [`retain_reads`] scope, kept for later reads of the same entries (LRU, [`retained::BUDGET`]).
@@ -743,6 +749,14 @@ mod retained {
     pub(super) fn active() -> bool { ON.with(|c| c.get()) }
     pub(super) fn set(on: bool) -> bool { ON.with(|c| c.replace(on)) }
     pub(super) fn get(pak: &str, offset: u64) -> Option<Arc<Vec<u8>>> { CACHE.lock().ok()?.as_ref()?.map.get(&(pak.to_owned(), offset)).cloned() }
+    pub(super) fn take(pak: &str, offset: u64) -> Option<Arc<Vec<u8>>> {
+        let mut g = CACHE.lock().ok()?;
+        let c = g.as_mut()?;
+        let d = c.map.remove(&(pak.to_owned(), offset))?;
+        c.bytes -= d.len();
+        if c.order.len() > 4 * c.map.len() + 1024 { let m = &c.map; c.order.retain(|k| m.contains_key(k)); }
+        Some(d)
+    }
     pub(super) fn put(pak: &str, offset: u64, data: Vec<u8>) {
         let Ok(mut g) = CACHE.lock() else { return };
         let c = g.get_or_insert_with(|| Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0 });
@@ -830,6 +844,18 @@ pub fn retain_reads<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_arch = "wasm32")]
     {
         let prev = retained::set(true);
+        let r = f();
+        retained::set(prev);
+        r
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    f()
+}
+
+pub fn without_retain<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prev = retained::set(false);
         let r = f();
         retained::set(prev);
         r
@@ -938,7 +964,7 @@ impl PakSet {
                 lookup.insert(e.key(), EntryRef { pak: pi as u32, index: ei as u32 });
             }
         }
-        let inner = std::sync::Arc::new(Mounted { paks, lookup });
+        let inner = std::sync::Arc::new(Mounted { paks, lookup, names: std::sync::OnceLock::new() });
         if let Ok(mut m) = MOUNTED.lock() {
             // (only this thread mounts these files: `mounting::begin`; keep the first one regardless)
             if let Some((_, shared, _)) = m.iter().find(|(f, ..)| f == files) {
@@ -1017,6 +1043,15 @@ impl PakSet {
                 (pf, &pf.entries[r.index as usize])
             })
             .collect();
+        out.sort_by(|a, b| a.1.path.to_lowercase().cmp(&b.1.path.to_lowercase()));
+        out
+    }
+
+    pub fn by_file_name(&self, name: &str) -> Vec<(&PakFile, &PakEntry)> {
+        fn h(s: &str) -> u64 { use std::hash::{Hash, Hasher}; let mut d = std::collections::hash_map::DefaultHasher::new(); s.hash(&mut d); d.finish() }
+        let idx = self.inner.names.get_or_init(|| { let mut m: HashMap<u64, Vec<(u32, u32)>> = HashMap::new(); for (k, r) in &self.inner.lookup { m.entry(h(k.rsplit('/').next().unwrap_or(k))).or_default().push((r.pak, r.index)); } m });
+        let want = name.to_lowercase();
+        let mut out: Vec<(&PakFile, &PakEntry)> = idx.get(&h(&want)).map(|v| v.iter().map(|&(p, i)| { let pf = &self.inner.paks[p as usize]; (pf, &pf.entries[i as usize]) }).filter(|(_, e)| { let n = e.path.replace('\\', "/"); n.rsplit('/').next().unwrap_or(&n).to_lowercase() == want }).collect()).unwrap_or_default();
         out.sort_by(|a, b| a.1.path.to_lowercase().cmp(&b.1.path.to_lowercase()));
         out
     }

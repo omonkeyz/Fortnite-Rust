@@ -36,6 +36,12 @@ pub const OUTLINE_RARITY_COLORS: [[f32; 4]; 10] = [
 pub const SPARKLE_GROUND: [f32; 10] = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5];
 pub const SPARKLE_PICKED: [f32; 10] = [0.5, 2.5, 4.0, 5.5, 7.0, 8.5, 10.0, 11.5, 13.0, 14.5];
 pub const LIFETIME_PICKED: [f32; 10] = [0.14, 0.175, 0.25, 0.325, 0.4, 0.475, 0.55, 0.625, 0.7, 0.775];
+pub const SHRINK_SPHERE: [(f32, f32, f32, f32, bool); 4] = [
+    (0.001_411_199_6, -0.009_729_385, -1.090_772_6, -1.090_772_6, true),
+    (0.157_685_88, 0.166_297_14, 6.163_026, 6.163_044, true),
+    (0.275_955_92, 0.849_048_85, 2.415_346, 2.415_338_5, true),
+    (0.468_137_03, 0.982_944_5, 0.0, 0.0, false),
+];
 /// `Component Radius Multiplier` of the CDO.
 pub const RADIUS_MULTIPLIER: f32 = 0.75;
 
@@ -63,7 +69,7 @@ pub fn trail_params(rarity: u8, radius_cm: f32) -> Params {
     p
 }
 
-struct Actor { beam: Instance, trail: Option<Instance>, picked: bool, radius_cm: f32, rarity: u8, resource: bool, /// The hologram of B_Pickups (mesh path + its MIDs), when the item mesh is known.
+struct Actor { beam: Instance, trail: Option<Instance>, picked: bool, accum: f32, last_seen: f32, radius_cm: f32, rarity: u8, resource: bool, /// The hologram of B_Pickups (mesh path + its MIDs), when the item mesh is known.
     holo: Option<(String, crate::pickups_dxbc::HoloActor)> }
 struct Burst { inst: Instance }
 
@@ -179,6 +185,13 @@ pub fn init(roots: &[PathBuf]) -> bool {
     true
 }
 
+const PICKUP_FX_CULL_MARGIN_M: f32 = 1.0;
+const PICKUP_ITEM_CULL_RADIUS_M: f32 = 2.0;
+const PICKUP_ITEM_SHADOW_MARGIN_M: f32 = 5.0;
+
+pub const BEAM_SECONDS_BEFORE_INACTIVE: f32 = 5.0;
+fn loops_forever(sys: &ParticleSystem) -> bool { sys.emitters.iter().any(|e| e.lods.iter().any(|l| l.enabled && l.required.emitter_loops == 0)) }
+
 fn xf(pos: Vec3, yaw: f32) -> Transform { Transform::from_game([pos.x, pos.y, pos.z], yaw) }
 
 /// The DXBC materials (loaded on first use from the game install).
@@ -239,7 +252,7 @@ pub fn frame(renderer: &mut Renderer, camera: &CameraParams, _frame_dt: f32) -> 
                 },
                 _ => None,
             };
-            st.actors.insert(s.id, Actor { beam, trail: None, picked: false, radius_cm: radius, rarity: s.rarity, resource, holo });
+            st.actors.insert(s.id, Actor { beam, trail: None, picked: false, accum: 0., last_seen: 0., radius_cm: radius, rarity: s.rarity, resource, holo });
         }
         let (loot, ribbon) = (st.loot.clone(), st.ribbon.clone());
         let a = st.actors.get_mut(&s.id).unwrap();
@@ -258,16 +271,18 @@ pub fn frame(renderer: &mut Renderer, camera: &CameraParams, _frame_dt: f32) -> 
             if a.resource { if let Some(l) = &loot { let i = Instance::new(l.clone(), Transform::from_game([s.pos.x, s.pos.y, s.pos.z], 0.), s.id ^ 0x100F, 0.); st.bursts.push(Burst { inst: i }); } }
         }
         if let Some(t) = a.trail.as_mut() { t.xf = p; }
+        if let Some(t) = s.picked_t.filter(|_| a.picked) { let k = 1. - fn_game::pickups::eval_keys(&SHRINK_SPHERE, t.max(0.)); a.beam.set_vector_parameter("SizeSphere", [k; 3]); }
     }
     // tick + draw
     st.clock = world;
     // SORTFIX: each instance = one particle system component: its draws carry the component's sort data (dynamic / fixed bounds origin, TranslucentRendering.cpp:864)
     let cat0 = st.catalog.clone();
     let mut groups: Vec<(Vec<fn_particles::EmitterDraw>, Transform, fn_render::primitive_ub::BoxSphereBounds)> = vec![];
-    let mut collect = |inst: &Instance| { let mut d = vec![]; inst.draw(eye, &mut d); if !d.is_empty() { groups.push((d, inst.xf, crate::particles::instance_bounds(inst, &cat0))); } };
+    let mut collect = |inst: &Instance| -> bool { let b = crate::particles::instance_bounds(inst, &cat0); if !crate::particles::camera_sees_ue(&b, PICKUP_FX_CULL_MARGIN_M, camera) { return false; } let mut d = vec![]; inst.draw(eye, &mut d); if !d.is_empty() { groups.push((d, inst.xf, b)); } true };
+    let inactive = if loops_forever(&st.beam) { BEAM_SECONDS_BEFORE_INACTIVE.max(0.1) } else { 0. };
     for a in st.actors.values_mut() {
-        a.beam.tick(dt, &env);
-        collect(&a.beam);
+        if !(inactive > 0. && a.accum > inactive && world > a.last_seen + inactive) { a.beam.tick(dt, &env); a.accum += dt; }
+        if collect(&a.beam) { a.last_seen = world; }
         if let Some(t) = a.trail.as_mut() { t.tick(dt, &env); collect(t); }
     }
     for t in st.orphan_trails.iter_mut() { t.tick(dt, &env); collect(t); }
@@ -281,7 +296,8 @@ pub fn frame(renderer: &mut Renderer, camera: &CameraParams, _frame_dt: f32) -> 
         for s in &snaps {
             let (Some((path, false)), Some(origin)) = (s.mesh.as_ref(), s.origin_cm) else { continue };
             let t = xf(s.pos, s.yaw);
-            if let Err(e) = dx.draw_static_item(renderer.fx(), path, t.pos, t.rot, origin) { if st.warned.insert(format!("static {path}")) { let m = format!("static item {path}: NOT DRAWN with its cooked materials: {e}"); eprintln!("[pickups-fx] {m}"); st.log.push(m); } }
+            if !crate::particles::camera_sees(s.pos, PICKUP_ITEM_CULL_RADIUS_M + PICKUP_ITEM_SHADOW_MARGIN_M, camera) { dx.static_item_df(path, t.pos, t.rot, origin); continue; }
+            if let Err(e) = dx.draw_static_item_with(renderer.fx(), path, t.pos, t.rot, origin, s.black_hole) { if st.warned.insert(format!("static {path}")) { let m = format!("static item {path}: NOT DRAWN with its cooked materials: {e}"); eprintln!("[pickups-fx] {m}"); st.log.push(m); } }
         }
     }
     // the holograms (B_Pickups hologram component)
@@ -290,6 +306,7 @@ pub fn frame(renderer: &mut Renderer, camera: &CameraParams, _frame_dt: f32) -> 
         for s in &snaps {
             let (Some(a), Some(origin)) = (st.actors.get(&s.id), s.origin_cm) else { continue };
             let Some((path, h)) = a.holo.as_ref() else { continue };
+            if !crate::particles::camera_sees(s.pos, PICKUP_ITEM_CULL_RADIUS_M + PICKUP_FX_CULL_MARGIN_M, camera) { continue; }
             let t = xf(s.pos, s.yaw);
             if let Err(e) = dx.draw_hologram(renderer.fx(), path, h, t.pos, t.rot, origin, eye_ue) { if st.warned.insert(format!("holo {path}")) { let m = format!("hologram of {path}: NOT DRAWN: {e}"); eprintln!("[pickups-fx] {m}"); st.log.push(m); } }
         }

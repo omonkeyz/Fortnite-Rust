@@ -130,7 +130,7 @@ pub fn is_female(defs: &[PartDef]) -> bool {
 }
 
 pub fn master_mesh_for(defs: &[PartDef]) -> String {
-    defs.iter().find(|d| d.kind == PartKind::Body && d.gender.as_deref().is_some_and(|g| g.ends_with("::Female")))
+    defs.iter().find(|d| d.kind == PartKind::Body)
         .and_then(|d| d.master_meshes.first().cloned())
         .unwrap_or_else(|| MASTER_MESH_PKG.to_owned())
 }
@@ -228,8 +228,19 @@ pub fn decode_texture(src: &ClipSourceDir, path: &str) -> Result<RgbaTexture, St
     let tex = loader::texture_export(src, path)?;
     if tex.num_slices != 1 { return Err(format!("{path}: not a plain 2D texture")); }
     let mip = tex.best_mip().ok_or_else(|| format!("{path}: no available mip"))?;
+    let cooked = CookedChain::of(&tex).map(std::sync::Arc::new);
+    if cooked.is_some() && cooked_only() { return Ok(RgbaTexture { width: tex.mips[mip].width as usize, height: tex.mips[mip].height as usize, rgba: Vec::new(), cooked }); }
     let img = tex.decode(mip, fn_texture::DecodeOptions::default()).map_err(|e| format!("{path}: {e}"))?;
-    Ok(RgbaTexture { width: img.width, height: img.height, rgba: img.to_rgba8(), cooked: CookedChain::of(&tex).map(std::sync::Arc::new) })
+    Ok(RgbaTexture { width: img.width, height: img.height, rgba: img.to_rgba8(), cooked })
+}
+
+thread_local! { static COOKED_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub fn cooked_only() -> bool { COOKED_ONLY.with(|c| c.get()) }
+pub fn with_cooked_only<R>(f: impl FnOnce() -> R) -> R {
+    let prev = COOKED_ONLY.with(|c| c.replace(true));
+    let r = f();
+    COOKED_ONLY.with(|c| c.set(prev));
+    r
 }
 
 /// The four slots of the renderer's character material, filled from a material's parameters `Diffuse`, `Normals`, `SpecularMasks`, `M`.
@@ -325,7 +336,7 @@ impl BrCharacter {
         ch.female = is_female(&defs);
         let master_path = master_mesh_for(&defs);
         let (master, _) = load_mesh(long_of(&master_path), master_path.rsplit('.').next().unwrap_or("Fortnite_M_Avg_Player"))?;
-        if master_path != MASTER_MESH_PKG { ch.notes.push(format!("master mesh swapped to the Female body part's MasterSkeletalMeshes[0] {master_path} (FortPlayerPawn.cpp:0x1ea path, FUN_1407fccd0)")); }
+        if master_path != MASTER_MESH_PKG { ch.notes.push(format!("master mesh swapped to the Body part's MasterSkeletalMeshes[0] {master_path} (FortPlayerPawn.cpp:0x1ea path, FUN_1407fccd0)")); }
         let swatches = crate::br_material::swatch_overrides(src, &defs.iter().collect::<Vec<_>>(), &mut ch.notes);
         for def in defs {
             // def.master_meshes names the mesh the part follows in the editor (the body lists SK_M_MALE_Base_Skeleton, the head the

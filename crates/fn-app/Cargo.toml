@@ -30,6 +30,7 @@ image.workspace = true
 serde_json.workspace = true
 gltf.workspace = true
 fn-render = { path = "../fn-render" }
+fn-postfx = { path = "../fn-postfx" }
 fn-terrain = { path = "../fn-terrain" } # TERRAIN: the landscape as walkable ground
 fn-hull = { path = "../fn-hull" }
 fn-propdata = { path = "../fn-propdata" }
@@ -68,6 +69,8 @@ fn-movement = { path = "../fn-movement" } # ADS HOOK
 fn-console = { path = "../fn-console" } # CONSOLE HOOK (F2 command bar: registry / parser / completion)
 fn-building = { path = "../fn-building" } # BUILDING HOOKS (building_edit_hook.rs)
 fn-net = { path = "../fn-net" }
+fn-bots = { path = "../fn-bots" }
+fn-nav = { path = "../fn-nav" }
 gilrs = { version = "0.11", optional = true, default-features = false, features = ["xinput"] }
 
 # Win32 bindings only (no C code): message boxes, console attach, cursor clip read-back, monitor work area. Used by src/sys.rs, the one module that may contain unsafe.

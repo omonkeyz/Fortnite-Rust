@@ -104,6 +104,12 @@ impl CueResolver for LibResolver<'_> {
     }
 }
 
+fn encoded_ok(a: &crate::soundwave::SoundWaveAsset) -> bool {
+    if a.info.sample_rate.is_none() || a.info.channels.is_none() { return false; }
+    if a.streamed.as_ref().is_some_and(|s| s.format == "OPUS") { return true; }
+    a.streamed.is_none() && a.primary().is_some_and(|f| f.name == "OGG" || f.name == "OPUS")
+}
+
 impl Library {
     pub fn open(root: impl AsRef<Path>) -> Result<Library> {
         Ok(Library::new(Install::open(root)?))
@@ -156,9 +162,16 @@ impl Library {
                 lw.pitch = asset.info.pitch.unwrap_or(1.0);
                 Arc::new(lw)
             }
+            None if self.compact_pcm && encoded_ok(&asset) => {
+                let mut a = asset;
+                let keep = a.primary().cloned();
+                a.formats = keep.into_iter().collect();
+                let (v, p) = (a.info.volume.unwrap_or(1.0), a.info.pitch.unwrap_or(1.0));
+                Arc::new(LoadedWave::encoded(a, v, p))
+            }
             None => {
                 let pcm = crate::codec::decode_asset(&asset)?;
-                { let lw = LoadedWave { pcm, volume: asset.info.volume.unwrap_or(1.0), pitch: asset.info.pitch.unwrap_or(1.0), stream: None, pcm16: Vec::new() }; Arc::new(if self.compact_pcm { lw.compact() } else { lw }) }
+                { let lw = LoadedWave { pcm, volume: asset.info.volume.unwrap_or(1.0), pitch: asset.info.pitch.unwrap_or(1.0), stream: None, pcm16: Vec::new(), lazy: None }; Arc::new(if self.compact_pcm { lw.compact() } else { lw }) }
             }
         };
         self.waves.insert(key, w.clone());

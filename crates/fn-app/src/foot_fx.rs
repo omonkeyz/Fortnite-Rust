@@ -37,12 +37,14 @@ struct State {
     seen_landings: Option<u32>, feet_ue: Vec3, parent_yaw: f32, vel_ue: Vec3, serial: u64, errors: std::collections::HashSet<String>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn new_state(catalog: Option<Arc<Catalog>>, install: Option<PathBuf>) -> State {
     State { catalog, install, dxbc: None, logic: FootFx::default(), walk: Comp { scale: 1., time_dilation: 1., ..Default::default() }, run: Comp { scale: 1., time_dilation: 1., ..Default::default() }, lands: vec![], seen_landings: None, feet_ue: Vec3::ZERO, parent_yaw: 0., vel_ue: Vec3::ZERO, serial: 0, errors: Default::default() }
 }
 
 /// Loads `<root>/particles-footfx` (or `FN_FOOTFX_DIR`); `install` = the 1.8 install whose paks hold the cooked materials.
 pub fn init(install: Option<PathBuf>, roots: &[PathBuf]) {
+    crate::waterfall_fx::init(roots);
     let dir = fn_live::var_os("FN_FOOTFX_DIR").map(PathBuf::from).filter(|d| d.join("index.json").is_file()).or_else(|| roots.iter().map(|r| r.join("particles-footfx")).find(|d| d.join("index.json").is_file()));
     // `FN_FOOTFX=0`: off (A/B frame-time comparisons)
     let off = fn_live::var("FN_FOOTFX").map_or(false, |v| v == "0");
@@ -54,6 +56,7 @@ pub fn init(install: Option<PathBuf>, roots: &[PathBuf]) {
         None => { eprintln!("[footfx] no `particles-footfx` folder in the asset roots (fn-particles-export --out <assets>/particles-footfx P_Walk_DustKickup_01 P_Run_DustKickup_01 P_Player_Land_Effect): no foot dust"); None }
     };
     if install.is_none() { eprintln!("[footfx] no install (paks): the dust materials cannot be built, no foot dust drawn"); }
+    WARMED.store(false, std::sync::atomic::Ordering::Relaxed);
     *STATE.lock().unwrap() = Some(new_state(catalog, install));
 }
 
@@ -84,22 +87,31 @@ fn draw(dx: &mut Dxbc, fx: &mut FxRenderer, cat: &Catalog, inst: &Instance, eye:
 
 /// FIRST USE: opens the paks and builds every material / mesh of the three systems under the loading screen (one throw-away frame of each, moved so the
 /// SpawnPerUnit emitters spawn too).
-pub fn prebuild(fx: &mut FxRenderer) {
-    let Ok(mut g) = STATE.lock() else { return };
-    let Some(st) = g.as_mut() else { return };
-    let Some(cat) = st.catalog.clone() else { return };
+pub fn prebuild(fx: &mut FxRenderer) -> bool {
+    static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if WARMED.load(std::sync::atomic::Ordering::Relaxed) { return true; }
+    let Ok(mut g) = STATE.lock() else { return true };
+    let Some(st) = g.as_mut() else { return true };
+    let Some(cat) = st.catalog.clone() else { return true };
     let t = std::time::Instant::now();
-    let Some(dx) = dxbc(&mut st.dxbc, &st.install, fx) else { return };
+    let first = st.dxbc.is_none();
+    let Some(dx) = dxbc(&mut st.dxbc, &st.install, fx) else { return true };
+    if first { return false; }
     let view = ViewParams { eye: Vec3::new(0., 2., 3.), forward: Vec3::new(0., -0.5, -0.85).normalize(), up: Vec3::Y, tan_half: (1., 0.6), near_m: 0.1, far_m: 1000., width: 64, height: 64, time: 0., real_time: 0., delta_world: 1. / 60. };
     dx.begin(&view);
     let env = Env::none();
-    for p in [P_WALK, P_RUN, P_LAND] {
+    let at = AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for p in [P_WALK, P_RUN, P_LAND].into_iter().skip(at).take(1) {
         let Some(s) = cat.system(p) else { continue };
         let mut i = Instance::new(s, Transform::identity(), 1, 100.);
         for k in 0..12 { i.xf.pos = Vec3::new(k as f32 * 10., 0., 0.); i.tick(1. / 30., &env); if k == 0 || k == 11 { draw(dx, fx, &cat, &i, [0., 2., 3.], 1. / 60., &mut st.errors); } }
     }
+    if at == 0 { crate::waterfall_fx::warm(dx, fx); }
     let _ = dx.take_frame();
+    if at + 1 < 3 { return false; }
+    WARMED.store(true, std::sync::atomic::Ordering::Relaxed);
     eprintln!("[footfx] warm-up: dust materials / meshes built in {:.0} ms", t.elapsed().as_secs_f32() * 1000.);
+    true
 }
 
 /// The dust of this frame, ticked by the world delta `dt`, as FX-pass draws appended to `out`.
@@ -107,7 +119,8 @@ pub fn fx_frame(fx: &mut FxRenderer, view: &ViewParams, dt: f32, out: &mut FxFra
     let Ok(mut guard) = STATE.lock() else { return };
     let Some(st) = guard.as_mut() else { return };
     let Some(cat) = st.catalog.clone() else { return };
-    if st.walk.inst.is_none() && st.run.inst.is_none() && st.lands.is_empty() { return; }
+    let falls = crate::waterfall_fx::tick(view, dt);
+    if st.walk.inst.is_none() && st.run.inst.is_none() && st.lands.is_empty() && !falls { return; }
     // TERRAIN: the particles' ground (collision modules), as in particles::tick_all
     let env_ground = |x: f32, y: f32| fn_terrain::ground_y(x * 0.01, y * 0.01) * 100.;
     let env = Env { ground: Some(&env_ground) };
@@ -129,6 +142,7 @@ pub fn fx_frame(fx: &mut FxRenderer, view: &ViewParams, dt: f32, out: &mut FxFra
         if debug { eprintln!("[footfx debug] {} live {} at UE ({:.0}, {:.0}, {:.0})", i.system.name, i.live_count(), i.xf.pos.x, i.xf.pos.y, i.xf.pos.z); }
         draw(dx, fx, &cat, i, eye, dt, errors);
     }
+    if falls { crate::waterfall_fx::draw_into(dx, fx, view, dt); }
     let fr = dx.take_frame();
     out.buffer_writes.extend(fr.buffer_writes);
     out.draws.extend(fr.draws);

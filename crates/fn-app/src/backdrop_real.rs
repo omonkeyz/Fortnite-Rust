@@ -267,6 +267,11 @@ pub fn frame(fx: &mut FxRenderer, view: &ViewParams, out: &mut FxFrame) {
     let Ok(mut g) = STATE.lock() else { return };
     if let Some(s) = g.as_mut() { s.frame(fx, view, out); }
 }
+pub fn prebuild(fx: &mut FxRenderer) {
+    let Ok(mut g) = STATE.lock() else { return };
+    let Some(s) = g.as_mut() else { return };
+    if s.built.is_none() { let r = s.build(fx); if let Err(e) = &r { eprintln!("[backdrop real] NOT BUILT ({e}): the far backdrop is not drawn on the real-shader path"); } s.built = Some(r); }
+}
 /// The real path is on (backdrop_load then leaves the far skybox meshes out of the reconstructed `Kind::Skybox` draw).
 pub fn active() -> bool { STATE.lock().ok().map_or(false, |g| g.as_ref().map_or(false, |s| !matches!(s.built, Some(Err(_))))) }
 /// REPORT ONLY (2026-10-08): (frames, summed draws, summed triangles) of the far meshes over the run.

@@ -38,6 +38,25 @@ impl Pkg {
     }
 }
 
+pub static IS_MAIN_THREAD: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+static PKG_PRELOADED: std::sync::Mutex<Option<HashMap<String, Option<Pkg>>>> = std::sync::Mutex::new(None);
+static PKG_QUEUE: std::sync::Mutex<std::collections::VecDeque<String>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+pub fn preload(install: std::path::PathBuf, list: Vec<String>, threads: usize) {
+    if let Ok(mut q) = PKG_QUEUE.lock() { q.extend(list); }
+    for _ in 0..threads.max(1) {
+        let dir = install.clone();
+        let _ = std::thread::Builder::new().name("ui package preload".into()).spawn(move || {
+            let Ok(set) = PakSet::open_install(&dir) else { return };
+            loop {
+                let Some(long) = PKG_QUEUE.lock().ok().and_then(|mut q| q.pop_front()) else { break };
+                if PKG_PRELOADED.lock().map_or(true, |g| g.as_ref().is_some_and(|m| m.contains_key(&long))) { continue; }
+                let p = load_pkg(&set, &long);
+                if let Ok(mut g) = PKG_PRELOADED.lock() { g.get_or_insert_with(HashMap::new).insert(long, p); }
+            }
+        });
+    }
+}
+
 pub struct Store {
     set: PakSet,
     pkgs: RefCell<HashMap<String, Option<Rc<Pkg>>>>,
@@ -68,8 +87,19 @@ impl Store {
     }
 
     fn load(&self, long: &str) -> Option<Pkg> {
+        if let Some(p) = PKG_PRELOADED.lock().ok().and_then(|mut g| g.as_mut().and_then(|m| m.remove(long))) { return p; }
+        let main = IS_MAIN_THREAD.get().is_some_and(|f| f());
+        let t = std::time::Instant::now();
+        let r = load_pkg(&self.set, long);
+        let ms = t.elapsed().as_secs_f32() * 1000.;
+        if main && ms >= 1. { eprintln!("[pkgrec] {ms:.1} {long}"); }
+        r
+    }
+}
+
+fn load_pkg(set: &PakSet, long: &str) -> Option<Pkg> {
         if !long.starts_with("/Game/") && !long.starts_with("/Engine/") { return None; }
-        let data = PackageData::load(&self.set, long).ok()?;
+        let data = PackageData::load(set, long).ok()?;
         let pkg = data.package().ok()?;
         let mut exports = Vec::with_capacity(pkg.exports.len());
         for (i, e) in pkg.exports.iter().enumerate() {
@@ -102,6 +132,8 @@ impl Store {
         }
         Some(Pkg { name: long.to_owned(), exports, by_path, by_outer, by_name })
     }
+
+impl Store {
 
     /// Every Blueprint function of package `long` decoded once: (statements, input parameter names), by function name.
     fn package_functions(&self, long: &str) -> Rc<HashMap<String, (Rc<Vec<fn_uasset::kismet::Statement>>, Vec<String>)>> {

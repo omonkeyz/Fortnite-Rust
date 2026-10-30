@@ -79,11 +79,30 @@ pub fn load_bp(set: &PakSet, package: &str) -> Result<Bp, String> {
             }
         }
         // POI: every component template of this layer
+        let mut var_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for i in 0..pkg.exports.len() {
+            let cn = pkg.export_class_name(i);
+            if cn != "SCS_Node" && cn != "InheritableComponentHandler" { continue; }
+            let Ok(o) = pkg.read_export(i) else { continue };
+            let Value::Object(m) = o.props.to_json(&pkg) else { continue };
+            if cn == "SCS_Node" {
+                if let (Some(t), Some(v)) = (m.get("ComponentTemplate").and_then(|v| v.as_str()), m.get("InternalVariableName").and_then(|v| v.as_str())) { var_of.insert(leaf(t).to_string(), v.to_string()); }
+            } else if let Some(recs) = m.get("Records").and_then(|v| v.as_array()) {
+                for r in recs {
+                    if let (Some(t), Some(v)) = (r.get("ComponentTemplate").and_then(|v| v.as_str()), r.get("ComponentKey").and_then(|k| k.get("SCSVariableName")).and_then(|v| v.as_str())) { var_of.insert(leaf(t).to_string(), v.to_string()); }
+                }
+            }
+        }
         let mut tl = vec![];
         for i in 0..pkg.exports.len() {
             let cn = pkg.export_class_name(i);
             if !cn.ends_with("Component") { continue; }
-            if let Ok(o) = pkg.read_export(i) { if let Value::Object(m) = o.props.to_json(&pkg) { tl.push((pkg.exports[i].name.trim_end_matches("_GEN_VARIABLE").to_string(), m)); } }
+            if let Ok(o) = pkg.read_export(i) {
+                if let Value::Object(m) = o.props.to_json(&pkg) {
+                    let name = var_of.get(&pkg.exports[i].name).cloned().unwrap_or_else(|| pkg.exports[i].name.trim_end_matches("_GEN_VARIABLE").to_string());
+                    tl.push((name, m));
+                }
+            }
         }
         tpl_layers.push(tl);
         cdo_layers.push(cdo);

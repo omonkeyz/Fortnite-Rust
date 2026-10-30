@@ -105,7 +105,7 @@ impl Texture2D {
         let mut other = None;
         for i in 0..pkg.exports.len() {
             let class = pkg.export_class(i);
-            if class == "Texture2D" || class == "TextureCube" {
+            if class == "Texture2D" || class == "TextureCube" || class == "TextureLightProfile" {
                 return Self::parse_export(pkg, i);
             }
             if class.contains("Texture") && other.is_none() {
@@ -127,7 +127,7 @@ impl Texture2D {
     /// Parse export number `idx` (0 based) which must be a `Texture2D` or `TextureCube`.
     pub fn parse_export(pkg: &Package, idx: usize) -> Result<Texture2D> {
         let class = pkg.export_class(idx);
-        if class != "Texture2D" && class != "TextureCube" {
+        if class != "Texture2D" && class != "TextureCube" && class != "TextureLightProfile" {
             return Err(Error::NotATexture(format!("export {idx} has class {class}")));
         }
         let (start, end) = pkg.export_range(idx);

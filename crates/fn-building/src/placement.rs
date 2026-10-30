@@ -208,7 +208,7 @@ pub fn box_overlaps_hull(lo: Vec3, hi: Vec3, h: &fn_hull::Hull) -> bool {
         mn > cp + r || mx < cp - r
     };
     if h.planes.iter().any(|(n, _)| separated(*n)) { return false; }
-    for ed in &h.edges {
+    for ed in h.edges.iter() {
         let d = h.verts[ed[1] as usize] - h.verts[ed[0] as usize];
         for ax in [Vec3::X, Vec3::Y, Vec3::Z] { let a = ax.cross(d); if a.length_squared() > 1e-12 && separated(a) { return false; } }
     }
@@ -459,13 +459,14 @@ pub struct BuildPreview {
     /// Query result of the current preview transform.
     pub result: QueryResult,
     pub active: bool,
+    pub snapped: bool,
     saved_iterations: [u8; 4],
 }
 
 impl Default for BuildPreview {
     fn default() -> Self {
         BuildPreview { kind: PieceKind::Wall, material: Material::Wood, rotation_iterations: 0, mirrored: false, loc: Vec3::ZERO, rot: Rot::default(), marker_kind: PieceKind::Wall,
-            last_loc: Vec3::ZERO, last_rot: Rot::default(), last_centroid: Vec3::ZERO, result: QueryResult::InvalidActor, active: false, saved_iterations: [0; 4] }
+            last_loc: Vec3::ZERO, last_rot: Rot::default(), last_centroid: Vec3::ZERO, result: QueryResult::InvalidActor, active: false, snapped: false, saved_iterations: [0; 4] }
     }
 }
 
@@ -501,6 +502,7 @@ impl BuildPreview {
         let moved = (loc - self.last_loc).abs().max_element() > grid::KINDA_SMALL
             || [rot.pitch - self.last_rot.pitch, rot.yaw - self.last_rot.yaw, rot.roll - self.last_rot.roll].iter().any(|d| { let m = d.rem_euclid(360.); m > 1e-4 && 360. - m > 1e-4 });
         if moved { self.last_loc = loc; self.last_rot = rot; self.last_centroid = grid::centroid(self.kind, loc, rot.yaw); }
+        self.snapped = moved;
         self.result
     }
 

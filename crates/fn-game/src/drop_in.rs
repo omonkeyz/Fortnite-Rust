@@ -88,6 +88,7 @@ pub const SKYDIVE_PARACHUTE: Mode = Mode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GamePhase { Warmup, Aircraft, SafeZones }
+pub fn damage_enabled(phase: Option<GamePhase>) -> bool { phase != Some(GamePhase::Warmup) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GamePhaseStep { None, Warmup, GetReady, BusLocked, BusFlying, StormForming }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,6 +329,8 @@ impl GameSim {
         self.cam.reset();
     }
     pub fn in_warmup(&self) -> bool { self.drop.as_ref().map_or(false, |d| d.phase == GamePhase::Warmup) }
+    pub fn match_phase(&self) -> Option<GamePhase> { self.drop.as_ref().map(|d| d.phase) }
+    pub fn damage_enabled(&self) -> bool { damage_enabled(self.match_phase()) }
     pub fn on_bus(&self) -> bool { self.drop.as_ref().map_or(false, |d| d.in_aircraft) }
     pub fn aerial_phase(&self) -> AerialPhase {
         let Some(d) = &self.drop else { return AerialPhase::None };
@@ -338,7 +341,7 @@ impl GameSim {
         if !c.is_skydiving() || c.is_parachute_forced_open() { return AerialPhase::None; }
         if c.is_parachute_open() { AerialPhase::Parachuting } else { AerialPhase::Skydiving }
     }
-    pub fn items_blocked(&self) -> bool { self.on_bus() || self.controller.component().is_skydiving() || self.controller.component().in_aerial_mode() }
+    pub fn items_blocked(&self) -> bool { self.dbno || self.on_bus() || self.controller.component().is_skydiving() || self.controller.component().in_aerial_mode() }
     pub fn drop_begin_frame(&mut self, dt: f32) {
         if let Some(d) = self.drop.as_mut() { d.view_time += dt; }
     }
@@ -560,6 +563,7 @@ mod tests {
         g.world.props.clear();
         g.start_match_on_spawn_island(0.5, 0.3, 0.7, WARMUP_COUNTDOWN_DURATION);
         assert!(g.in_warmup() && !g.on_bus());
+        assert!(!g.damage_enabled());
         let o = Vec3::from(SPAWN_ISLAND_LOCATION);
         assert!((g.x - (WARMUP_STARTS[55][0] + o.x) * 0.01).abs() < 1.);
         let dt = 1. / 30.;
@@ -569,6 +573,7 @@ mod tests {
         while !g.on_bus() { g.step(&FrameInput { forward: 1., ..Default::default() }, dt); t += dt; ready |= g.drop.as_ref().unwrap().game_phase_step().0 == GamePhaseStep::GetReady; assert!(t < WARMUP_COUNTDOWN_DURATION + 1.); }
         assert!(ready && (t - WARMUP_COUNTDOWN_DURATION).abs() < 0.1, "bus at {t}");
         assert_eq!(g.drop.as_ref().unwrap().game_phase_step().0, GamePhaseStep::BusLocked);
+        assert!(g.damage_enabled());
         assert!(g.y > 700., "bus height {}", g.y);
     }
     #[test] fn the_bus_auto_ejects_at_the_end_of_the_drop_zone() {

@@ -344,7 +344,7 @@ struct BdUniform { view_rot_proj: [[f32; 4]; 4], eye: [f32; 4], misc: [f32; 4] }
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MatUniform { kind: [u32; 4], p: [[f32; 4]; 4] }
 
-struct GpuMesh { vb: wgpu::Buffer, ib: wgpu::Buffer, lods: Vec<(u32, u32)>, centre: Vec3, radius: f32, material: usize, terrain: bool }
+struct GpuMesh { vb: wgpu::Buffer, ib: wgpu::Buffer, vr: std::ops::Range<u64>, ir: std::ops::Range<u64>, lods: Vec<(u32, u32)>, centre: Vec3, radius: f32, material: usize, terrain: bool }
 
 pub struct BackdropRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -432,9 +432,34 @@ fn backdrop_pipelines(device: &wgpu::Device, layout: &wgpu::PipelineLayout, merg
     (pipeline, merge, main)
 }
 
+pub struct BackdropPrep { chains: std::collections::HashMap<(usize, usize), Vec<RgbaImage>>, verts: Vec<BdVertex>, indices: Vec<u32>, ranges: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> }
+
+pub fn prepare(data: &BackdropData) -> BackdropPrep {
+    let jobs: Vec<(usize, usize, &RgbaImage, bool)> = data.materials.iter().enumerate().flat_map(|(mi, m)| m.textures.iter().zip(m.srgb).enumerate().filter_map(move |(ti, (t, s))| t.as_ref().map(|img| (mi, ti, img, s)))).collect();
+    let chains: std::collections::HashMap<(usize, usize), Vec<RgbaImage>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = jobs.iter().map(|&(mi, ti, img, s)| sc.spawn(move || ((mi, ti), texture::mip_chain(img, s, MipFilter::Triangle)))).collect();
+        hs.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let (mut verts, mut indices): (Vec<BdVertex>, Vec<u32>) = (vec![], vec![]);
+    let mut ranges = vec![];
+    for m in &data.meshes {
+        let vs = std::mem::size_of::<BdVertex>() as u64;
+        let (v0, i0) = (verts.len() as u64 * vs, indices.len() as u64 * 4);
+        verts.extend_from_slice(&m.verts);
+        indices.extend_from_slice(&m.indices);
+        ranges.push((v0..verts.len() as u64 * vs, i0..indices.len() as u64 * 4));
+    }
+    if verts.is_empty() { verts.push(BdVertex::zeroed()); }
+    if indices.is_empty() { indices.push(0); }
+    BackdropPrep { chains, verts, indices, ranges }
+}
+
 impl BackdropRenderer {
     /// `bgl_shadow` = the cascades' LightViewProj layout (shadow.wgsl group 0), for the main-pass terrain casters.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, bgl_globals: &wgpu::BindGroupLayout, bgl_shadow: &wgpu::BindGroupLayout, hdr: wgpu::TextureFormat, depth: wgpu::TextureFormat, data: &BackdropData) -> BackdropRenderer {
+        Self::new_prepared(device, queue, bgl_globals, bgl_shadow, hdr, depth, data, prepare(data), false)
+    }
+    pub fn new_prepared(device: &wgpu::Device, queue: &wgpu::Queue, bgl_globals: &wgpu::BindGroupLayout, bgl_shadow: &wgpu::BindGroupLayout, hdr: wgpu::TextureFormat, depth: wgpu::TextureFormat, data: &BackdropData, prep: BackdropPrep, deferred: bool) -> BackdropRenderer {
         let v = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let f = wgpu::ShaderStages::FRAGMENT;
         let mut entries = vec![
@@ -456,11 +481,12 @@ impl BackdropRenderer {
         let white = texture::solid_rgba8(device, queue, [255, 255, 255, 255], "backdrop white");
         let wview = white.create_view(&Default::default());
         let mut material_bgs = vec![];
+        let BackdropPrep { mut chains, verts: all_v, indices: all_i, ranges } = prep;
         for (mi, m) in data.materials.iter().enumerate() {
             let mu = MatUniform { kind: [m.kind as u32, 0, 0, 0], p: m.params };
             let mbuf = texture::buffer_init(device, &[mu], wgpu::BufferUsages::UNIFORM, "backdrop material");
-            let views: Vec<wgpu::TextureView> = m.textures.iter().zip(m.srgb).map(|(t, srgb)| match t {
-                Some(img) => texture::upload_rgba8(device, queue, img, srgb /* SRGB BEFORE FILTER */, MipFilter::Triangle, &format!("backdrop m{mi}")).create_view(&Default::default()),
+            let views: Vec<wgpu::TextureView> = m.textures.iter().zip(m.srgb).enumerate().map(|(ti, (t, srgb))| match t {
+                Some(img) => match chains.remove(&(mi, ti)) { Some(l) if deferred => texture::upload_mip_chain_deferred(device, l, srgb, &format!("backdrop m{mi}")), Some(l) => texture::upload_mip_chain(device, queue, img, &l, srgb, &format!("backdrop m{mi}")), None => texture::upload_rgba8(device, queue, img, srgb /* SRGB BEFORE FILTER */, MipFilter::Triangle, &format!("backdrop m{mi}")) }.create_view(&Default::default()),
                 None => wview.clone(),
             }).collect();
             let mut be = vec![wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: mbuf.as_entire_binding() }];
@@ -468,9 +494,11 @@ impl BackdropRenderer {
             be.push(wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&sampler) });
             material_bgs.push(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("backdrop material bg"), layout: &bgl, entries: &be }));
         }
-        let meshes: Vec<GpuMesh> = data.meshes.iter().map(|m| GpuMesh {
-            vb: texture::buffer_init(device, &m.verts, wgpu::BufferUsages::VERTEX, &m.name),
-            ib: texture::buffer_init(device, &m.indices, wgpu::BufferUsages::INDEX, &m.name),
+        let (shared_vb, shared_ib) = if deferred { (texture::buffer_deferred(device, &all_v, wgpu::BufferUsages::VERTEX, "terrain backdrop vertices"), texture::buffer_deferred(device, &all_i, wgpu::BufferUsages::INDEX, "terrain backdrop indices")) }
+            else { (texture::buffer_init(device, &all_v, wgpu::BufferUsages::VERTEX, "terrain backdrop vertices"), texture::buffer_init(device, &all_i, wgpu::BufferUsages::INDEX, "terrain backdrop indices")) };
+        drop((all_v, all_i));
+        let meshes: Vec<GpuMesh> = data.meshes.iter().zip(ranges).map(|(m, (vr, ir))| GpuMesh {
+            vb: shared_vb.clone(), ib: shared_ib.clone(), vr, ir,
             lods: m.lods.clone(), centre: m.centre, radius: m.radius, material: m.material, terrain: data.materials.get(m.material).map_or(false, |x| x.kind == Kind::Terrain),
         }).collect();
         let n = meshes.len();
@@ -560,8 +588,8 @@ impl BackdropRenderer {
             let m = &self.meshes[i];
             if cur != m.material { pass.set_bind_group(1, &self.material_bgs[m.material], &[]); cur = m.material; }
             let (first, count) = m.lods[l.min(m.lods.len() - 1)];
-            pass.set_vertex_buffer(0, m.vb.slice(..));
-            pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, m.vb.slice(m.vr.clone()));
+            pass.set_index_buffer(m.ib.slice(m.ir.clone()), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(first..first + count, 0, 0..1);
         }
     }
@@ -590,8 +618,8 @@ impl BackdropRenderer {
         for &(i, l) in list {
             let m = &self.meshes[i];
             let (first, count) = m.lods[l.min(m.lods.len() - 1)];
-            pass.set_vertex_buffer(0, m.vb.slice(..));
-            pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, m.vb.slice(m.vr.clone()));
+            pass.set_index_buffer(m.ib.slice(m.ir.clone()), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(first..first + count, 0, 0..1);
         }
     }
@@ -614,8 +642,8 @@ impl BackdropRenderer {
             let Some(l) = lod else { continue };
             if m.material != cur { pass.set_bind_group(1, &self.material_bgs[m.material], &[]); cur = m.material; }
             let (first, count) = m.lods[(*l).min(m.lods.len() - 1)];
-            pass.set_vertex_buffer(0, m.vb.slice(..));
-            pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, m.vb.slice(m.vr.clone()));
+            pass.set_index_buffer(m.ib.slice(m.ir.clone()), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(first..first + count, 0, 0..1);
         }
     }

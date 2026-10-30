@@ -192,7 +192,7 @@ impl AthenaShopUi {
         let regs = ui.w[list].props.get("PreregisteredTabInfoArray").and_then(|a| a.as_array()).cloned().unwrap_or_default();
         let (mut tabs, mut labels, mut item_shop_tab) = (vec![], vec![], 0usize);
         for r in regs {
-            if r.get("bHidden").and_then(|b| b.as_bool()).unwrap_or(false) { continue; }
+            if !crate::screens::athena_lobby::tab_shown(&r) { continue; }
             if r.get("TabContentType").and_then(|c| c.as_str()).map_or(false, |c| c.contains("AthenaDirectAcquisitionScreen")) { item_shop_tab = tabs.len(); }
             let dn = r.get("TabLabelInfo").and_then(|l| l.get("DisplayName")).cloned().unwrap_or(json!(null));
             // AthenaTabsScreen::HandleTabCreated: SetStyle(ButtonStyle-Tab-Main); ButtonText = TextToUpper(ButtonText); ShowText()
@@ -595,7 +595,7 @@ mod tests {
     fn the_item_shop_tab_switches_to_the_direct_acquisition_screen() {
         let Some((mut ui, mut uic)) = load() else { return };
         // the registration the tab list was built from names the screen we compose
-        assert_eq!(ui.tab_labels(), ["LOBBY", "LOCKER", "ITEM SHOP", "SEASON SHOP", "STATS", "LEADERBOARDS", "STORE"]);
+        assert_eq!(ui.tab_labels(), ["LOBBY", "LOCKER", "ITEM SHOP", "SEASON SHOP", "STATS", "LEADERBOARDS"]);
         assert_eq!(ui.item_shop_tab, 2);
         let tabs = ui.ui.store.pkg("/Game/Athena/UI/Frontend/AthenaTabsScreen").unwrap();
         let regs = tabs.named("TopTabList").unwrap().props["PreregisteredTabInfoArray"].as_array().unwrap().clone();

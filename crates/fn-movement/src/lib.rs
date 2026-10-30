@@ -7,8 +7,10 @@
 //!
 //! Old file mapping: movement_cmc.rs -> cmc.rs, movement_scene.rs -> scene.rs, movement_params.rs -> params.rs, movement.rs -> controller.rs,
 //! movement_tests.rs -> tests.rs (cfg(test)).
+pub mod clamber_root;
 pub mod cmc;
 pub mod controller;
+pub mod enhanced;
 pub mod params;
 pub mod scene;
 pub mod skydive;

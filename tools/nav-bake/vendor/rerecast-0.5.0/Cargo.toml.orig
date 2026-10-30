@@ -1,0 +1,58 @@
+[package]
+name = "rerecast"
+description = "Rust port of recastnavigation"
+version = "0.5.0"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+readme = { workspace = true }
+
+[dependencies]
+slotmap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+glam = { workspace = true }
+bitflags = { workspace = true }
+tracing = { workspace = true, optional = true }
+libm = { workspace = true, optional = true }
+
+bevy_reflect = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+test_utils = { workspace = true }
+
+[features]
+default = ["std", "tracing"]
+# Recommended defaults for no_std applications
+default_no_std = ["libm"]
+# Use std if available, but fall back to libm if not
+nostd-libm = ["dep:libm", "glam/nostd-libm"]
+# use libm for no_std support and cross-platform determinism
+libm = ["dep:libm", "glam/libm"]
+# use std
+std = [
+    "glam/std",
+    "bevy_reflect?/std",
+    "slotmap/std",
+    "bitflags/std",
+    "tracing?/std",
+    "anyhow/std",
+    "thiserror/std",
+]
+# Note: tracing works on all no_std platforms that support atomics
+tracing = ["dep:tracing"]
+serialize = ["dep:serde", "glam/serde", "slotmap/serde", "bitflags/serde"]
+bevy_reflect = ["dep:bevy_reflect"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["-Zunstable-options", "--generate-link-to-definition"]
+all-features = true

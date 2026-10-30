@@ -156,6 +156,7 @@ pub struct RendererAssets {
     pub sky: SkyAssets,
     /// T_Grasslands_D.png
     pub ground_texture: RgbaImage,
+    pub ground_mips: Option<Vec<RgbaImage>>,
 }
 
 #[derive(Clone, Debug)]
@@ -216,7 +217,9 @@ struct GpuPrimitive {
     /// BUILD ANIM HOOK: the material uniform (`kind`, then the per-model scalar of `set_model_scalar`), kept for rewrites.
     kind_buf: wgpu::Buffer, kind: MaterialKind,
     /// CHAR MATERIAL HOOK: the original compiled character material of this primitive (bind group 3 of the character pipeline), see char_material.rs
-    char_bg: Option<wgpu::BindGroup>,
+    char_bg: Option<(wgpu::BindGroup, wgpu::Buffer)>,
+    char_src: Option<std::sync::Arc<crate::char_material::CharSrc>>,
+    char_cb: Option<wgpu::Buffer>,
     /// CHAR MATERIAL HOOK: an eye-region modulate overlay (not drawn in the scene / shadow passes, drawn after the scene with its own pipeline)
     overlay: Option<crate::char_material::GpuOverlay>,
     /// The material's `TwoSided` flag: both faces go into the shadow depth (UE4.16 ShadowDepthRendering.cpp:1059 `Material->IsTwoSided() || CastsShadowAsTwoSided()`).
@@ -273,12 +276,14 @@ impl ModelBuilder {
             let (d, n, s, m) = (upload(&p.material.diffuse, &c[0], &self.white), upload(&p.material.normal, &c[1], &self.neutral[0]), upload(&p.material.spec, &c[2], &self.neutral[1]), upload(&p.material.mask, &c[3], &self.neutral[2]));
             let material_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(&label), layout: &self.bgl_material, entries: &[bg_buf(0, &kind_buf), bg_tex(1, &d), bg_tex(2, &n), bg_tex(3, &s), bg_tex(4, &m)] });
             // CHAR MATERIAL HOOK: the original compiled character material (scene pass) or the eyeshadow modulate overlay (own pass)
+            let mut char_src = None;
+            let mut char_cb = None;
             let (char_bg, overlay) = match p.material.ue.as_deref() {
-                Some(crate::char_material::UeMaterial::Char(c)) => (Some(crate::char_material::char_bind_group_with(&self.char_bgl, device, queue, c, &label)), None),
+                Some(crate::char_material::UeMaterial::Char(c)) => { let (bg, src, buf) = crate::char_material::char_binding_with(&self.char_bgl, device, queue, c, &label); char_src = Some(src); char_cb = Some(buf); (Some((bg, crate::char_material::char_tangent_buffer(device, c, p.vertices.len(), &label))), None) }
                 Some(crate::char_material::UeMaterial::Eyeshadow(e)) => (None, Some(crate::char_material::overlay_with(&self.overlay_bgl, device, queue, e, &label))),
                 None => (None, None),
             };
-            gpu_prims.push(GpuPrimitive { vb, ib, index_count: p.indices.len() as u32, material_bg, kind_buf, kind, char_bg, overlay, two_sided: p.material.two_sided });
+            gpu_prims.push(GpuPrimitive { vb, ib, index_count: p.indices.len() as u32, material_bg, kind_buf, kind, char_bg, char_src, char_cb, overlay, two_sided: p.material.two_sided });
         }
         let obj = device.create_buffer(&wgpu::BufferDescriptor { label: Some("model object"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let bone_count = bone_count.max(1);
@@ -322,6 +327,8 @@ struct Targets {
 /// PERF (report only): the caster sources of the per-cascade shadow statistics (`FN_SHADOW_STATS=1`).
 const SHADOW_STAT_SOURCES: [&str; 7] = ["characters (skinned)", "props (merged buffer)", "statics instanced opaque", "statics instanced masked", "fx placed statics", "fx building / pickups", "gun"];
 pub struct Renderer {
+    batch: std::sync::Mutex<Option<Vec<wgpu::CommandBuffer>>>,
+    batch_after: std::sync::atomic::AtomicBool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     output_format: wgpu::TextureFormat,
@@ -409,10 +416,14 @@ pub struct Renderer {
     sky_refl: crate::sky_reflection::SkyReflection,
     // LIGHT FUNCTION (2026-10-07): the sun light function textures (globals bindings 20..22), see light_function.rs
     light_function: crate::light_function::LightFunctionGpu,
+    local_lights: crate::local_lights::LocalLightsGpu,
+    sss: crate::subsurface::Subsurface,
+    sss_on: bool,
     // SCOPE HOOK: the scoped weapon's post-process material pass + mesh (scope_pass.rs), between `post` and FXAA
     scope: crate::scope_pass::ScopeRenderer,
     /// OUTLINE: the build preview's highlight (custom depth + SkinAndMeshOutlinePostProcess), see outline_pass.rs
     outline: crate::outline_pass::OutlineRenderer,
+    decals: crate::decal_pass::DecalRenderer,
     // CHAR MATERIAL HOOK: the BR character materials' pipelines (head / hair / body skin, eyeshadow modulate overlay), see char_material.rs
     char_gpu: crate::char_material::CharGpu,
     // VOLUMETRIC FOG HOOK: the volumetric fog volume + passes (volfog.rs), composited right after the opaque scene
@@ -619,6 +630,28 @@ fn entry_texture(binding: u32, vis: wgpu::ShaderStages, filterable: bool) -> wgp
 fn entry_sampler(binding: u32, vis: wgpu::ShaderStages, ty: wgpu::SamplerBindingType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry { binding, visibility: vis, ty: wgpu::BindingType::Sampler(ty), count: None }
 }
+fn scene_globals_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
+    let vf = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+    let f = wgpu::ShaderStages::FRAGMENT;
+    let mut globals_entries = vec![
+        entry_uniform(0, vf), entry_uniform(1, vf),
+        wgpu::BindGroupLayoutEntry { binding: 2, visibility: f, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
+        entry_sampler(3, f, wgpu::SamplerBindingType::Comparison),
+        entry_sampler(4, f, wgpu::SamplerBindingType::Filtering),
+        entry_sampler(15, f, wgpu::SamplerBindingType::NonFiltering), // PERF (2026-10-06): shadow_point_samp (lit_common.wgsl csm_gather)
+    ];
+    globals_entries.extend(crate::distance_field::globals_layout_entries()); // DISTANCE FIELD HOOK: bindings 5..10
+    globals_entries.extend(crate::sky_reflection::globals_layout_entries()); // SKY REFLECTION HOOK: bindings 11..14
+    globals_entries.extend(crate::light_function::globals_layout_entries()); // LIGHT FUNCTION: bindings 20..22
+    globals_entries.extend(crate::local_lights::globals_layout_entries());
+    globals_entries
+}
+pub fn pso_prewarm_fx(device: &wgpu::Device, queue: &wgpu::Queue) -> crate::fx::FxRenderer {
+    let bgl_globals = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("globals bgl"), entries: &scene_globals_entries() });
+    let mut fx = crate::fx::FxRenderer::new(device, queue, HDR_FORMAT, DEPTH_FORMAT);
+    fx.set_scene_lighting(&bgl_globals, fn_live::wgsl!("../shaders/common.wgsl"), fn_live::wgsl!("../shaders/lit_common.wgsl"));
+    fx
+}
 fn bg_buf<'a>(binding: u32, b: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a> { wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() } }
 fn bg_tex<'a>(binding: u32, v: &'a wgpu::TextureView) -> wgpu::BindGroupEntry<'a> { wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(v) } }
 fn bg_samp<'a>(binding: u32, s: &'a wgpu::Sampler) -> wgpu::BindGroupEntry<'a> { wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Sampler(s) } }
@@ -672,16 +705,7 @@ impl Renderer {
         let vf = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let (v, f) = (wgpu::ShaderStages::VERTEX, wgpu::ShaderStages::FRAGMENT);
         // ---- bind group layouts ----
-        let mut globals_entries = vec![
-            entry_uniform(0, vf), entry_uniform(1, vf),
-            wgpu::BindGroupLayoutEntry { binding: 2, visibility: f, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
-            entry_sampler(3, f, wgpu::SamplerBindingType::Comparison),
-            entry_sampler(4, f, wgpu::SamplerBindingType::Filtering),
-            entry_sampler(15, f, wgpu::SamplerBindingType::NonFiltering), // PERF (2026-10-06): shadow_point_samp (lit_common.wgsl csm_gather)
-        ];
-        globals_entries.extend(crate::distance_field::globals_layout_entries()); // DISTANCE FIELD HOOK: bindings 5..10
-        globals_entries.extend(crate::sky_reflection::globals_layout_entries()); // SKY REFLECTION HOOK: bindings 11..14
-        globals_entries.extend(crate::light_function::globals_layout_entries()); // LIGHT FUNCTION: bindings 20..22
+        let globals_entries = scene_globals_entries();
         let bgl_globals = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("globals bgl"), entries: &globals_entries });
         let bgl_material = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("material bgl"), entries: &[
             entry_uniform(0, f), entry_texture(1, f, true), entry_texture(2, f, true), entry_texture(3, f, true), entry_texture(4, f, true),
@@ -732,6 +756,9 @@ impl Renderer {
         ge.extend(sky_refl.bind_entries());
         let light_function = crate::light_function::LightFunctionGpu::new(&device, &queue); // LIGHT FUNCTION
         ge.extend(light_function.bind_entries());
+        let local_lights = crate::local_lights::LocalLightsGpu::new(&device, &queue);
+        let sss = crate::subsurface::Subsurface::new(&device, &queue, HDR_FORMAT);
+        ge.extend(local_lights.bind_entries());
         let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("globals bg"), layout: &bgl_globals, entries: &ge });
         drop(ge);
         df.take_bind_dirty();
@@ -746,7 +773,7 @@ impl Renderer {
         progress("Uploading the ground texture");
         let verts: Vec<GroundVertex> = ground_triangles(GROUND_HALF, GROUND_OUTER).into_iter().map(|(pos, uv)| GroundVertex { pos, uv }).collect();
         let ground_vb = texture::buffer_init(&device, &verts, wgpu::BufferUsages::VERTEX, "ground vb");
-        let ground_tex = texture::upload_rgba8(&device, &queue, &assets.ground_texture, true /* SRGB BEFORE FILTER: cooked SRGB=true (scene.wgsl shade_ground) */, MipFilter::Triangle, "T_Grasslands_D");
+        let ground_tex = match &assets.ground_mips { Some(l) => texture::upload_mip_chain(&device, &queue, &assets.ground_texture, l, true, "T_Grasslands_D"), None => texture::upload_rgba8(&device, &queue, &assets.ground_texture, true /* SRGB BEFORE FILTER: cooked SRGB=true (scene.wgsl shade_ground) */, MipFilter::Triangle, "T_Grasslands_D") };
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
         let kind_buf = |k: MaterialKind| texture::buffer_init(&device, &[MaterialUniform { kind: [k as u32, 0, 0, 0] }], wgpu::BufferUsages::UNIFORM, "material kind");
         let ground_kind = kind_buf(MaterialKind::Ground);
@@ -774,6 +801,7 @@ impl Renderer {
         gun.set_shadow_vp(&shadow_vp_bufs); // GUN SHADOW: the cascades' LightViewProj for the gun depth pass
         let scope = crate::scope_pass::ScopeRenderer::new(&device, &queue); // SCOPE HOOK
         let outline = crate::outline_pass::OutlineRenderer::new(&device, &queue); // OUTLINE
+        let decals = crate::decal_pass::DecalRenderer::new(&device, &queue);
         let char_gpu = crate::char_material::CharGpu::new(&device, common, lit_common, &bgl_globals, &bgl_material, &bgl_obj_skinned, HDR_FORMAT, DEPTH_FORMAT); // CHAR MATERIAL HOOK
         let volfog = crate::volfog::VolFog::new(&device, &camera_buf, &light_buf, HDR_FORMAT); // VOLUMETRIC FOG HOOK
         let tlv = crate::translucent_lighting::TranslucentLighting::new(&device); // MIRRORFIX (translucency volume)
@@ -788,6 +816,7 @@ impl Renderer {
         taa.prewarm(output_format, LDR_FORMAT);
         let sun_mask = crate::light_shafts::SunMask::new(&device); // LIGHT SHAFT HOOK
         Ok(Renderer {
+            batch: std::sync::Mutex::new(None), batch_after: std::sync::atomic::AtomicBool::new(false),
             device, queue, output_format, bgl_material, bgl_obj_skinned, bgl_post, bgl_downsample, bgl_meter, bgl_shadow,
             ground_pipeline, ground_depth_pipeline, skinned_pipeline, prop_pipeline, skinned_depth_pipeline, prop_depth_pipeline, shadow_pipeline, shadow_prop_pipeline, downsample_pipeline, meter_pipeline, meter_hist_pipeline, meter_hist_buf, post_pipeline, post_ldr_pipeline,
             fxaa_pipeline, bgl_fxaa, fxaa_buf, bgl_globals, shadow_cmp, shadow_point, tex_sampler, shadow_size: SHADOW_MAP_SIZE, sampler_key: (8, 0), prop_vb,
@@ -801,8 +830,11 @@ impl Renderer {
             particles, // PARTICLE HOOK
             gun, sky_refl, // GUN MATERIAL HOOK, SKY REFLECTION HOOK
             light_function, // LIGHT FUNCTION
+            local_lights,
+            sss, sss_on: false,
             scope, // SCOPE HOOK
             outline, // OUTLINE
+            decals,
             char_gpu, // CHAR MATERIAL HOOK
             volfog, // VOLUMETRIC FOG HOOK
             tlv, // MIRRORFIX (translucency volume)
@@ -824,6 +856,13 @@ impl Renderer {
         self.ground_count = if terrain { 0 } else { 6 }; // the plate quad only (no terrain) / nothing
         self.df.ao.set_heightfield(&self.device, &self.queue, if terrain { data.height_grid.as_ref() } else { None });
         crate::fog::set_world_z_ref_cm(data.ground_ref_cm); // FOG HEIGHT RE-BASE (2026-10-07): world y = 0 is at this absolute UE Z (fog::fog_height_cm)
+    }
+    pub fn set_backdrop_prepared(&mut self, data: &crate::backdrop::BackdropData, prep: crate::backdrop::BackdropPrep) {
+        self.backdrop = Some(crate::backdrop::BackdropRenderer::new_prepared(&self.device, &self.queue, &self.bgl_globals, &self.bgl_shadow, HDR_FORMAT, DEPTH_FORMAT, data, prep, true));
+        let terrain = self.backdrop.as_ref().is_some_and(|b| b.has_main_terrain());
+        self.ground_count = if terrain { 0 } else { 6 };
+        self.df.ao.set_heightfield(&self.device, &self.queue, if terrain { data.height_grid.as_ref() } else { None });
+        crate::fog::set_world_z_ref_cm(data.ground_ref_cm);
     }
     pub fn has_backdrop(&self) -> bool { self.backdrop.is_some() }
     /// LANDSCAPE MATERIAL (2026-10-07): the landscape component bounds of the backdrop (game m, component order), empty without one.
@@ -865,7 +904,16 @@ impl Renderer {
         let prev_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("instance bg (prev)"), layout: &self.bgl_obj_skinned, entries: &[bg_buf(0, &prev_obj), bg_buf(1, &prev_bones)] });
         self.queue.write_buffer(&obj, 0, bytemuck::bytes_of(&ObjectUniform { model: Mat4::IDENTITY.to_cols_array_2d() }));
         let obj_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("instance bg"), layout: &self.bgl_obj_skinned, entries: &[bg_buf(0, &obj), bg_buf(1, &bones)] });
-        let m = Model { prims: s.prims.clone(), obj, bones, bone_count: s.bone_count, obj_bg, bounds: s.bounds, world: std::sync::Mutex::new(Mat4::IDENTITY), prev_obj, prev_bones, prev_bg, prev_valid: std::sync::atomic::AtomicBool::new(false) };
+        let mut prims = s.prims.clone();
+        for p in prims.iter_mut() {
+            if let (Some(src), Some(cbg)) = (p.char_src.clone(), p.char_bg.as_ref()) {
+                let buf = crate::char_material::char_instance_buffer(device, &src, "instance char cb");
+                let bg = crate::char_material::char_bind_group_from(&self.char_gpu.char_bgl, device, &src, &buf, "instance char bg");
+                p.char_bg = Some((bg, cbg.1.clone()));
+                p.char_cb = Some(buf);
+            }
+        }
+        let m = Model { prims, obj, bones, bone_count: s.bone_count, obj_bg, bounds: s.bounds, world: std::sync::Mutex::new(Mat4::IDENTITY), prev_obj, prev_bones, prev_bg, prev_valid: std::sync::atomic::AtomicBool::new(false) };
         self.models.push(m);
         ModelId(self.models.len() - 1)
     }
@@ -880,6 +928,16 @@ impl Renderer {
     }
     /// BUILD ANIM HOOK: the per-model material scalar of every primitive of model `id` (`MaterialKind::Architect`: `EmissiveMultiply`, what
     /// `AFortWeap_BuildingTool::OnBlueprintPaperPulseUpdate` 0x14092f190 sets on the paper's MID).
+    pub fn set_model_char_cb(&self, id: ModelId, f: &dyn Fn(crate::char_material::CharPerm, &[[f32; 4]]) -> Option<Vec<[f32; 4]>>) -> usize {
+        let mut n = 0;
+        for p in &self.models[id.0].prims {
+            let (Some(src), Some(buf)) = (&p.char_src, &p.char_cb) else { continue };
+            let cb = f(src.perm, &src.base).unwrap_or_else(|| src.base.clone());
+            crate::char_material::char_write(&self.queue, buf, src.perm, &cb);
+            n += 1;
+        }
+        n
+    }
     pub fn set_model_scalar(&self, id: ModelId, v: f32) {
         for p in &self.models[id.0].prims { self.queue.write_buffer(&p.kind_buf, 0, bytemuck::bytes_of(&MaterialUniform { kind: [p.kind as u32, v.to_bits(), 0, 0] })); }
     }
@@ -919,6 +977,7 @@ impl Renderer {
     pub fn create_static_mesh(&mut self, data: &StaticMeshData, materials: &[StaticMaterialHandle]) -> StaticMeshHandle { self.statics.create_mesh(data, materials) }
     /// Replaces the placed static meshes (real trees / rocks). Cheap to call every frame (a copy of the list); culling, LOD choice, fading and the
     /// batched instanced draws happen per frame inside `render`. LOD hysteresis state is kept by list index, so keep the order stable.
+    pub fn release_static_meshes(&mut self, meshes: &[StaticMeshHandle]) -> (usize, u64) { self.statics.release_meshes(meshes) }
     pub fn set_static_instances(&mut self, instances: &[StaticMeshInstance]) { self.statics.set_instances(instances); self.df.set_instances(instances); }
     /// DISTANCE FIELD HOOK: the cooked distance field of a static mesh (fn-app reads it from the paks); instances of the mesh then cast ray-traced
     /// distance-field shadows beyond the CSM and occlude the sky light (DFAO).
@@ -946,6 +1005,11 @@ impl Renderer {
     pub fn set_gun_frame(&mut self, frame: crate::gun_material::GunFrame) { self.gun.set_frame(frame); }
     /// SKY REFLECTION HOOK: the processed sky cube (`sky_reflection::filter_reflection_environment` of the specified cubemap), once it is built.
     /// LIGHT FUNCTION: installs the decoded T_spiralLF / T_FORT_LF (the High light-function program of the sun, light_function.rs).
+    pub fn set_subsurface_profiles(&mut self, profiles: &[crate::subsurface::SssProfile]) { self.sss.set_profiles(&self.queue, profiles); }
+    pub fn set_local_lights(&mut self, lights: Vec<crate::local_lights::LocalLight>) { self.local_lights.list = lights; }
+    pub fn local_lights(&self) -> &[crate::local_lights::LocalLight] { &self.local_lights.list }
+    pub fn local_light_stats(&self) -> (usize, usize, [u32; 3], bool) { (self.local_lights.list.len(), self.local_lights.last_visible, self.local_lights.last_dims, self.local_lights.last_overflow) }
+    pub fn set_ies_profiles(&mut self, rows: &[Vec<f32>]) { self.local_lights.set_ies_profiles(&self.device, &self.queue, rows); self.rebuild_globals(); }
     pub fn set_light_function_textures(&mut self, spiral: crate::light_function::GreyImage, fort: crate::light_function::GreyImage) { self.light_function.set_textures(&self.device, &self.queue, spiral, fort); self.rebuild_globals(); }
     pub fn set_sky_reflection(&mut self, mips: &[crate::sky_light::Cube]) { self.sky_refl.set_cube(&self.device, &self.queue, mips); self.rebuild_globals(); }
     // SCOPE HOOK: textures / buffers / pipelines of the scope pass (`scope()`) and the draws of the next frame (`set_scope_frame`), see scope_pass.rs
@@ -953,6 +1017,7 @@ impl Renderer {
     pub fn set_scope_frame(&mut self, frame: crate::scope_pass::ScopeFrame) { self.scope.set_frame(frame); }
     // OUTLINE: the highlight pass (`outline()` to install the program, `set_outline_frame` + `set_custom_depth_instances` every frame), see outline_pass.rs
     pub fn outline(&mut self) -> &mut crate::outline_pass::OutlineRenderer { &mut self.outline }
+    pub fn decals(&mut self) -> &mut crate::decal_pass::DecalRenderer { &mut self.decals }
     pub fn set_outline_frame(&mut self, frame: crate::outline_pass::OutlineFrame) { self.outline.set_frame(frame); }
     /// OUTLINE: the static mesh instances drawn into the custom depth / stencil targets next frame (empty = none).
     pub fn set_custom_depth_instances(&mut self, instances: &[StaticMeshInstance]) { self.statics.set_custom_instances(instances); }
@@ -966,6 +1031,7 @@ impl Renderer {
         ge.extend(self.df.bind_entries()); // DISTANCE FIELD HOOK
         ge.extend(self.sky_refl.bind_entries()); // SKY REFLECTION HOOK
         ge.extend(self.light_function.bind_entries()); // LIGHT FUNCTION
+        ge.extend(self.local_lights.bind_entries());
         self.globals_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("globals bg"), layout: &self.bgl_globals, entries: &ge });
     }
     /// Applies the quality options that need new GPU objects (shadow map size, texture sampler).
@@ -991,6 +1057,7 @@ impl Renderer {
 
     /// Reads the linear HDR scene target (mip 0) of the last rendered frame back to the CPU (synchronous; reference comparison / debugging).
     pub fn read_hdr(&self) -> Option<HdrImage> {
+        if cfg!(target_arch = "wasm32") { return None; }
         let t = self.targets.as_ref()?;
         let (w, h) = (t.width, t.height);
         let bpr = (w * 8).div_ceil(256) * 256;
@@ -1091,9 +1158,23 @@ impl Renderer {
             o.draw(&self.device, &self.queue, target, frame.camera.width, frame.camera.height);
             if let Some(s) = ui { self.profiler.write_marker(&self.device, &self.queue, s + 1); }
         }
-        self.profiler.end_frame(&self.device, &self.queue);
+        let batched = self.batch.lock().map_or(false, |b| b.is_some());
+        if batched { let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("timestamp resolve") }); if self.profiler.encode_end_frame(&mut enc) { self.defer_submit(enc.finish()); } }
+        else { self.profiler.end_frame(&self.device, &self.queue); }
         self.profiler.collect(&self.device, false);
         stats
+    }
+
+    pub fn begin_batch(&self) { if let Ok(mut b) = self.batch.lock() { if b.is_none() { *b = Some(vec![]); } } }
+    pub fn take_batch(&self) -> Vec<wgpu::CommandBuffer> { self.batch.lock().ok().and_then(|mut b| b.take()).unwrap_or_default() }
+    pub fn after_batch_submitted(&mut self) {
+        if self.batch_after.swap(false, std::sync::atomic::Ordering::Relaxed) { self.occlusion.after_submit(); }
+        self.profiler.start_map();
+    }
+    fn defer_submit(&self, cb: wgpu::CommandBuffer) -> bool {
+        if let Ok(mut g) = self.batch.lock() { if let Some(v) = g.as_mut() { v.push(cb); self.batch_after.store(true, std::sync::atomic::Ordering::Relaxed); return true; } }
+        self.queue.submit([cb]);
+        false
     }
 
     /// True when the device has timestamp queries (`Gpu::new` requests them when the adapter supports them).
@@ -1164,6 +1245,7 @@ impl Renderer {
         // ---- uniforms ----
         let cu = cam.uniform(frame.time);
         queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
+        self.local_lights.prepare(queue, cam, opt.shadow_scalability.light_max_draw_distance_scale, crate::quality::lod_distance_factor(cam.fov_deg));
         let sun = lighting::sun_direction();
         let sr = lighting::sun_radiance();
         let sky_rad = lighting::sky_radiance(); // time-of-day sky light, up-facing SH value (sky_light.rs: SLS_SpecifiedCubemap, no scene capture)
@@ -1244,6 +1326,7 @@ impl Renderer {
         // OUTLINE: the highlighted actors' instances + the pass's targets / uniforms / bind groups
         self.statics.prepare_custom(cam, self.outline.stencil());
         { let t = self.targets.as_ref().unwrap(); self.outline.prepare(t.width, t.height, HDR_FORMAT, &t.depth_view); }
+        { let t = self.targets.as_ref().unwrap(); self.decals.prepare(&t.depth_view); }
         mark!("statics");
         // ShadowSetup.cpp:2454 small-caster cull of the skinned models (bounds origin to the shadow view origin = the camera); the same for every cascade
         let casters: Vec<ModelId> = casters.into_iter().filter(|id| {
@@ -1288,7 +1371,7 @@ impl Renderer {
         if let Some(b) = self.backdrop.as_mut() { b.prepare(queue, cam, frame.time, &cascades[..num_cascades], shadows_on && !scene_skip("terrain-shadow") /* TERRAIN MAIN PASS: casters per cascade; debug-only A/B switch */); b.ensure_depth(&self.device, cam.width, cam.height); if let Some(t) = self.targets.as_ref() { b.ensure_scene_depth(&self.device, &t.depth_view, self.fx_gen); } } // BACKDROP HOOK (+ SSR BACKDROP: its own depth target)
         mark!("sky+backdrop");
         // POST-PROCESS WIRING: the stacked TOD post-process components at the live clock (UE 4.16 volume blending), see tonemap::PostSettings::blend
-        let ps = tonemap::PostSettings::current();
+        let ps = tonemap::PostSettings::current().with_dynamic();
         let post = ps.post_params(
             opt.bloom, opt.vignette, opt.ao,
             [tx, ty, cam.near, cam.far],
@@ -1420,6 +1503,12 @@ impl Renderer {
                 }
             }
             if !ao_on { self.ssao_ue.disable(); }
+            let has_char = frame.models.iter().any(|id| self.models[id.0].prims.iter().any(|p| p.char_bg.is_some()));
+            self.sss_on = has_char && opt.effects.sss_scale > 0.;
+            if self.sss_on {
+                self.sss.ensure_targets(t.width, t.height, opt.effects.sss_half_res);
+                self.sss.prepare(&self.queue, cam.tan_half().0, opt.effects.sss_scale, opt.effects.sss_sample_set, cam.near, cam.far, self.ssr.active(), ao_on);
+            }
             self.ssao.prepare(&self.device, &self.queue, &self.post_buf, &t.depth_view, [&t.refl.views[0], &t.refl.views[1]], self.ssr.output(), self.ssr.output_key(), self.ssr.active(),
                 ao_on, self.ssao_ue.ao_view(), self.ssao_ue.ao_key(), HDR_FORMAT, t.width, t.height, self.fx_gen);
         }
@@ -1533,7 +1622,7 @@ impl Renderer {
                         if p.overlay.is_some() { continue; } // drawn by the "char overlay" pass (modulate, no depth write)
                         let is_char = p.char_bg.is_some();
                         if on_char != Some(is_char) { on_char = Some(is_char); pass.set_pipeline(if is_char { &this.char_gpu.char_depth_pipeline } else { &this.skinned_depth_pipeline }); }
-                        if let Some(cbg) = &p.char_bg { pass.set_bind_group(3, cbg, &[]); }
+                        if let Some(cbg) = &p.char_bg { pass.set_bind_group(3, &cbg.0, &[]); pass.set_vertex_buffer(1, cbg.1.slice(..)); }
                         pass.set_bind_group(1, &p.material_bg, &[]);
                         pass.set_vertex_buffer(0, p.vb.slice(..));
                         pass.set_index_buffer(p.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1636,7 +1725,7 @@ impl Renderer {
                         pass.set_bind_group(0, &this.globals_bg, &[]);
                         pass.set_bind_group(2, &m.obj_bg, &[]);
                     }
-                    if let Some(cbg) = &p.char_bg { pass.set_bind_group(3, cbg, &[]); }
+                    if let Some(cbg) = &p.char_bg { pass.set_bind_group(3, &cbg.0, &[]); pass.set_vertex_buffer(1, cbg.1.slice(..)); }
                     pass.set_bind_group(1, &p.material_bg, &[]);
                     pass.set_vertex_buffer(0, p.vb.slice(..));
                     pass.set_index_buffer(p.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1662,30 +1751,6 @@ impl Renderer {
                 timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
             this.fx.draw(&mut pass, false);
-        });
-        // CHAR MATERIAL HOOK: the eye-region modulate overlays (scene colour *= the original Eyeshadow shader's output), depth read-only, right after the scene pass
-        let overlay_on = models.iter().any(|id| this.models[id.0].prims.iter().any(|p| p.overlay.is_some()));
-        graph.add_if(overlay_on, "char overlay", move |enc| {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("char overlay"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &targets.hdr_mip_views[0], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &targets.depth_view, depth_ops: None, stencil_ops: None }),
-                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-            });
-            pass.set_pipeline(&this.char_gpu.overlay_pipeline);
-            pass.set_bind_group(0, &this.globals_bg, &[]);
-            for id in models {
-                let m = &this.models[id.0];
-                pass.set_bind_group(1, &m.obj_bg, &[]);
-                for p in &m.prims {
-                    let Some(o) = &p.overlay else { continue };
-                    pass.set_bind_group(2, &o.bg, &[]);
-                    pass.set_vertex_buffer(0, p.vb.slice(..));
-                    pass.set_vertex_buffer(1, o.color_vb.slice(..));
-                    pass.set_index_buffer(p.ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..p.index_count, 0, 0..1);
-                }
-            }
         });
         // SCALABILITY (temporal AA): scene velocity of the skinned models, depth-tested against the opaque scene (velocity.wgsl); a model without a
         // previous transform yet takes its current one (no motion of its own)
@@ -1744,6 +1809,60 @@ impl Renderer {
             }
         });
         graph.add("ssao + reflections", move |enc| { let ts = this.profiler.slot("reflection apply", "scene"); this.ssao.encode(enc, &targets.hdr, &targets.hdr_mip_views[0], ao_on, this.profiler.render_writes(ts)); });
+        let sss_on = this.sss_on;
+        graph.add_if(sss_on, "subsurface", move |enc| {
+            if let Some(att) = this.sss.input_attachments() {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("char subsurface inputs"), color_attachments: &att,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &targets.depth_view, depth_ops: None, stencil_ops: None }),
+                    timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+                pass.set_pipeline(&this.char_gpu.char_sss_pipeline);
+                pass.set_bind_group(0, &this.globals_bg, &[]);
+                for id in models {
+                    let m = &this.models[id.0];
+                    pass.set_bind_group(2, &m.obj_bg, &[]);
+                    for p in &m.prims {
+                        let Some(cbg) = &p.char_bg else { continue };
+                        if p.overlay.is_some() { continue; }
+                        pass.set_bind_group(3, &cbg.0, &[]);
+                        pass.set_vertex_buffer(1, cbg.1.slice(..));
+                        pass.set_bind_group(1, &p.material_bg, &[]);
+                        pass.set_vertex_buffer(0, p.vb.slice(..));
+                        pass.set_index_buffer(p.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..p.index_count, 0, 0..1);
+                    }
+                }
+            }
+            let ssr = this.ssr.active().then(|| this.ssr.output());
+            let ao = ao_on.then(|| this.ssao_ue.ao_view());
+            this.sss.encode(enc, &crate::subsurface::SssFrame { depth: &targets.depth_view, ao, refl_sky: &targets.refl.views[0], refl_brdf: &targets.refl.views[1], ssr, hdr: &targets.hdr_mip_views[0] });
+        });
+        graph.add_if(this.decals.active(), "decals", move |enc| { let ts = this.profiler.slot("decals", "scene"); this.decals.encode(enc, &targets.hdr_mip_views[0], this.profiler.render_writes(ts)); });
+        // CHAR MATERIAL HOOK: the eye-region modulate overlays (scene colour *= the original Eyeshadow shader's output), depth read-only, right after the scene pass
+        let overlay_on = models.iter().any(|id| this.models[id.0].prims.iter().any(|p| p.overlay.is_some()));
+        graph.add_if(overlay_on, "char overlay", move |enc| {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("char overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &targets.hdr_mip_views[0], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &targets.depth_view, depth_ops: None, stencil_ops: None }),
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+            });
+            pass.set_pipeline(&this.char_gpu.overlay_pipeline);
+            pass.set_bind_group(0, &this.globals_bg, &[]);
+            for id in models {
+                let m = &this.models[id.0];
+                pass.set_bind_group(1, &m.obj_bg, &[]);
+                for p in &m.prims {
+                    let Some(o) = &p.overlay else { continue };
+                    pass.set_bind_group(2, &o.bg, &[]);
+                    pass.set_vertex_buffer(0, p.vb.slice(..));
+                    pass.set_vertex_buffer(1, o.color_vb.slice(..));
+                    pass.set_index_buffer(p.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..p.index_count, 0, 0..1);
+                }
+            }
+        });
         // VOLUMETRIC FOG HOOK: material setup + light scattering + final integration (compute), then `dst * V.a + V.rgb` over the opaque scene (scene depth selects the slice)
         let vfog_on = this.volfog.active();
         graph.add_if(vfog_on, "vfog", move |enc| {
@@ -1951,8 +2070,7 @@ impl Renderer {
         // device maintain), "prep end frame" (the passes' end_frame)
         let cb = encoder.finish();
         mark!("finish");
-        this.queue.submit([cb]);
-        this.occlusion.after_submit(); // OCCLUSION: map this frame's HZB readback (occlusion.rs)
+        if !this.defer_submit(cb) { this.occlusion.after_submit(); } // OCCLUSION: map this frame's HZB readback (occlusion.rs)
         mark!("submit");
         self.df.end_frame(); // DISTANCE FIELD HOOK
         self.taa.end_frame(); // SCALABILITY
@@ -1975,6 +2093,7 @@ impl Renderer {
 
     /// Reads the adapted exposure state back (synchronous; for tests and reports, not for the frame loop).
     pub fn read_exposure(&self) -> ExposureInfo {
+        if cfg!(target_arch = "wasm32") { return ExposureInfo { ev: 0., target_ev: 0., exposure: 1., avg_luminance: 0. }; }
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("exposure readback"), size: 16, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(&self.exposure_buf, 0, &staging, 0, 16);

@@ -192,3 +192,46 @@ Addresses re-checked in `C:\FortniteRef\decomp\named` (round-3 names).
   `SelectionOutlineID_CodeReferenced` (2) and the cooked `SkinAndMeshOutlinePostProcess` program (BL_BeforeTranslucency) run unchanged.
 - **Shader-map reader fix** (`fn-dxbc-cli/src/uniform.rs`): the compile description sits 56 + 16 n bytes after the uniform set, n = the
   material's parameter collection count (was tied to the cube count, which only matched the scope material).
+
+---
+
+## Audit 2026-10-24 (build / edit feel, browser build)
+
+Sources: the 1.8 exe decompile (`D:\Fortnite\FortniteRef\decomp\named`), the exe's vtables and static FName initialisers, and the cooked
+`/Game/Characters/Feedback/PlayerUIFeedback` (`fn-inspect props`).
+
+- **Controller vtable check.** `FortPlayerControllerAthena` (ctor @140413a60, vtable 0x144070898) keeps the base slots 672 / 677 / 685 / 687 @140816bd0 /
+  688 / 689 @140816430; slot 679 = @142286760 `return 0`. It overrides only 684 / 686, which first pop its own input component (slot 660 @140437540).
+  The other vtables that override 671 / 674 / 675 / 679 / 687 / 689 are not Athena's (Outpost = @14085ca30 -> 0x1442495f0, Zone / PvP = 0x14423e630 / 0x14423ff40).
+- **A1 (fixed). The occupant of the preview's slot is the focused building.** FUN_140835750, query 1 (ExistingActor) with a player-buildable occupant
+  (or the same building type): FUN_140849930 writes the occupant into the controller's focus (+0x1790), the marker is hidden (vfunc 0x2a8).
+  `TargetedBuilding` (FUN_1408537d0) takes +0x1790 first, and the edit start FUN_1408316c0 edits only +0x1790. The port showed the preview's
+  "{MaxHealth} HP / BUILD" over a placed piece, and started the edit on the camera-ray piece.
+  Now: `building_hook::preview_focus` is the occupant. Target Info shows it (health, Edit / BeingModified), and G edits it.
+- **A2 (fixed). Build-mode UI feedback sounds were missing.** `FUN_140850520(PC, FName)` plays the `PlayerUIFeedback` entry of that name.
+  FName globals, from the static initialiser at @1400aa566..@1400aa646:
+
+  | FName global | Entry | Played by | Cue |
+  |---|---|---|---|
+  | DAT_1466290f0 | BuildPreviewChange | SetBuildableClass @140835390 (a new non-null class) | `Fort_Build_BluePrint_Select_Cue` |
+  | DAT_1466290f8 | BuildPreviewGridSnap | @140835750, when `LastBuildPreviewGridSnapLoc/Rot` change | `Fort_Build_BluePrint_Select_Cue` |
+  | DAT_146629120 | BuildPreviewRotate | @1408352a0 | `Fort_Build_Rotate_Cue` |
+  | DAT_1466290e0 | BuildPreviewUnableToPlace | Fire @1408336f0, query != 0 | `UI_CantBuild_Cue` |
+  | DAT_1466290e8 | BuildPreviewUnableToAfford | Fire @1408336f0, vfunc_677 false | `UI_NotEnoughResources_Cue` |
+  | DAT_146629100 / 108 / 110 | BuildSelectWood / Stone / Metal | @140834fc0, resource changed | `Fort_Build_SelectWood_Cue` / `Fort_Build_SelectRock_Cue` / `Fort_Build_SelectMetal_Cue` |
+
+  The query != 0 text (slot 692 @140827c30) is empty for results 1-3, so only the sound plays.
+- **A3 (fixed, pass 2). The occupant is outlined.** In the same branch, vfunc_672 is called with [occupant], mode 0 and Friendly = (team attitude == 0),
+  which FUN_140588150 maps to HighlightColors +0x1d8. The port's outline pass draws custom depth for real props only (statics renderer), not for
+  FX-pass building pieces. Pass 2: `outline_hook` registers the occupant class's StaticMesh (LOD 0, opaque two-sided, so masked gaps between
+  planks are filled in the custom depth) in the statics renderer and draws it into the custom depth / stencil with HighlightColors[0] Valid.
+- **A4 (unverified). Combat-mode edit focus.** Outside build mode, +0x1790 comes from the interaction scorer FUN_140840d70
+  ("ReticleAimingAtInteractionActorTrace"), fed by FUN_14081f700 ("FindInteractActorsLineTrace" / "FindInteractActorsSphereTrace", channel 14).
+  It scores every interactable (pickups, containers, doors, buildings) in one pass; the port has separate per-hook focuses, so porting it means one
+  shared interaction-focus system replacing those. Not done; the port still uses the EditModeTrace ray.
+- **A5 (removed, pass 2).** `Game.TurboBuild`, `ConfirmEditOnRelease` and `ResetEditOnRelease` (`fn_settings::extras`) have no string in the 1.8 exe.
+  They were settings rows (extension rows of the Game tab); rows, settings keys and code paths are removed. Old settings files that still hold the
+  keys load unchanged (kept as unknown extras).
+- **A6 (fixed, pass 2). F2 was taken by the port's console.** In ConfigD_Athena, F2 = HotbarKeyF2 = the Floor slot. `console_hook::keys_from_winit` maps F2 to
+  ToggleConsole first, so the default Floor key opened the command bar. The console key is now Tilde (Backquote), the cooked
+  `InputSettings:ConsoleKeys:0=Tilde` (CookedIniVersion.txt line 1980); F2 reaches the game as HotbarKeyF2.

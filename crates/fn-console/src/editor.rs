@@ -48,7 +48,7 @@ pub struct Console {
 impl Console {
     pub fn new() -> Console {
         let mut c = Console::default();
-        c.log.push((LineKind::Info, "Command bar (F2 / Esc closes). help lists the commands; Tab completes; Up / Down = history.".into()));
+        c.log.push((LineKind::Info, "Command bar (~ / Esc closes). help lists the commands; Tab completes; Up / Down = history.".into()));
         c
     }
     pub fn is_open(&self) -> bool { self.open }

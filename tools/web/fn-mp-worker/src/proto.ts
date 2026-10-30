@@ -6,13 +6,20 @@ export const T = {
   HEAL: 0x05,
   SELFDMG: 0x06,
   INTERACT: 0x07,
+  REVIVE: 0x08,
   PING: 0x09,
+  PICKUP_SPAWN: 0x0a,
+  PICKUP_CLAIM: 0x0b,
+  EMOTE: 0x0c,
   HEALTH: 0x40,
   ELIM: 0x41,
   STORM: 0x42,
   SPAWN: 0x43,
   LOOT: 0x44,
   DAMAGE: 0x45,
+  DBNO: 0x46,
+  PICKUP: 0x47,
+  PICKUP_GONE: 0x48,
   CORRECT: 0x80,
   PONG: 0x89,
 } as const;
@@ -30,15 +37,20 @@ export const SIZE = {
   HEAL: 3,
   SELFDMG: 3,
   INTERACT: 6,
+  REVIVE: 3,
   PING: 5,
   ELIM: 5,
   STORM: 32,
   SPAWN: 14,
   DAMAGE: 8,
+  PICKUP_SPAWN_HEAD: 29,
+  PICKUP_CLAIM: 5,
+  EMOTE: 3,
+  PICKUP_HEAD: 35,
 } as const;
 
 export const HOST_ONLY = new Set<number>([T.STORM, T.LOOT]);
-export const SERVER_ONLY = new Set<number>([T.HEALTH, T.ELIM, T.SPAWN, T.DAMAGE, T.CORRECT, T.PONG]);
+export const SERVER_ONLY = new Set<number>([T.HEALTH, T.ELIM, T.SPAWN, T.DAMAGE, T.DBNO, T.PICKUP, T.PICKUP_GONE, T.CORRECT, T.PONG]);
 
 export function damageMsg(victim: number, attacker: number, flags: number, amount: number): Uint8Array {
   const out = new Uint8Array(9);
@@ -48,8 +60,16 @@ export function damageMsg(victim: number, attacker: number, flags: number, amoun
   return out;
 }
 
-export function elimMsg(victim: number, killer: number, weapon: number, head: boolean): Uint8Array {
-  return new Uint8Array([T.ELIM, SERVER_SLOT, victim, killer, weapon, head ? 1 : 0]);
+export const ELIM_FLAG = { WAS_DBNO: 1, BLED_OUT: 2, TEAM_WIPE: 4 } as const;
+
+export function elimMsg(victim: number, killer: number, weapon: number, head: boolean, flags = 0): Uint8Array {
+  return new Uint8Array([T.ELIM, SERVER_SLOT, victim, killer, weapon, head ? 1 : 0, flags]);
+}
+
+export const DBNO_STATE = { REVIVED: 0, DOWNED: 1, REVIVE_START: 2, REVIVE_STOP: 3 } as const;
+
+export function dbnoMsg(victim: number, state: number, instigator: number, weapon: number, head: boolean): Uint8Array {
+  return new Uint8Array([T.DBNO, SERVER_SLOT, victim, state, instigator, weapon, head ? 1 : 0]);
 }
 
 export function healthMsg(list: { slot: number; health: number; shield: number; dead: boolean }[]): Uint8Array {
@@ -169,5 +189,43 @@ export function pong(nonce: number, nowMs: number): Uint8Array {
   const v = new DataView(out.buffer);
   out[0] = T.PONG; out[1] = SERVER_SLOT;
   v.setUint32(2, nonce, true); v.setFloat64(6, nowMs, true);
+  return out;
+}
+
+export const PICKUP_FLAG = { DEATH: 1, DROPPED: 2 } as const;
+export const NO_TAKER = 0xff;
+const ITEM_RE = /^[A-Za-z0-9_]{1,64}$/;
+
+export interface PickupSpawn { flags: number; count: number; start: [number, number, number]; end: [number, number, number]; item: string }
+
+export function decodePickupSpawn(b: DataView): PickupSpawn | null {
+  if (b.byteLength < SIZE.PICKUP_SPAWN_HEAD) return null;
+  const len = b.getUint8(28);
+  if (b.byteLength !== SIZE.PICKUP_SPAWN_HEAD + len) return null;
+  let item = '';
+  for (let i = 0; i < len; i++) item += String.fromCharCode(b.getUint8(SIZE.PICKUP_SPAWN_HEAD + i));
+  if (!ITEM_RE.test(item)) return null;
+  const f = (o: number) => b.getFloat32(o, true);
+  const r: PickupSpawn = { flags: b.getUint8(1), count: b.getUint16(2, true), start: [f(4), f(8), f(12)], end: [f(16), f(20), f(24)], item };
+  if (!finite(...r.start, ...r.end) || r.count < 1 || r.count > 9999 || (r.flags & ~3) !== 0) return null;
+  if ([r.start, r.end].some((v) => Math.abs(v[0]) > 6000 || Math.abs(v[2]) > 6000 || v[1] < -200 || v[1] > 3000)) return null;
+  return r;
+}
+
+export function pickupMsg(id: number, owner: number, p: PickupSpawn): Uint8Array {
+  const out = new Uint8Array(SIZE.PICKUP_HEAD + p.item.length);
+  const v = new DataView(out.buffer);
+  out[0] = T.PICKUP; out[1] = SERVER_SLOT;
+  v.setUint32(2, id, true); out[6] = owner; out[7] = p.flags; v.setUint16(8, p.count, true);
+  [...p.start, ...p.end].forEach((x, i) => v.setFloat32(10 + i * 4, x, true));
+  out[34] = p.item.length;
+  for (let i = 0; i < p.item.length; i++) out[SIZE.PICKUP_HEAD + i] = p.item.charCodeAt(i);
+  return out;
+}
+
+export function pickupGoneMsg(id: number, taker: number): Uint8Array {
+  const out = new Uint8Array(7);
+  const v = new DataView(out.buffer);
+  out[0] = T.PICKUP_GONE; out[1] = SERVER_SLOT; v.setUint32(2, id, true); out[6] = taker;
   return out;
 }

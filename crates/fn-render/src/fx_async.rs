@@ -57,6 +57,7 @@ impl WebPipes {
     /// The program's draws must be skipped (still compiling, or failed).
     pub(super) fn skip(&self, idx: usize) -> bool { self.pending.contains_key(&idx) || self.failed.contains(&idx) }
     pub(super) fn pending_count(&self) -> usize { self.pending.len() }
+    pub(super) fn is_pending(&self, idx: usize) -> bool { self.pending.contains_key(&idx) }
 }
 
 impl FxRenderer {

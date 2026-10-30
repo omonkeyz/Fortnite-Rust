@@ -24,20 +24,57 @@ pub struct Program {
     /// The loose parameters the entry serialized for itself (per-frame expression offsets, base-pass VS velocity globals): read from the shader map, see
     /// [`crate::shader_params`] (`None` when the entry is not a material shader or did not parse).
     pub params: Option<crate::shader_params::MaterialShaderParams>,
+    pub discards: bool,
+    pub packed: std::sync::Arc<Vec<u8>>,
+}
+
+impl Program {
+    pub fn full(&self) -> std::borrow::Cow<'_, Program> {
+        if !self.shader.instructions.is_empty() || self.packed.is_empty() { return std::borrow::Cow::Borrowed(self); }
+        let mut p = self.clone();
+        p.blob.bytes = miniz_oxide::inflate::decompress_to_vec(&self.packed).unwrap_or_default();
+        if let Ok(s) = Shader::parse(&p.blob.bytes) { p.shader = s; }
+        p.packed = std::sync::Arc::new(Vec::new());
+        std::borrow::Cow::Owned(p)
+    }
+}
+
+#[derive(Clone)]
+pub struct Entry {
+    pub shader_type: String,
+    pub vertex_factory: String,
+    pub stream: usize,
+    pub major: u8,
+    lz_blob: Blob,
+    lz_uniform_buffer_names: Option<Vec<String>>,
+    lz_params: Option<crate::shader_params::MaterialShaderParams>,
+    lz_discards: bool,
+    lz_packed: std::sync::Arc<Vec<u8>>,
+    lz_cell: std::sync::OnceLock<Box<Program>>,
+}
+
+impl Entry {
+    fn decode(&self) -> Program {
+        let bytes = if self.lz_packed.is_empty() { self.lz_blob.bytes.clone() } else { miniz_oxide::inflate::decompress_to_vec(&self.lz_packed).unwrap_or_default() };
+        let mut shader = Shader::parse(&bytes).expect("shader parsed at load");
+        let resource_table = ResourceTable::parse(&self.lz_blob.header).expect("resource table parsed at load");
+        let bindings = named_bindings(&resource_table, self.lz_uniform_buffer_names.as_deref(), &shader.decls).unwrap_or_default();
+        let mut blob = self.lz_blob.clone();
+        if self.lz_packed.is_empty() { blob.bytes = bytes; } else { shader.instructions = Vec::new(); }
+        Program { shader_type: self.shader_type.clone(), vertex_factory: self.vertex_factory.clone(), stream: self.stream, blob, shader, resource_table, uniform_buffer_names: self.lz_uniform_buffer_names.clone(), bindings, params: self.lz_params.clone(), discards: self.lz_discards, packed: self.lz_packed.clone() }
+    }
+    pub fn is_decoded(&self) -> bool { self.lz_cell.get().is_some() }
+}
+
+impl std::ops::Deref for Entry {
+    type Target = Program;
+    fn deref(&self) -> &Program { self.lz_cell.get_or_init(|| Box::new(self.decode())) }
 }
 
 /// Every program of a material package.
 pub struct Cooked {
-    pub programs: Vec<Program>,
+    pub programs: Vec<Entry>,
     pub names: Vec<String>,
-    /// BROWSER PORT (wasm32, MEMORY 2026-10-07): `programs` hold their declarations but no instruction list (`shader.instructions` empty), and the SM4
-    /// duplicates are left out ([`Cooked::find`] never returns them); the program [`Cooked::find`] returns is decoded in full here on first use. A
-    /// material's shader map has hundreds of permutations (vertex factories x passes x light-map policies, SM5 + SM4) of which a game uses a handful:
-    /// decoded up front they were ~1.4 GB of the 4 GiB wasm32 heap with the full map loaded (verification/browser/remote-heap3).
-    #[cfg(target_arch = "wasm32")]
-    full: Vec<std::sync::OnceLock<Program>>,
-    #[cfg(target_arch = "wasm32")]
-    packed: Vec<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Cooked {
@@ -81,44 +118,43 @@ impl Cooked {
             let bindings = named_bindings(&resource_table, uniform_buffer_names.as_deref(), &shader.decls).unwrap_or_default();
             // serialized FMaterialShader parameters of this entry (shader_params.rs: offsets read from the cooked data instead of inferred)
             let params = crate::shader_params::parse(data, names, entry.offset, (entry.name_index, entry.number), st.start, header);
+            let discards = shader.body().any(|i| i.op == fn_dxbc::Opcode::Discard);
             #[cfg(target_arch = "wasm32")]
-            let shader = { if shader.major < 5 { continue; } let mut s = shader; s.instructions = Vec::new(); s };
-            programs.push(Program { shader_type: entry.name.clone(), vertex_factory: vf, stream: blob.id, blob, shader, resource_table, uniform_buffer_names, bindings, params });
+            {
+                if shader.major < 5 { continue; }
+                let _ = (&resource_table, &bindings);
+                let major = shader.major;
+                drop(shader);
+                let mut blob = blob;
+                let packed = std::sync::Arc::new({ let mut v = miniz_oxide::deflate::compress_to_vec(&std::mem::take(&mut blob.bytes), 1); v.shrink_to_fit(); v });
+                programs.push(Entry { shader_type: entry.name.clone(), vertex_factory: vf, stream: blob.id, major, lz_blob: blob, lz_uniform_buffer_names: uniform_buffer_names, lz_params: params, lz_discards: discards, lz_packed: packed, lz_cell: std::sync::OnceLock::new() });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let major = shader.major;
+                let p = Program { shader_type: entry.name.clone(), vertex_factory: vf.clone(), stream: blob.id, blob: blob.clone(), shader, resource_table, uniform_buffer_names: uniform_buffer_names.clone(), bindings, params: params.clone(), discards, packed: std::sync::Arc::new(Vec::new()) };
+                let mut lz = blob;
+                lz.bytes = Vec::new(); lz.header = Vec::new(); lz.trailer = Vec::new();
+                let cell = std::sync::OnceLock::new();
+                let _ = cell.set(Box::new(p));
+                programs.push(Entry { shader_type: entry.name.clone(), vertex_factory: vf, stream: lz.id, major, lz_blob: lz, lz_uniform_buffer_names: uniform_buffer_names, lz_params: params, lz_discards: discards, lz_packed: std::sync::Arc::new(Vec::new()), lz_cell: cell });
+            }
         }
         if fn_live::var_os("FN_FX_TIMING").is_some() { eprintln!("[fx-timing] Cooked::parse: {} programs from {} KB: scan_blobs {:.1} ms, Shader::parse {:.1} ms, total {:.1} ms", programs.len(), data.len() / 1024, t_scan.as_secs_f32() * 1000., t_shader.as_secs_f32() * 1000., t0.elapsed().as_secs_f32() * 1000.); }
-        #[cfg(target_arch = "wasm32")]
-        let full = programs.iter().map(|_| std::sync::OnceLock::new()).collect();
-        #[cfg(target_arch = "wasm32")]
-        let packed = programs.iter_mut().map(|p| std::sync::Arc::new(miniz_oxide::deflate::compress_to_vec(&std::mem::take(&mut p.blob.bytes), 1))).collect();
-        Ok(Cooked { programs, names: names.to_vec(), #[cfg(target_arch = "wasm32")] full, #[cfg(target_arch = "wasm32")] packed })
+        Ok(Cooked { programs, names: names.to_vec() })
     }
 
     /// The SM5 program of a (vertex factory, shader type) pair; vertex / pixel stage is part of the type name. SM4 duplicates (`vs_4_0`) are skipped.
     pub fn find(&self, vertex_factory: &str, shader_type: &str) -> Option<&Program> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let i = self.programs.iter().position(|p| p.vertex_factory == vertex_factory && p.shader_type == shader_type && p.shader.major >= 5)?;
-            return Some(self.full[i].get_or_init(|| {
-                let mut p = self.programs[i].clone();
-                p.blob.bytes = miniz_oxide::inflate::decompress_to_vec(&self.packed[i]).unwrap_or_default();
-                if let Ok(s) = Shader::parse(&p.blob.bytes) { p.shader = s; } // the same bytes parsed at load: cannot fail now
-                p
-            }));
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        self.programs.iter().find(|p| p.vertex_factory == vertex_factory && p.shader_type == shader_type && p.shader.major >= 5)
+        self.programs.iter().find(|p| p.vertex_factory == vertex_factory && p.shader_type == shader_type && p.major >= 5).map(|e| &**e)
     }
     /// LANDSCAPE MATERIAL (2026-10-07): the SM5 programs ([`Self::find`] never returns another) whose zlib stream lies in `[lo, hi)` of the `.uexp` (one export's serialized shader maps: a map package holds
     /// the `StaticPermutationMaterialResources` of several `LandscapeMaterialInstanceConstant`s, each export owning its own).
     pub fn subset(&self, lo: usize, hi: usize) -> Cooked {
-        let keep: Vec<usize> = (0..self.programs.len()).filter(|&i| self.programs[i].stream >= lo && self.programs[i].stream < hi && self.programs[i].shader.major >= 5).collect();
+        let keep: Vec<usize> = (0..self.programs.len()).filter(|&i| self.programs[i].stream >= lo && self.programs[i].stream < hi && self.programs[i].major >= 5).collect();
         Cooked {
             programs: keep.iter().map(|&i| self.programs[i].clone()).collect(),
             names: self.names.clone(),
-            #[cfg(target_arch = "wasm32")]
-            full: keep.iter().map(|_| std::sync::OnceLock::new()).collect(),
-            #[cfg(target_arch = "wasm32")]
-            packed: keep.iter().map(|&i| self.packed[i].clone()).collect(),
         }
     }
     pub fn list(&self) -> Vec<String> {

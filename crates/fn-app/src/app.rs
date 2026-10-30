@@ -11,6 +11,7 @@
 //! starts directly in `Loading`; `--startup-capture` runs the whole flow on a fake 60 Hz clock with synthetic input and writes PNGs of every screen.
 //! Frame in `Playing` (the old `App::update` + `render`): real dt (clamped to UE's 0.1 s `MaxDeltaTime`; fixed 1/fps in scripted runs) ->
 //! input (`InputState::gather`, gamepad, quickbar) -> `GameSim::step` -> pose evaluation -> scene render -> HUD / menu / fade -> present -> frame limiter.
+pub const GRENADE_RETICLE_IMAGE: &str = "HUD_Xhair_Launcher_comp.png";
 use crate::audio::{AudioSink, GameplayAudio, SoundEvent};
 use crate::arms::{Arms, ArmsData, ArmsInput, Policy};
 use crate::backend::AppBackend;
@@ -56,8 +57,13 @@ pub const STALL_MS: f32 = 50.;
 
 /// FRONT END: `GetPlatformDisplayName` for "Signed in as:": the signed-in account's name (offline: `FN_DISPLAY_NAME`, else the OS user name).
 static WORLD_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static PLAY_WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARM_GPU_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_FINISH_FADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+thread_local! { static WARM_T0: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) }; }
 const FINISH_STEP_MS: f32 = if cfg!(target_arch = "wasm32") { 6. } else { 25. };
-const WORLD_STEPS: usize = 9;
+const WORLD_STEPS: usize = 11;
+thread_local! { static WORLD_PROPS: std::cell::RefCell<Option<Option<crate::loader::PropsJob>>> = const { std::cell::RefCell::new(None) }; }
 fn menu_first() -> bool { static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *V.get_or_init(|| fn_live::var("FN_MENU_FIRST").map_or(cfg!(target_arch = "wasm32"), |v| v != "0")) }
 fn display_name() -> String {
     if cfg!(target_arch = "wasm32") { return fn_live::var("FN_DISPLAY_NAME").ok().filter(|s| !s.is_empty()).or_else(crate::name_store::saved).unwrap_or_else(|| "Player".into()); }
@@ -214,7 +220,7 @@ impl App {
         // Do not let `--quick` skip past a scripted capture condition before it can be recorded.
         let timing = if skip_flow { Timing::skipped() } else if opts.quick && !opts.startup_capture { Timing::quick() } else { Timing::default() };
         let mut flow = Flow::new(timing, if skip_flow { Stage::Loading } else { Stage::Splash }).with_picker(opts.game_picker && !skip_flow);
-        flow.lobby = flow.picker && !opts.startup_capture && run.is_none() && fn_live::var("FN_LOBBY").map_or(false, |v| v == "1");
+        flow.lobby = flow.picker && !opts.startup_capture && run.is_none() && fn_live::var("FN_LOBBY").ok().filter(|v| !v.is_empty()).map_or(cfg!(target_arch = "wasm32"), |v| v == "1");
         flow.echo = true;
         let backend = AppBackend::new(path, crate::audio::open_for_app(&opts, &source)); // AUDIO HOOK: the real sink (NullAudio for --no-audio / no install / automated runs)
         let live = if opts.live_test { Some(LiveTest::default()) } else { None };
@@ -285,6 +291,11 @@ impl App {
     /// Starts the in-match load (worker threads) and enters the Loading phase.
     /// Enters the Loading phase; the world load itself started earlier with the picker flow (behind the start-up and login screens).
     fn start_loading(&mut self) -> Phase {
+        if cfg!(target_arch = "wasm32") && self.run.is_none() && self.cap.is_none() && !self.skip_flow {
+            if self.loader.is_none() && self.early_scene.is_none() && self.scene.is_none() && WORLD_STEP.load(std::sync::atomic::Ordering::Relaxed) >= WORLD_STEPS { WORLD_STEP.store(0, std::sync::atomic::Ordering::Relaxed); }
+            self.phase_t = 0.;
+            return Phase::Loading;
+        }
         if WORLD_STEP.load(std::sync::atomic::Ordering::Relaxed) < WORLD_STEPS { self.finish_world_steps(); }
         if self.loader.is_none() && self.early_scene.is_none() && self.scene.is_none() { self.start_world_load(); }
         self.phase_t = 0.;
@@ -320,21 +331,31 @@ impl App {
             }
             5 => {
             crate::landscape_render::init(self.install_dir()); // LANDSCAPE MATERIAL (landscape_render.rs)
-            if !cfg!(target_arch = "wasm32") { crate::landscape_render::prewarm(); } // LOAD TIME: its packages read and its materials parsed on a worker while the match loads
+            crate::landscape_render::prewarm(); // LOAD TIME: its packages read and its materials parsed on a worker while the match loads
             }
             6 => {
             crate::hurt_hook::init(&self.roots.roots); // HURT HOOK: <assets>/particles-hurt (damage direction lens effects)
             crate::foot_fx::init(self.install_dir(), &self.roots.roots); // FOOT FX: <assets>/particles-footfx (P_Walk_DustKickup_01 / P_Run_DustKickup_01 / P_Player_Land_Effect)
             crate::heal_fx::init(self.install_dir(), &self.roots.roots); // HEAL FX: <assets>/particles-healfx (P_Consume_Item, the consumable montages' particle notify)
+            crate::enhanced_anim_load::ensure_loading(self.install_dir(), &self.roots.roots);
+            crate::enhanced_sound::ensure_loading(&self.roots.roots);
             }
             7 => {
+            crate::floor_loot_hook::init();
+            crate::supply_drop_hook::init(self.install_dir(), &self.roots.roots);
+            crate::bots_hook::init(&self.roots.roots);
             crate::chest_hook::init(self.install_dir(), &self.roots.roots); // CHEST HOOK: <assets>/particles-chests + the Athena loot tables (chest_hook.rs)
             crate::trap_hook::init(self.install_dir(), &self.roots.roots);
-            crate::rocket_hook::init(self.install_dir(), &self.roots.roots);
-            crate::bus_hook::init(self.install_dir());
-            crate::muzzle_hook::init(&self.roots.roots); // MUZZLE HOOK: the firearms' muzzle flash assets (<assets>/particles-muzzle, independent of the props / harvest particles)
             }
             8 => {
+            crate::bounce_hook::init(self.install_dir(), &self.roots.roots);
+            crate::rocket_hook::init(self.install_dir(), &self.roots.roots);
+            crate::gunfx_hook::init(self.install_dir(), &self.roots.roots);
+            crate::bus_hook::init(self.install_dir());
+            crate::elim_fx::init(self.install_dir(), &self.roots.roots);
+            crate::muzzle_hook::init(&self.roots.roots); // MUZZLE HOOK: the firearms' muzzle flash assets (<assets>/particles-muzzle, independent of the props / harvest particles)
+            }
+            9 => {
             let mode = self.real_mode();
             let props = if mode.needs_real() {
                 crate::props::discover(&self.roots.roots).map(|cat| {
@@ -347,6 +368,10 @@ impl App {
                     crate::loader::PropsJob { cat, lib, kinds, poi: mode == crate::props::Mode::Layout }
                 })
             } else { None };
+            WORLD_PROPS.with(|w| *w.borrow_mut() = Some(props));
+            }
+            10 => {
+            let props = WORLD_PROPS.with(|w| w.borrow_mut().take()).flatten();
             if let Some(j) = props.as_ref() { crate::statics_render::prewarm(j.kinds.clone()); } // LOAD TIME: the real-shader props' materials parse during the loading screen, not on the first frame
             crate::building_render::prewarm(); // LOAD TIME: the standard building pieces' materials too (no stutter at the first build-mode equip / first piece of a type)
             if let Some(g) = self.gfx.as_ref() { self.loader = Some(Loader::start(self.source.clone(), self.roots.clone(), g.gpu.device.clone(), g.gpu.queue.clone(), g.format(), props)); }
@@ -469,6 +494,17 @@ impl App {
         let dt = if self.cap.is_some() { CAPTURE_DT } else { raw_dt };
         if matches!(self.phase, Phase::StartupLoading | Phase::LoggingIn | Phase::GamePicker | Phase::Lobby | Phase::Loading | Phase::Finishing) { let name = self.flow.stage.name(); self.stalls.record(name, raw_dt * 1000.); }
         if self.cap.is_some() { self.capture_poll(el, dt); if self.cap.is_none() { return; } }
+        let pre_t = Instant::now(); let pre_name = (!matches!(self.phase, Phase::Playing)).then(|| self.flow.stage.name());
+        #[cfg(target_arch = "wasm32")] let c0 = web_quality::pre_counters();
+        #[cfg(not(target_arch = "wasm32"))] let c0 = (0f32, 0f32, 0f32);
+        self.phase_frame(el, dt, now);
+        #[cfg(target_arch = "wasm32")] let c1 = web_quality::pre_counters();
+        #[cfg(not(target_arch = "wasm32"))] let c1 = (0f32, 0f32, 0f32);
+        let secs = crate::platform::take_sections();
+        if let Some(name) = pre_name { let ms = pre_t.elapsed().as_secs_f32() * 1000.; if ms > 40. { let mut s = secs; s.sort_by(|a, b| b.1.total_cmp(&a.1)); eprintln!("[hitchtag] {name} cpu {ms:.0}: [{}] lock {:.0} filewait {:.0} grow {:.0}", s.iter().take(8).map(|(k, v)| format!("{k} {v:.0}")).collect::<Vec<_>>().join(", "), c1.0 - c0.0, c1.1 - c0.1, c1.2 - c0.2); } }
+    }
+
+    fn phase_frame(&mut self, el: &ActiveEventLoop, dt: f32, now: Instant) {
         match self.phase.clone() {
             Phase::Boot => {}
             Phase::Splash => self.splash_frame(dt),
@@ -490,11 +526,11 @@ impl App {
         let (Some(gfx), Some(ui)) = (self.gfx.as_mut(), self.ui.as_mut()) else { return };
         let (w, h) = gfx.size();
         ui.begin();
-        build(ui, w as f32, h as f32);
-        if let Acquire::Frame(f) = gfx.acquire() {
+        crate::platform::timed("ui build", || build(ui, w as f32, h as f32));
+        if let Acquire::Frame(f) = crate::platform::timed("acquire", || gfx.acquire()) {
             let view = f.texture.create_view(&Default::default());
-            ui.render(&view, w, h, Some([0., 0., 0., 1.]));
-            gfx.present(f);
+            crate::platform::timed("ui render", || ui.render(&view, w, h, Some([0., 0., 0., 1.])));
+            crate::platform::timed("present", || gfx.present(f));
         }
         if !want.is_empty() {
             let target = fn_render::OffscreenTarget::new(&gfx.gpu.device, w, h, gfx.format());
@@ -532,12 +568,12 @@ impl App {
         let (Some(gfx), Some(ui), Some(bg)) = (self.gfx.as_mut(), self.ui.as_mut(), self.backdrop.as_mut()) else { return };
         let (w, h) = gfx.size();
         ui.begin();
-        build(ui, w as f32, h as f32);
-        if let Acquire::Frame(f) = gfx.acquire() {
+        crate::platform::timed("ui build", || build(ui, w as f32, h as f32));
+        if let Acquire::Frame(f) = crate::platform::timed("acquire", || gfx.acquire()) {
             let view = f.texture.create_view(&Default::default());
-            bg.render(&view, w, h, t, dt);
-            ui.render(&view, w, h, None);
-            gfx.present(f);
+            crate::platform::timed("backdrop render", || bg.render(&view, w, h, t, dt));
+            crate::platform::timed("ui render", || ui.render(&view, w, h, None));
+            crate::platform::timed("present", || gfx.present(f));
         }
         if !want.is_empty() {
             let target = fn_render::OffscreenTarget::new(&gfx.gpu.device, w, h, gfx.format());
@@ -574,7 +610,7 @@ impl App {
         crate::audio::stage_audio(self.backend.audio.as_mut(), s); // MUSIC HOOK: loading-screen mix / front-end music per flow stage
         self.phase_t = 0.;
         match s {
-            Stage::Loading => { if let Some(l) = self.lobby.as_mut() { l.flush(); } self.lobby = None; self.phase = self.start_loading(); }
+            Stage::Loading => { crate::bots_hook::reset(); self.release_front_end_art("loading"); self.backdrop = None; self.backdrop_job = None; if let Some(l) = self.lobby.as_mut() { l.flush(); if cfg!(target_arch = "wasm32") { l.release_gpu(); } } if self.lobby.take().is_some() { crate::lobby_scene::clear_hero_mips(); crate::lobby_scene::clear_hero_views(); } self.phase = self.start_loading(); }
             Stage::StartupLoading => {
                 self.work.begin_front_end();
                 if self.flow.picker && self.loader.is_none() && !menu_first() { self.start_world_load(); } // FRONT END: split loading (see start_world_load)
@@ -584,22 +620,31 @@ impl App {
             Stage::Lobby => { self.phase = Phase::Lobby; self.release_mouse(); }
             Stage::Playing => {
                 fn_ui::menu::pages::visibility::set_in_zone(true);
-                if cfg!(target_arch = "wasm32") { let o = self.overlay.release_large(1 << 20); if let Some(ui) = self.ui.as_mut() { let (n, b) = ui.ctx.assets.release_large(1 << 20); eprintln!("[mem] front-end art released at play: {n} UI textures ({:.0} MB), {o} overlay images", b as f64 / 1048576.); } }
+                self.release_front_end_art("play");
                 self.phase = self.begin_play();
             }
             other => { self.phase = Phase::of(other); }
         }
     }
 
+    fn release_front_end_art(&mut self, at: &str) {
+        if !cfg!(target_arch = "wasm32") { return; }
+        let o = self.overlay.release_large(1 << 20);
+        let lm = self.lobby.as_mut().map_or(0, |l| l.release_ui_materials());
+        if let Some((n, b)) = self.ui.as_mut().and_then(|u| u.front.as_mut()).map(|f| f.release_materials()) { if n > 0 { eprintln!("[mem] front-end UI materials released at {at}: {n} ({:.0} MB of material textures)", b as f64 / 1048576.); } }
+        if lm > 0 { eprintln!("[mem] lobby UI materials released at {at}: {lm}"); }
+        if let Some(ui) = self.ui.as_mut() { let keep = ui.hud.extra.kept_textures(); let (n, b) = ui.ctx.assets.release_large_keep(1 << 20, &keep); eprintln!("[mem] front-end art released at {at}: {n} UI textures ({:.0} MB), {o} overlay images", b as f64 / 1048576.); }
+    }
+
     fn splash_frame(&mut self, dt: f32) {
         self.simple_frame(|ui, w, h| ui.splash(w, h, 1.));
         let s = self.flow.tick(dt);
-        self.entered(s);
+        crate::platform::timed("entered", || self.entered(s));
     }
 
     /// Start-up loading screen: the key art is shown once the worker delivered it AND it was uploaded (one texture per frame, so showing it costs no hitch).
     fn startup_frame(&mut self, el: &ActiveEventLoop, dt: f32) {
-        self.upload_art();
+        crate::platform::timed("upload_art", || self.upload_art());
         let (t, fade, ready, progress) = (self.flow.stage_t, self.flow.startup_fade(), self.art.startup_uploaded, self.work.fraction());
         let (done, total) = self.load_counts();
         self.simple_frame(move |ui, w, h| { ui.startup_loading(w, h, t, progress, ready, fade); ui.load_counter(w, h, done, total); });
@@ -607,7 +652,7 @@ impl App {
         if self.flow.picker && self.front_step == 0 && t > 0. {
             let at = Instant::now();
             let name = display_name();
-            let note = match (self.install_dir(), self.ui.as_mut()) { (Some(dir), Some(ui)) => ui.load_front_end(&dir, &name), _ => Some("no game files".into()) };
+            let note = match (self.install_dir(), self.ui.as_mut()) { (Some(dir), Some(ui)) => crate::platform::timed("load front end", || ui.load_front_end(&dir, &name)), _ => Some("no game files".into()) };
             self.flow.note(format!("front end composed in {:.0} ms{}", at.elapsed().as_secs_f32() * 1000., note.map(|n| format!(" (fallback: {n})")).unwrap_or_default()));
             // FRONT END BACKDROP: the front-end level's scene data on a worker (frontend_bg.rs); its GPU half follows in poll_backdrop
             if let Some(dir) = self.install_dir() {
@@ -619,13 +664,13 @@ impl App {
             if self.flow.lobby { if let Some(dir) = self.install_dir() { self.lobby = Some(crate::lobby_host::LobbyHost::start(&dir, name.clone())); } }
             self.front_step = 1;
         }
-        if self.flow.picker { self.poll_world_early(el, Duration::from_millis(8)); }
+        if self.flow.picker { crate::platform::timed("poll_world_early", || self.poll_world_early(el, Duration::from_millis(8))); }
         if self.work.done() && (self.art.picker_uploaded || !self.flow.picker) && (self.front_step >= 1 || !self.flow.picker) { self.flow.set_work_done(); }
         // FRONT END: the art-only hold = the world load's worker units (paks, loadout, models, clips)
-        let bg_loading = self.poll_backdrop();
+        let bg_loading = crate::platform::timed("poll_backdrop", || self.poll_backdrop());
         if self.flow.work_done() && !bg_loading && (menu_first() || self.early_scene.is_some() || self.loader.as_ref().map_or(true, |l| l.login_share_done())) { self.flow.set_art_hold_done(); }
         let s = self.flow.tick(dt);
-        self.entered(s);
+        crate::platform::timed("entered", || self.entered(s));
     }
 
     /// One art texture per call: first the start-up screen's, then the picker's.
@@ -665,7 +710,7 @@ impl App {
     fn poll_lobby(&mut self) {
         let (Some(lobby), Some(g)) = (self.lobby.as_mut(), self.gfx.as_ref()) else { return };
         if lobby.ready() {
-            if !self.lobby_warmed { self.lobby_warmed = true; let (w, h) = g.size(); lobby.warm(w, h); }
+            if !self.lobby_warmed { let (w, h) = g.size(); self.lobby_warmed = crate::platform::timed("lobby warm", || lobby.warm(w, h)); }
             return;
         }
         let at = Instant::now();
@@ -676,9 +721,11 @@ impl App {
     }
 
     fn login_frame(&mut self, el: &ActiveEventLoop, dt: f32) {
-        self.upload_art();
-        self.poll_backdrop();
-        self.poll_lobby();
+        crate::platform::timed("upload_art", || self.upload_art());
+        crate::platform::timed("poll_backdrop", || self.poll_backdrop());
+        let lobby_t = Instant::now();
+        crate::platform::timed("poll_lobby", || self.poll_lobby());
+        let lobby_busy = lobby_t.elapsed().as_secs_f32() * 1000. > 20.;
         let (t, ready) = (self.flow.stage_t, self.art.startup_uploaded);
         let (done, total) = self.load_counts();
         // GetLoginStatusText: the running login step, stepped by the rest of the world load
@@ -687,7 +734,7 @@ impl App {
         let status = ((frac * n as f32) as usize).min(n - 1);
         // the start-up screen's art layer fades out over the login screen with the exe's 0.2 s curve (`startup_loading` module notes)
         let art_alpha = 1. - (t / startup::STARTUP_FADE_SECONDS.max(1e-3)).clamp(0., 1.);
-        if self.name_entry.is_none() && self.flow.lobby && self.cap.is_none() && self.front_step >= 1 && fn_live::var("FN_DISPLAY_NAME").map_or(true, |v| v.is_empty())
+        if self.name_entry.is_none() && fn_live::var("FN_ASK_NAME").map_or(false, |v| v == "1") && crate::name_store::saved().is_none() && self.flow.lobby && self.cap.is_none() && self.front_step >= 1 && fn_live::var("FN_DISPLAY_NAME").map_or(true, |v| v.is_empty())
             && crate::lobby_profile::stored_display_name(&crate::lobby_profile::default_profile_path()).is_none() && self.ui.as_ref().map_or(false, |u| u.has_sign_in()) && !self.name_known {
             self.name_entry = Some(crate::login_name::NameEntry::new());
         }
@@ -702,22 +749,26 @@ impl App {
             self.name_known = true;
             self.apply_display_name(&name);
         }
-        if self.front_step < 2 && t > 0. {
+        if self.front_step < 2 && t > 0. && !lobby_busy {
             let at = Instant::now();
-            if let (Some(g), Some(ui)) = (self.gfx.as_ref(), self.ui.as_mut()) { let (w, h) = g.size(); ui.warm_picker(w as f32, h as f32); }
-            self.flow.note(format!("picker background rastered in {:.0} ms", at.elapsed().as_secs_f32() * 1000.));
-            self.front_step = 2;
+            static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let k = STEP.load(std::sync::atomic::Ordering::Relaxed);
+            let r = match (self.gfx.as_ref(), self.ui.as_mut()) { (Some(g), Some(ui)) => { let (w, h) = g.size(); crate::platform::timed("picker raster", || ui.warm_picker_step(w as f32, h as f32, k)) } _ => Some(true) };
+            if r.is_some() { STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            let done = r.unwrap_or(false);
+            self.flow.note(format!("picker background step {k} rastered in {:.0} ms", at.elapsed().as_secs_f32() * 1000.));
+            if done { self.front_step = 2; }
         }
-        self.poll_world_early(el, Duration::from_millis(8));
+        crate::platform::timed("poll_world_early", || self.poll_world_early(el, Duration::from_millis(8)));
         // its share: the rest of the world load (renderer, uploads, UI warm-up), so the level-travel screen is short
         let share = menu_first() || self.early_scene.is_some() || self.loader.is_none();
         if share && self.front_step >= 2 && t >= startup::STARTUP_FADE_SECONDS && self.name_entry.is_none() { self.flow.set_login_done(); }
         let s = self.flow.tick(dt);
-        self.entered(s);
+        crate::platform::timed("entered", || self.entered(s));
     }
 
     fn picker_frame(&mut self, dt: f32) {
-        if WORLD_STEP.load(std::sync::atomic::Ordering::Relaxed) < WORLD_STEPS { self.next_world_step(); }
+        if !self.flow.lobby && WORLD_STEP.load(std::sync::atomic::Ordering::Relaxed) < WORLD_STEPS { self.next_world_step(); }
         // gamepad navigation (edge + repeat)
         if self.input.focused && self.cap.is_none() {
             self.pad_state = self.pad.poll(dt);
@@ -725,7 +776,7 @@ impl App {
             for e in evs { self.picker_event(e); }
         }
         self.picker.tick(dt);
-        self.poll_lobby();
+        crate::platform::timed("poll_lobby", || self.poll_lobby());
         if self.flow.lobby && self.cap.is_none() && fn_live::var_os("FN_LOBBY_SHOTS").is_some() && self.flow.pick_battle_royale() { let s = self.flow.stage; self.entered(Some(s)); return; }
         if crate::mp_hook::take_autoplay() && self.phase == Phase::GamePicker { self.flow.lobby = false; if self.flow.pick_battle_royale() { self.entered(Some(Stage::Loading)); } }
         let (p, ready) = (self.picker.clone(), self.art.picker_uploaded);
@@ -741,19 +792,13 @@ impl App {
             crate::rocket_hook::start_prefetch();
         } }
         let s = self.flow.tick(dt);
-        self.entered(s);
+        crate::platform::timed("entered", || self.entered(s));
     }
 
-    fn lobby_frame(&mut self, el: &ActiveEventLoop, dt: f32) {
-        self.poll_lobby();
+    fn lobby_frame(&mut self, _el: &ActiveEventLoop, dt: f32) {
+        crate::platform::timed("poll_lobby", || self.poll_lobby());
         if crate::mp_hook::take_autoplay() && self.flow.lobby_play() { self.entered(Some(Stage::Loading)); return; }
-        self.poll_world_early(el, Duration::from_millis(8));
-        if self.cap.is_none() && self.run.is_none() { if let Some(scene) = self.early_scene.as_mut() {
-            crate::statics_render::set_view_distance_scale(self.backend.render.options.view_distance_scale);
-            let _ = crate::statics_render::poi_prebuild_step(scene.renderer.fx(), 4.) && crate::building_render::prebuild_step(scene.renderer.fx(), 4.) && crate::pickups_fx::prebuild_step(&mut scene.renderer, 4.) && scene.renderer.fx().pso_warm_step(4.);
-            crate::rocket_hook::start_prefetch();
-        } }
-        let load_fraction = if self.early_scene.is_some() || self.scene.is_some() { 1. } else { self.loader.as_ref().map_or(1., |l| l.fraction().min(0.99)) };
+        let load_fraction = 1.;
         if self.lobby.is_none() {
             if self.flow.lobby_play() { self.entered(Some(Stage::Loading)); }
             return;
@@ -761,7 +806,7 @@ impl App {
         if !self.lobby.as_ref().map_or(false, |l| l.ready()) {
             let t = self.flow.stage_t;
             self.simple_frame(move |ui, w, h| ui.startup_loading(w, h, t, 0.0, true, 0.));
-            let s = self.flow.tick(dt); self.entered(s);
+            let s = self.flow.tick(dt); crate::platform::timed("entered", || self.entered(s));
             return;
         }
         let mut out = crate::lobby_host::LobbyOut::None;
@@ -769,18 +814,18 @@ impl App {
             let (w, h) = gfx.size();
             let (device, queue, format) = (gfx.gpu.device.clone(), gfx.gpu.queue.clone(), gfx.format());
             if let Acquire::Frame(f) = gfx.acquire() {
-                out = lobby.frame(&device, &queue, format, &f.texture, w, h, dt, load_fraction);
+                out = crate::platform::timed("lobby frame", || lobby.frame(&device, &queue, format, &f.texture, w, h, dt, load_fraction));
                 gfx.present(f);
             }
-            for e in lobby.take_sounds() { self.backend.audio.event(e); }
+            for e in lobby.take_sounds() { eprintln!("[lobby] ui sound {e:?}"); self.backend.audio.event(e); }
         }
         if let Some(dir) = fn_live::var_os("FN_LOBBY_SHOTS") { self.lobby_shots(std::path::PathBuf::from(dir)); }
         if out == crate::lobby_host::LobbyOut::MatchReady {
-            if let Some(l) = self.lobby.as_mut() { l.flush(); }
-            if self.flow.lobby_play() { self.entered(Some(Stage::Loading)); return; }
+            if let Some(l) = self.lobby.as_mut() { crate::platform::timed("lobby flush", || l.flush()); }
+            if self.flow.lobby_play() { crate::platform::timed("enter loading", || self.entered(Some(Stage::Loading))); return; }
         }
         let s = self.flow.tick(dt);
-        self.entered(s);
+        crate::platform::timed("entered", || self.entered(s));
     }
 
     fn lobby_shots(&mut self, dir: PathBuf) {
@@ -819,18 +864,33 @@ impl App {
 
     fn loading_frame(&mut self, el: &ActiveEventLoop, dt: f32) {
         self.phase_t += dt;
+        #[cfg(target_arch = "wasm32")]
+        crate::web::heap_reserve_step();
+        if WORLD_STEP.load(std::sync::atomic::Ordering::Relaxed) < WORLD_STEPS {
+            let i = WORLD_STEP.load(std::sync::atomic::Ordering::Relaxed);
+            crate::platform::timed(["world step 0", "world step 1", "world step 2", "world step 3", "world step 4", "world step 5", "world step 6", "world step 7", "world step 8", "world step 9", "world step 10"].get(i).copied().unwrap_or("world step"), || self.next_world_step());
+            self.loading_page(0., "Starting", 0.);
+            let s = self.flow.tick(dt); self.entered(s);
+            return;
+        }
         let (Some(ui), Some(loader)) = (self.ui.as_mut(), self.loader.as_mut()) else {
             // load finished earlier: keep showing 100 % until the flow leaves the stage
             self.loading_page(1., "Starting", 0.);
-            let s = self.flow.tick(dt); self.entered(s);
+            let s = self.flow.tick(dt); crate::platform::timed("entered", || self.entered(s));
             return;
         };
-        let state = match self.early_scene.take() { Some(s) => Ok(State::Done(s)), None => loader.poll(ui, Duration::from_millis(12)) };
+        static POST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        let poll_t = Instant::now();
+        let state = match self.early_scene.take() { Some(s) => Ok(State::Done(s)), None => crate::platform::timed("loader poll", || loader.poll(ui, Duration::from_millis(12))) };
         let (fraction, label) = (loader.fraction(), loader.label());
         match state {
             Err(e) => { self.fail(el, e); return; }
-            Ok(State::Done(scene)) => {
+            Ok(State::Done(scene)) => 'post: {
+                let post = POST.load(std::sync::atomic::Ordering::Relaxed);
+                if post == 0 && self.run.is_none() && poll_t.elapsed() > Duration::from_millis(20) { POST.store(1, std::sync::atomic::Ordering::Relaxed); self.early_scene = Some(scene); break 'post; }
                 let t_done = Instant::now(); let mut marks: Vec<(&str, f32)> = vec![]; // LOAD TIME: the post-load setup runs on the UI thread with the screen frozen at 100 %
+                let mut scene = scene;
+                if post < 2 {
                 if let Some(loadout) = &scene.loadout {
                     if let Some(ui) = self.ui.as_mut() { ui.inv.set_catalog(loadout.inventory.clone()); } // WIDGETS3 HOOK: inventory screen item texts
                     let mut items = std::array::from_fn(|_| None);
@@ -847,6 +907,7 @@ impl App {
                         Err(e) => eprintln!("[arms] unavailable: {e}"),
                     }
                     self.ads = crate::ads::AdsDriver::from_resources(loadout); // ADS HOOK: aim-down-sights profiles of the three firearms
+                    crate::emote_hook::init(loadout);
                 }
                 marks.push(("arms + ads", t_done.elapsed().as_secs_f32() * 1000.));
                 self.load_log = loader.timings_text();
@@ -854,12 +915,15 @@ impl App {
                 let install = self.install_dir(); crate::pickups_hook::init(install.clone()); self.weapons.set_install(install); // WEAPON RUNTIME HOOK (+ PICKUPS HOOK: the item catalog scan)
                 if let (Some(dir), Some(arms), Some(ui)) = (self.install_dir(), self.arms.as_ref(), self.ui.as_mut()) { ui.inv.panel.set_install(dir.clone()); ui.hud.pickup.set_install(dir.clone()); /* PICKUP CARD: the cooked InteractionIndicator */ for n in ui.inv.load_extras(&dir, arms) { eprintln!("{n}"); } } // INVENTORY HOOK: consumable / ammo item texts + icons, the panel's background material
                 marks.push(("hooks + inventory extras", t_done.elapsed().as_secs_f32() * 1000.));
-                let stage_note = format!("load steps:\n{}", self.load_log);
-                let mut scene = scene;
                 // SCOPE HOOK: the post-process material + mesh of the first scoped weapon (data: its ADS profile's `ScopeData`)
                 if let (Some(dir), Some(sd)) = (self.install_dir(), self.ads.as_ref().and_then(|a| a.profiles.iter().find_map(|p| p.scope.clone()))) { crate::scope_hook::install(&mut scene.renderer, &dir, &sd); }
                 if let Some(dir) = self.install_dir() { crate::outline_hook::start(&dir); } // OUTLINE HOOK: decode the outline post-process material
+                if let Some(dir) = self.install_dir() { crate::decals_hook::start(&dir); }
                 marks.push(("scope", t_done.elapsed().as_secs_f32() * 1000.));
+                if self.run.is_none() { eprintln!("[load] post-load setup (UI thread), part 1: {}", marks.iter().map(|(n, ms)| format!("{n} -> {ms:.0} ms")).collect::<Vec<_>>().join(", ")); POST.store(2, std::sync::atomic::Ordering::Relaxed); self.early_scene = Some(scene); break 'post; }
+                }
+                POST.store(0, std::sync::atomic::Ordering::Relaxed);
+                let stage_note = format!("load steps:\n{}", self.load_log);
                 // GUN MATERIAL HOOK: the held firearms run their cooked WeaponMat_Base material through the gun pass by default (as 1.8; the gun pass now casts CSM shadows and
                 // gets the DFAO + sky-light specular, docs/spec/pickup_visual_gaps.md section 2). If a material cannot be built the renderer Prop model is the logged
                 // fallback; `--standin-gun-material` forces that model.
@@ -884,16 +948,19 @@ impl App {
                 self.flow.note(stage_note.trim_end());
                 if self.run.is_some() {
                     // FIRST USE: `FN_SCRIPT_WARM=1` runs the loading screen's building warm-up before frame 0, as a normal launch does (verification/first_use)
-                    if fn_live::var_os("FN_SCRIPT_WARM").is_some() { if let Some(scene) = self.scene.as_mut() {
+                    if fn_live::var("FN_SCRIPT_WARM").map_or(cfg!(target_arch = "wasm32"), |v| v != "0") { if let Some(scene) = self.scene.as_mut() {
                         let t = Instant::now();
                         while !(crate::building_render::prebuild_step(scene.renderer.fx(), 1000.) && crate::pickups_fx::prebuild_step(&mut scene.renderer, 1000.)) && t.elapsed().as_secs() < 60 {}
                         crate::pickups_hook::warm_pickaxe(scene);
-                        crate::particles::prebuild(&mut scene.renderer);
-                        crate::muzzle_hook::prebuild(&mut scene.renderer);
-                        crate::foot_fx::prebuild(scene.renderer.fx()); // FOOT FX
+                        while !crate::particles::prebuild(&mut scene.renderer) {}
+                        while !crate::muzzle_hook::prebuild(&mut scene.renderer) {}
+                        while !crate::foot_fx::prebuild(scene.renderer.fx()) {} // FOOT FX
                         crate::heal_fx::prebuild(scene.renderer.fx()); // HEAL FX
                         crate::chest_hook::prebuild(scene.renderer.fx()); // CHEST HOOK
                         crate::rocket_hook::prebuild(scene.renderer.fx());
+                        while !crate::gunfx_hook::prebuild(scene.renderer.fx()) {}
+                        while !crate::elim_fx::prebuild(scene.renderer.fx()) {}
+                        while !crate::supply_drop_hook::prebuild(scene.renderer.fx()) {}
                     } }
                     self.flow.force(Stage::Playing); self.phase = self.begin_play(); return;
                 }
@@ -902,35 +969,114 @@ impl App {
         }
         let (fraction, label) = if self.loader.is_none() { (1., "Starting".to_owned()) } else { (fraction, label) };
         self.loading_page(fraction, &label, 0.);
-        let s = self.flow.tick(dt); self.entered(s);
+        let s = self.flow.tick(dt); crate::platform::timed("entered", || self.entered(s));
     }
 
     fn finishing_frame(&mut self, dt: f32) {
+        #[cfg(target_arch = "wasm32")]
+        crate::web::heap_reserve_step();
         // LOAD TIME (2026-10-06): the real-shader props' materials build ~25 ms per frame under the live loading screen. The flow holds here until they
         // are done (capped at 30 s), so the first in-game frame no longer stalls on them with the screen frozen on "Starting".
         self.phase_t += dt;
         // FIRST USE (2026-10-06): then the building pieces / their effects (building_render::prebuild_step), so the first piece of a type does not freeze
         crate::statics_render::set_view_distance_scale(self.backend.render.options.view_distance_scale);
-        let ready = match self.scene.as_mut() {
-            Some(scene) => scene.step_original_guns() && crate::landscape_render::prebuild_step(scene.renderer.fx()) // LOAD TIME: the landscape's GPU data under the loading screen, not in the first frame of play
-                && crate::statics_render::prebuild_step(scene.renderer.fx(), &self.sim.world.props, scene.real.as_ref(), FINISH_STEP_MS) && crate::building_render::prebuild_step(scene.renderer.fx(), FINISH_STEP_MS)
-                && crate::spline_mesh::prebuild_step(scene.renderer.fx()) // ROADS / SPLINES: the spline meshes under the loading screen (spline_mesh.rs)
-                && crate::pickups_fx::prebuild_step(&mut scene.renderer, FINISH_STEP_MS) // FIRST USE: the pickup effects (and with FN_WARM_ITEMS the item holograms / static materials)
-                && { crate::pickups_hook::warm_pickaxe(scene); crate::particles::prebuild(&mut scene.renderer); crate::muzzle_hook::prebuild(&mut scene.renderer); crate::foot_fx::prebuild(scene.renderer.fx()); crate::heal_fx::prebuild(scene.renderer.fx()); crate::chest_hook::prebuild(scene.renderer.fx()); crate::rocket_hook::prebuild(scene.renderer.fx()) } // FIRST USE: the held pickaxe's gun-pass model, the harvest / impact / muzzle particle materials (each once, cheap afterwards)
-                && scene.renderer.fx().pso_warm_step(FINISH_STEP_MS)
-                && scene.renderer.fx().pending_pipelines() == 0, // BROWSER PORT: the FX pipelines still compiling in the browser (async; always 0 natively)
-            None => true,
-        } || self.phase_t > if cfg!(target_arch = "wasm32") { 240. } else { 30. }; // BROWSER PORT: remote file reads can take minutes on a cold cache
+        static UI_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let ui_pending = self.ui.as_mut().map_or(0, |u| { if !UI_WARM.swap(true, std::sync::atomic::Ordering::Relaxed) { let n = u.renderer.prewarm_materials(); eprintln!("[load] ui material pipelines: {n} started"); } u.renderer.prewarm_pending() });
+        { let dir = self.install_dir(); crate::skydive_anim::ensure_loading(|| dir); }
+        crate::enhanced_anim_load::ensure_loading(self.install_dir(), &self.roots.roots);
+        crate::enhanced_sound::ensure_loading(&self.roots.roots);
+        let (chain, pso_done) = match self.scene.as_mut() {
+            Some(scene) => { let pso = crate::platform::timed("finishing: pso warm", || scene.renderer.fx().pso_warm_step(FINISH_STEP_MS)); (crate::platform::timed("finishing: guns", || scene.step_original_guns()) && crate::platform::timed("finishing: landscape", || crate::landscape_render::prebuild_step(scene.renderer.fx())) // LOAD TIME: the landscape's GPU data under the loading screen, not in the first frame of play
+                && crate::platform::timed("finishing: statics", || crate::statics_render::prebuild_step(scene.renderer.fx(), &self.sim.world.props, scene.real.as_ref(), FINISH_STEP_MS)) && crate::platform::timed("finishing: building", || crate::building_render::prebuild_step(scene.renderer.fx(), FINISH_STEP_MS))
+                && crate::platform::timed("finishing: splines", || crate::spline_mesh::prebuild_step(scene.renderer.fx())) // ROADS / SPLINES: the spline meshes under the loading screen (spline_mesh.rs)
+                && crate::platform::timed("finishing: pickups", || crate::pickups_fx::prebuild_step(&mut scene.renderer, FINISH_STEP_MS)) // FIRST USE: the pickup effects (and with FN_WARM_ITEMS the item holograms / static materials)
+                && crate::platform::timed("finishing: skydive", || crate::skydive_anim::prebuild_step(scene)) && crate::enhanced_anim_load::prebuild_step(scene) && crate::enhanced_sound::ready(), pso) }
+            None => (true, true),
+        };
+        let warm = chain && self.finish_warm_step();
+        static UPGRADES_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !UPGRADES_ON.swap(true, std::sync::atomic::Ordering::Relaxed) { fn_fx::gpu::enable_upgrades(); }
+        if let Some(scene) = self.scene.as_mut() { crate::decals_hook::prewarm(&mut scene.renderer); }
+        if let Some(scene) = self.scene.as_mut() { crate::platform::timed("finishing: texture upgrades", || fn_fx::gpu::upgrade_step(scene.renderer.fx(), 8 << 20)); }
+        let textures = !warm || fn_fx::gpu::upgrades_idle();
+        let pending = self.scene.as_mut().map_or(0, |s| s.renderer.fx().pending_pipelines());
+        let ready = chain && warm && textures && pso_done && pending == 0 && ui_pending == 0 || self.phase_t > if cfg!(target_arch = "wasm32") { 240. } else { 30. }; // BROWSER PORT: remote file reads can take minutes on a cold cache
         // PIPELINE DEDUP: the FX pipelines the load made and the identical requests that reused one (once, when the loading screen is done)
         static DEDUP_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if ready && !DEDUP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) { if let Some(scene) = self.scene.as_mut() { eprintln!("{}", scene.renderer.fx().pipeline_cache_report()); } }
         static FIN_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if ready && !FIN_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) { eprintln!("[load] finishing stage: {:.1} s (POI kinds {:?}, done or capped)", self.phase_t, crate::statics_render::poi_prepare_progress()); }
         let fade = self.flow.finish_fade();
+        LAST_FINISH_FADE.store(fade.to_bits(), std::sync::atomic::Ordering::Relaxed);
         // LOADING SCREEN: real progress of the world preparation (the POI kinds of the groups around the spawn)
         let (pd, pt) = crate::statics_render::poi_prepare_progress();
-        if pt > 0 && pd < pt { self.loading_page(pd as f32 / pt as f32, &format!("Preparing the world ({pd} / {pt})"), fade); } else { self.loading_page(1., "Starting", fade); }
-        if ready { let s = self.flow.tick(dt); self.entered(s); }
+        let (sd, st, sdone) = self.scene.as_mut().map_or((0, 0, true), |s| s.renderer.fx().pso_warm_progress());
+        if pt > 0 && pd < pt { self.loading_page(pd as f32 / pt as f32, &format!("Preparing the world ({pd} / {pt})"), fade); }
+        else if !sdone && st > 0 { self.loading_page(sd as f32 / st as f32, &format!("Compiling shaders ({sd} / {st})"), fade); }
+        else { self.loading_page(1., "Starting", fade); }
+        if ready { let s = self.flow.tick(dt); crate::platform::timed("entered", || self.entered(s)); }
+    }
+
+    fn load_fx_world(&mut self) {
+        if !self.fx_tried && self.scene.is_some() {
+            self.fx_tried = true;
+            if let Some(dir) = self.install_dir() {
+                match fn_pak::PakSet::open_install(&dir).map_err(|e| e.to_string()).and_then(|set| fn_fx::bridge::FxWorld::load(&set, self.scene.as_mut().unwrap().renderer.fx())) {
+                    Ok(w) => { for n in &w.notes { eprintln!("[fx] {n}"); } self.fx = Some(w); }
+                    Err(e) => eprintln!("[fx] weak-point ring / damage numbers unavailable: {e}"),
+                }
+            }
+        }
+    }
+
+    fn finish_warm_step(&mut self) -> bool {
+        static STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static TRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let step = STEP.load(std::sync::atomic::Ordering::Relaxed);
+        if self.scene.is_none() { return true; }
+        let t = Instant::now();
+        let dir = self.install_dir();
+        let mut advance = {
+            let scene = self.scene.as_mut().unwrap();
+            match step {
+                0 => { crate::pickups_hook::warm_pickaxe(scene); true }
+                1 => crate::particles::prebuild(&mut scene.renderer),
+                2 => crate::muzzle_hook::prebuild(&mut scene.renderer),
+                3 => crate::foot_fx::prebuild(scene.renderer.fx()),
+                4 => { crate::heal_fx::prebuild(scene.renderer.fx()); true }
+                5 => { crate::chest_hook::prebuild(scene.renderer.fx()); true }
+                6 => crate::bus_hook::prebuild(scene.renderer.fx()),
+                7 => crate::rocket_hook::prebuild(scene.renderer.fx()),
+                20 => crate::gunfx_hook::prebuild(scene.renderer.fx()),
+                21 => crate::elim_fx::prebuild(scene.renderer.fx()),
+                22 | 23 | 24 => true,
+                25 => crate::supply_drop_hook::prebuild(scene.renderer.fx()),
+                8 => true,
+                9 => { if crate::df_hook::pending() { crate::df_hook::frame(scene, dir.clone(), &self.roots.roots); } !crate::df_hook::pending() || TRIES.load(std::sync::atomic::Ordering::Relaxed) > 1200 }
+                10 => { if crate::light_fn_hook::pending() { crate::light_fn_hook::frame(&mut scene.renderer, dir.clone()); } true }
+                11 => { if crate::local_lights_hook::pending() { crate::local_lights_hook::frame(&mut scene.renderer, dir.clone(), &self.sim.world.props); } true }
+                12 => { if crate::sky_refl_hook::pending() { crate::sky_refl_hook::frame(&mut scene.renderer, dir.clone()); } !crate::sky_refl_hook::pending() || TRIES.load(std::sync::atomic::Ordering::Relaxed) > 600 }
+                13 => { if self.storm.wants_load(&self.sim.storm, true) { self.storm.load(dir.clone(), scene.renderer.fx(), &self.sim.storm); } true }
+                14 => { crate::backdrop_real::prebuild(scene.renderer.fx()); true }
+                15 => { crate::statics_render::grass_prebuild(scene.renderer.fx(), scene.grass.as_ref()); true }
+                16 => { crate::trap_hook::prebuild_catalog(); crate::trap_hook::warm_ribbons(scene.renderer.fx()); true }
+                17 => crate::building_render::prebuild_doors(scene.renderer.fx(), FINISH_STEP_MS),
+                18 => crate::bots_hook::prewarm(scene),
+                19 => true,
+                _ => return true,
+            }
+        };
+        if step == 8 { self.load_fx_world(); }
+        if let (22..=24, Some(u), Some(g)) = (step, self.ui.as_mut(), self.gfx.as_ref()) {
+            let (w, h) = g.size();
+            match step { 22 => u.hud.prewarm_aerial(&mut u.ctx, w as f32, h as f32), 23 => { if !u.hud.prewarm_game_over(&mut u.ctx, w as f32, h as f32) { advance = false; } } _ => { let map = u.hud.prewarm(&mut u.ctx); u.renderer.prewarm_straight(map, &u.ctx.assets); } }
+        }
+        if step == 19 { crate::demolition_hook::tick(&mut self.sim); }
+        let ms = t.elapsed().as_secs_f32() * 1000.;
+        crate::platform::section(&format!("finish warm {step}"), ms);
+        if ms > 100. { eprintln!("[load] finishing warm step {step}: {ms:.0} ms"); }
+        if advance { STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed); TRIES.store(0, std::sync::atomic::Ordering::Relaxed); } else { TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        false
     }
 
     fn begin_play(&mut self) -> Phase {
@@ -1045,11 +1191,17 @@ impl App {
         for (err, l) in crate::pickups_hook::take_lines() { self.console.console.say(if err { fn_console::LineKind::Error } else { fn_console::LineKind::Info }, l); }
         // DOOR HOOK: map / player doors (Use on the focused leaf, swing, timers, collision into the sim, open / close cues); a focused pickup keeps the key
         let pickup_focused = crate::pickups_hook::has_focus();
+        crate::mp_hook::set_use_held(use_down && !pickup_focused);
         for e in crate::platform::timed("doors", || crate::door_hook::frame(&mut self.sim, use_down, pickup_focused, dt)) { self.backend.audio.event(e); }
         // CHEST HOOK: chests / ammo boxes (hold Use to search, open, loot); a focused pickup or door keeps the key
         let door_focused = crate::door_hook::prompt("").is_some();
-        for e in crate::platform::timed("chests", || crate::chest_hook::frame(&mut self.sim, use_down, pickup_focused || door_focused, dt)) { self.backend.audio.event(e); }
-        if let Some(a) = self.arms.as_mut() { a.set_interact_search(crate::chest_hook::searching()); } // CHEST HOOK: the pawn's Search montage while a search hold runs
+        if self.phase == Phase::Playing { crate::platform::timed("floor loot", || crate::floor_loot_hook::frame(&mut self.sim)); }
+        let equip = (self.hud_inputs.selected, self.build_input.is_building());
+        for e in crate::platform::timed("chests", || crate::chest_hook::frame(&mut self.sim, use_down, pickup_focused || door_focused, equip, dt)) { if fn_live::var("FN_BUILD_SOUND_LOG").is_ok_and(|v| v == "1") { eprintln!("[chest-sound] {e:?}"); } self.backend.audio.event(e); }
+        let chest_focused = crate::chest_hook::prompt("").is_some();
+        let zones = self.storm.game.zones_view();
+        for e in crate::platform::timed("supply drops", || crate::supply_drop_hook::frame(&mut self.sim, zones, use_down, pickup_focused || door_focused || chest_focused, dt)) { self.backend.audio.event(e); }
+        if let Some(a) = self.arms.as_mut() { a.set_interact_search(crate::chest_hook::searching()); if crate::interact::take_tap() { a.play_interact_use(); } } // CHEST HOOK: the pawn's Search montage while a search hold runs
     }
     /// WEAPON RUNTIME HOOK: the runtime's log lines into the F2 console log.
     fn flush_weapon_events(&mut self) { for (is_err, line) in self.weapons.take_events() { self.console.console.say(if is_err { fn_console::LineKind::Error } else { fn_console::LineKind::Info }, line); } }
@@ -1085,6 +1237,7 @@ impl App {
         // WEAPON AUDIO HOOK: the arms' sound moments -> sink events (weapon sounds at the weapon's attach point, montage-notify sounds at the pawn mesh)
         crate::heal_fx::on_notifies(arms.take_particles()); // HEAL FX: the montages' AnimNotify_PlayParticleEffect (P_Consume_Item at the heal trigger)
         let sounds = arms.take_sounds();
+        crate::muzzle_hook::on_arms_sounds(&sounds);
         if !sounds.is_empty() {
             let weapon = self.scene.as_ref().and_then(|s| s.weapon_origin).unwrap_or(self.sim.cam_view.eye);
             let pawn = crate::scene::pawn_matrix(&self.sim).w_axis.truncate();
@@ -1135,7 +1288,27 @@ impl App {
         // Only confirmed hits restart `B_Ranged_Generic.HitNotifyReticleImage` (0.4 s); misses and melee never do.
         self.hud_inputs.firearm_hit = crate::hitreg_hook::take_impacts().iter().any(|(_, i)| i.surface == fn_hitreg::shoot::SURFACE_PLAYER && i.damage > 0.);
         self.sim.arms = arms.montages();
+        { let pawn = crate::scene::pawn_matrix(&self.sim).w_axis.truncate() + glam::Vec3::Y * 0.9; let dead = crate::kill_feed_hook::local_death().is_some() || crate::mp_hook::local_dead(); let dm = crate::death_hook::local_frame(arms.data.death.as_ref(), dead, dt, pawn); self.sim.arms.extend(dm); let km = crate::dbno_hook::local_frame(arms.data.death.as_ref(), crate::mp_hook::local_knocked(), dead, dt, pawn); self.sim.arms.extend(km); }
+        {
+            let dead = crate::kill_feed_hook::local_death().is_some() || crate::mp_hook::local_dead();
+            let weapon_ability = self.sim.swing.stage != 0 || (fire && arms.gun_index().is_some());
+            let building = self.build_input.is_building() || self.build_input.is_editing();
+            let typing = self.console.console.is_open() || crate::chat_hook::is_open();
+            let pad_emote = crate::emote_hook::edge(23, self.pad_state.as_ref().map_or(false, |s| s.buttons & fn_game::pad_layout::DPAD_DOWN != 0));
+            let key = crate::emote_hook::edge(24, self.backend.input.bindings.down(fn_settings::A_CHAT_PICKER, |k| self.input.poll(k)));
+            let press = (key || pad_emote) && !typing && !crate::emote_hook::input_owned();
+            let f = crate::emote_hook::Frame { dt, press, feet: self.sim.feet(), airborne: self.sim.controller.airborne(), crouched: self.sim.controller.crouched, jump_press: crate::emote_hook::edge(25, inp.jump),
+                weapon_ability, weapon_start: crate::emote_hook::edge(26, weapon_ability), equip_changed: inp.selection_changed || crate::emote_hook::changed(27, building), dbno: crate::mp_hook::local_knocked(), dead, skydiving: self.sim.items_blocked() };
+            let em = crate::emote_hook::local_frame(&f, self.pad_state.is_some());
+            self.sim.arms.extend(em);
+            if crate::mp_hook::players_alive().is_none() { let _ = crate::emote_hook::take_net(); }
+        }
+        crate::elim_fx::step(dt);
+        for e in crate::death_hook::take_sounds() { self.backend.audio.event(e); }
+        if crate::death_hook::take_killed_mix() { self.backend.audio.push_player_killed_mix(); }
         self.sim.anim.set_mask_right_arm(arms.mask_right_arm());
+        self.sim.anim.set_additive_layer_curve(arms.interact_curve("AdditiveLayer").map_or(0., |(s, _)| s));
+        crate::interact::set_montage_curves(["BothHandFK", "LeftHandFK"].into_iter().filter_map(|n| arms.interact_curve(n).map(|(s, w)| (n, s, w))).collect());
         crate::build_anim::drive(&mut self.sim, arms, inp, dt); // BUILD ANIM HOOK: blueprint in the hands -> PaperBlueprint set, BuildingState, Blueprint_* montages
         // BUILD ANIM HOOK: the blueprint montages' PlaySound notifies (Blueprint_Equip -> Player_Equip_Blueprint_Cue, bFollow: at the pawn mesh)
         for s in crate::build_anim::take_sounds() { let pawn = crate::scene::pawn_matrix(&self.sim).w_axis.truncate(); for e in crate::audio::arms_to_sounds(&s, &[], false, pawn, pawn) { self.backend.audio.event(e); } }
@@ -1155,7 +1328,9 @@ impl App {
                     dim: arms.is_reloading() || remaining <= 0,
                     hit: rd.hit_image.clone(), muzzle_blocked: rd.muzzle_blocked_image.clone(), muzzle_blocked_px: test_blocked,
                 })
-            })
+            }).or_else(|| arms.throwable_selected().then(|| fn_ui::screens::reticle_state::FirearmReticle {
+                image: None, center: Some(GRENADE_RETICLE_IMAGE.to_owned()), corner_angles: vec![], corner_outside: false, spread_deg: 0., fov_deg: 80., dim: false, hit: None, muzzle_blocked: None, muzzle_blocked_px: None,
+            }))
         };
         self.hud_inputs.equip = arms.equip_progress().map(|(elapsed, duration)| fn_ui::screens::reticle_state::EquipProgress { elapsed, duration });
         self.hud_inputs.slot_cooldowns = arms.slot_cooldowns(); // WIDGETS3 HOOK: QuickbarSlotCooldown
@@ -1176,7 +1351,7 @@ impl App {
         use fn_game::pad_layout::{Actions, Layout, Mode};
         if self.console.console.is_open() || crate::chat_hook::is_open() { self.input.set_pad_actions(&self.backend.input.bindings, &[]); return Actions::default(); }
         let mode = if self.build_input.is_editing() { Mode::Edit } else if self.build_input.is_building() { Mode::Build } else { Mode::Combat };
-        let interact = crate::pickups_hook::has_focus() || crate::door_hook::prompt("").is_some() || crate::chest_hook::prompt("").is_some();
+        let interact = crate::pickups_hook::has_focus() || crate::door_hook::prompt("").is_some() || crate::chest_hook::prompt("").is_some() || crate::supply_drop_hook::has_focus();
         let was_connected = self.input.pad_connected;
         self.input.pad_connected = self.pad_state.is_some();
         if was_connected != self.input.pad_connected { eprintln!("[pad] controller {}", if self.input.pad_connected { "connected" } else { "disconnected: every held pad action released" }); }
@@ -1201,7 +1376,6 @@ impl App {
     /// One gameplay input + simulation step. Returns true when the simulation advanced.
     fn update_sim(&mut self, dt: f32) -> bool {
         let Some(ui) = self.ui.as_mut() else { return false };
-        self.build_input.set_edit_release_options(fn_settings::extras::flag(&self.settings, fn_settings::extras::CONFIRM_EDIT_ON_RELEASE), fn_settings::extras::flag(&self.settings, fn_settings::extras::RESET_EDIT_ON_RELEASE)); self.build_input.set_turbo_build(fn_settings::extras::flag(&self.settings, fn_settings::extras::TURBO_BUILD) || fn_live::var("FN_TURBO_BUILD").map_or(false, |v| v == "1"));
         if let Some(run) = self.run.as_mut() {
             let f = run.frame;
             run.driver.prepare(f, &mut self.sim);
@@ -1277,7 +1451,20 @@ impl App {
         let before = self.hud_inputs.selected;
         let mut ai = ArmsInput::default();
         let pad_act = self.pad_actions(dt, cursor_mode);
-        if let Some(i) = self.input.quickbar_press(&self.backend.input.bindings) {
+        let emote_open = crate::emote_hook::picker_open();
+        crate::emote_hook::set_input_owned(emote_open);
+        self.sim.ext_block_app = if crate::emote_hook::with_local(|l| l.playing.is_some()) { Some("emoting") } else if self.build_input.is_editing() { Some("entered edit mode") } else { None };
+        if emote_open {
+            let (vw, vh) = self.gfx.as_ref().map_or((1280, 720), |g| g.size());
+            let (mx, my) = self.input.take_mouse();
+            crate::emote_hook::picker_mouse(mx as f32, my as f32, vw as f32 * 0.5, vh as f32 * 0.5);
+            let pad = self.pad_state.as_ref().map(|s| { let (x, y) = gpad::radial_deadzone(s.rx, s.ry, gpad::RIGHT_DEADZONE); (s.buttons & gpad::A != 0, s.rt >= gpad::TRIGGER_ON, s.buttons & gpad::B != 0, s.buttons & fn_game::pad_layout::DPAD_DOWN != 0, (x, y)) });
+            let shoulder = self.pad_state.as_ref().map_or(0, |s| crate::emote_hook::edge(20, s.buttons & gpad::RB != 0) as i32 - crate::emote_hook::edge(21, s.buttons & gpad::LB != 0) as i32);
+            let k = crate::emote_hook::picker_keys(|c| self.input.raw_down(c), self.input.slot_wheel(&self.backend.input.bindings) + shoulder, pad);
+            crate::emote_hook::apply_picker_keys(&k, self.sim.feet(), fn_ui::layout::dpi_scale(vw as f32, vh as f32));
+        } else { crate::emote_hook::picker_keys(|c| self.input.raw_down(c), 0, None); }
+        if emote_open {
+        } else if let Some(i) = self.input.quickbar_press(&self.backend.input.bindings) {
             // only occupied slots can be selected (HudState::select)
             let mut st = hud_state(&self.sim, &self.settings, &self.hud_inputs); st.select(i); self.hud_inputs.selected = st.selected;
             ai.select = Some(st.selected);
@@ -1301,21 +1488,27 @@ impl App {
         let open_menu = gpad::start_released(pf.menu);
         // mouse look uses the FOV of the last composed view (`GetFOVAngle()` in UFortPlayerInputAthena vfunc_71 @1404392c0); the base mode's before the first compose
         let look_fov = if self.sim.ads.fov > 0. { self.sim.ads.fov } else { self.sim.ads.base_mode().fov };
+        self.sim.crouch_toggle = self.backend.input.crouch_mode == fn_settings::CrouchMode::Toggle;
+        self.sim.sprint_toggle = self.backend.input.sprint_toggle;
         let mut inp = self.input.gather(&self.backend.input.bindings, &self.backend.input, &pf, dt, look_fov);
         if if self.sim.crouch_toggle { pad_act.crouch_press } else { pad_act.crouch } { inp.crouch_key = true; }
         if inp.reset && !self.input.raw_down(keys::VK_R) { inp.reset = false; }
         ai.reload_press = self.input.reload_edge(&self.backend.input.bindings);
         inp.equip = equip;
-        if self.console.console.is_open() || crate::chat_hook::is_open() || crate::mp_hook::local_dead() { inp = FrameInput::default(); ai = ArmsInput::default(); } // CONSOLE HOOK: typing never moves / fires / selects
+        if self.console.console.is_open() || crate::chat_hook::is_open() || crate::mp_hook::local_dead() || crate::death_hook::local_dying() { inp = FrameInput::default(); ai = ArmsInput::default(); }
+        if crate::mp_hook::local_knocked() { ai = ArmsInput::default(); inp.attack = false; } // CONSOLE HOOK: typing never moves / fires / selects
         // INVENTORY FIX2: cursor mode: the mouse buttons / wheel / look go to the panel (Slate handles the pointer), the keyboard still drives the pawn
         let map_open = self.full_map_open();
         cursor_mode_mask(cursor_mode || map_open, &mut inp, &mut ai);
+        if emote_open { inp.attack = false; inp.yaw_delta = 0.; inp.pitch_delta = 0.; ai.reload_press = false; ai.fire_held = false; }
         // GAMEPAD LOOK: the right stick through FUN_140615dd0 (pad.rs PadLook); not while typing in the console or in cursor mode (like the mouse look)
-        let pad_turn = if self.pad_state.is_some() && !(self.console.console.is_open() || crate::chat_hook::is_open()) && !cursor_mode && !map_open { let m = inp.forward != 0. || inp.side != 0.; self.pad_look_step(pf.look.0, pf.look.1, dt, look_fov, m) } else { (0., 0.) };
+        let pad_turn = if emote_open { (0., 0.) } else if self.pad_state.is_some() && !(self.console.console.is_open() || crate::chat_hook::is_open()) && !cursor_mode && !map_open { let m = inp.forward != 0. || inp.side != 0.; self.pad_look_step(pf.look.0, pf.look.1, dt, look_fov, m) } else { (0., 0.) };
         if let Some(arms) = self.arms.as_mut() { crate::console_hook::tick(&self.console.console.flags, arms); } // CONSOLE HOOK: god / infinite ammo
         if !(self.console.console.is_open() || crate::chat_hook::is_open()) && !self.sim.items_blocked() { let (b, inp_state) = (&self.backend.input.bindings, &self.input); self.build_input.update(b, |k| inp_state.poll(k), self.settings.game.reset_building_choice, dt); } // BUILD INPUT HOOK (build_input.rs)
+        if self.sim.items_blocked() && (self.build_input.is_building() || self.build_input.is_editing()) { self.build_input.exit_build_mode(); }
         self.build_input.end_frame();
         if self.build_input.is_building() || self.build_input.is_editing() { inp.attack = false; } // BUILD INPUT HOOK: in build mode Fire belongs to BuildPreviewModeInputComponent (places a piece), in edit mode to EditModeInputComponent0 (tile select): it never swings
+        if inp.attack && self.sim.ext_block_app.is_none() { self.sim.ext_block_app = Some("firing"); }
         if self.arms.is_some() { self.drive_arms(dt, &mut inp, ai); }
         else if self.hud_inputs.selected != 0 { inp.attack = false; } // preview items (no loadout resources) must never secretly execute pickaxe combat
         inp.yaw_delta += pad_turn.0; inp.pitch_delta += pad_turn.1; // GAMEPAD LOOK (after the mouse-only ADS multiplier of drive_arms)
@@ -1328,13 +1521,25 @@ impl App {
         true
     }
     fn play_frame(&mut self, el: &ActiveEventLoop, raw_dt: f32, frame_start: Instant) {
+        if let Some(t0) = WARM_T0.with(|t| t.get()) {
+            let pending = self.scene.as_mut().map_or(0, |s| s.renderer.fx().pending_pipelines());
+            let gpu_done = WARM_GPU_DONE.load(std::sync::atomic::Ordering::Relaxed);
+            if (!gpu_done || pending > 0) && t0.elapsed().as_secs_f32() < 4. {
+                let fade = f32::from_bits(LAST_FINISH_FADE.load(std::sync::atomic::Ordering::Relaxed));
+                self.loading_page(1., "Starting", fade);
+                return;
+            }
+            WARM_T0.with(|t| t.set(None));
+            eprintln!("[load] warm-up GPU work done after {:.0} ms (pipelines pending {pending})", t0.elapsed().as_secs_f32() * 1000.);
+        }
         if self.cap.is_some() { self.flow.tick(raw_dt); } // the start-up capture's `StageTime(Playing, ..)` conditions need the flow clock to keep running in the world
         for n in crate::chat_hook::take_renames() { self.apply_display_name(&n); }
         let scripted = self.run.is_some();
         let dt = if let Some(r) = &self.run { 1. / r.driver.fps() } else { raw_dt.min(MAX_DELTA_TIME) };
         if !scripted {
             // gameplay starts captured; capture again after focus returns / the menu closed, unless the menu is open
-            if self.input.started && self.input.focused && !self.input.captured && !self.input.user_released && !self.menu_open() && !self.inventory_open() { self.try_capture(); } // INVENTORY HOOK: never re-grab the mouse under the open inventory screen
+            if self.input.started && self.input.focused && !self.input.captured && !self.input.user_released && !self.menu_open() && !self.inventory_open() && !self.storm.game.cursor_mode() { self.try_capture(); } // INVENTORY HOOK: never re-grab the mouse under the open inventory screen
+            if self.storm.game.cursor_mode() && self.input.captured { self.release_mouse(); }
             if self.input.captured { if let Some(p) = self.platform.as_ref() { p.recenter(); } }
         }
         self.startup_elapsed += dt;
@@ -1344,18 +1549,11 @@ impl App {
             if let Some((w, h)) = run.driver.resize(run.frame) { let _ = p.window.request_inner_size(PhysicalSize::new(w, h)); }
         }
         // RENDER FX HOOK: the FX world (ring + damage numbers) is loaded once from the original paks, after the scene exists
-        if !self.fx_tried && self.scene.is_some() {
-            self.fx_tried = true;
-            if let Some(dir) = self.install_dir() {
-                match fn_pak::PakSet::open_install(&dir).map_err(|e| e.to_string()).and_then(|set| fn_fx::bridge::FxWorld::load(&set, self.scene.as_mut().unwrap().renderer.fx())) {
-                    Ok(w) => { for n in &w.notes { eprintln!("[fx] {n}"); } self.fx = Some(w); }
-                    Err(e) => eprintln!("[fx] weak-point ring / damage numbers unavailable: {e}"),
-                }
-            }
-        }
+        self.load_fx_world();
         // DISTANCE FIELD HOOK: the cooked mesh distance fields of the real props, once (df_hook.rs)
         if self.scene.is_some() && crate::df_hook::pending() { let dir = self.install_dir(); crate::df_hook::frame(self.scene.as_mut().unwrap(), dir, &self.roots.roots); }
         if self.scene.is_some() { let dir = if crate::light_fn_hook::pending() { self.install_dir() } else { None }; crate::light_fn_hook::frame(&mut self.scene.as_mut().unwrap().renderer, dir); } // LIGHT FUNCTION HOOK
+        if self.scene.is_some() { let dir = if crate::local_lights_hook::pending() { self.install_dir() } else { None }; crate::local_lights_hook::frame(&mut self.scene.as_mut().unwrap().renderer, dir, &self.sim.world.props); }
         if self.scene.is_some() && crate::sky_refl_hook::pending() { let dir = self.install_dir(); crate::sky_refl_hook::frame(&mut self.scene.as_mut().unwrap().renderer, dir); } // SKY REFLECTION HOOK: the sky light's processed specular cube
         // STORM HOOK: the wall + cloud assets are loaded once from the original paks (when the storm is on), after the scene exists
         if self.scene.is_some() && self.storm.wants_load(&self.sim.storm, self.sim.drop.is_some()) { let dir = self.install_dir(); self.storm.load(dir, self.scene.as_mut().unwrap().renderer.fx(), &self.sim.storm); }
@@ -1365,10 +1563,13 @@ impl App {
         fn_render::time_of_day::tick(world_dt); // TOD LIVE: the TOD manager's clock advance (exe default speed 80; FN_TOD_SPEED overrides), read by every renderer upload this frame
         if stepped { let dir = self.install_dir(); self.build_input.set_interact_build_blocked(self.sim.swing.blocks_interact_build()); crate::building_hook::frame(&mut self.sim, &mut self.build_input, dir, dt); } // EDIT GATE: the pickaxe combo blocks InteractBuild (build_input::try_interact_build, vfunc_669 @14083e780). BUILDING HOOK (core): build intents, preview, placing, build-up, piece collision (building_hook.rs)
         if stepped { for e in crate::trap_hook::frame(&mut self.sim, &mut self.build_input, self.arms.as_mut(), dt) { self.backend.audio.event(e); } }
+        if stepped { for e in crate::bounce_hook::frame(&mut self.sim, dt) { self.backend.audio.event(e); } }
         if stepped { for e in crate::rocket_hook::frame(&mut self.sim, self.arms.as_mut(), dt) { self.backend.audio.event(e); } }
-        for e in crate::bus_hook::frame(&mut self.sim) { self.backend.audio.event(e); }
+        crate::gunfx_hook::set_listener(crate::scene::pawn_matrix(&self.sim).w_axis.truncate() + glam::Vec3::Y * 0.9, self.sim.cam_view.forward);
+        for e in crate::gunfx_hook::take_sounds() { self.backend.audio.event(e); }
+        for e in crate::bus_hook::frame(&mut self.sim, dt) { self.backend.audio.event(e); }
         for e in self.storm.game.frame(&mut self.sim, self.arms.as_mut()) { self.backend.audio.event(e); }
-        if self.sim.drop.is_some() { let dir = self.install_dir(); crate::skydive_anim::ensure_loading(|| dir); }
+        if self.sim.drop.is_some() || crate::mp_hook::squad_play() { let dir = self.install_dir(); crate::skydive_anim::ensure_loading(|| dir); }
         for (n, im) in crate::trap_hook::take_ui_images() { self.overlay.insert(&n, im); }
         if self.live.is_some() { self.live_sample(raw_dt); }
         let pad_available = self.pad.available();
@@ -1381,16 +1582,22 @@ impl App {
         // pose + camera
         scene.show_pickaxe = self.hud_inputs.selected == 0;
         scene.held = self.arms.as_ref().and_then(|a| a.gun_index().map(|g| (g, a.weapon_clip().map(|(_, c, t)| (c, t)))));
-        if self.sim.items_blocked() { scene.show_pickaxe = false; scene.held = None; }
+        if self.sim.items_blocked() || self.sim.controller.enhanced.as_ref().is_some_and(|e| e.holster_weapon()) { scene.show_pickaxe = false; scene.held = None; }
+        if crate::emote_hook::local_holstered() || crate::death_hook::local_holstered(self.arms.as_ref().and_then(|a| a.data.death.as_ref())) { scene.show_pickaxe = false; scene.held = None; }
+        if crate::death_hook::local_hidden() { self.sim.cam_view.hide_pawn = true; }
         crate::loader::cosmetic::tick(&mut self.sim, scene); // COSMETIC SWAP HOOK: pending skin / pickaxe changes (background rebuild, atomic install before the pose update)
         crate::build_anim::pre_scene(scene); // BUILD ANIM HOOK: the blueprint replaces the pickaxe / firearm in the hands
         crate::statics_render::prof("scene update", || scene.update(&mut self.sim));
         crate::build_anim::frame(scene, &self.sim);
+        crate::enhanced_anim_load::frame(scene);
         crate::skydive_anim::frame(scene, &self.sim, world_dt); // BUILD ANIM HOOK: paper on BluePrintPaper, pencil on BluePrintPen (this frame's final pose)
         crate::mp_hook::frame(&mut self.sim, scene, self.arms.as_mut(), dt);
+        for e in crate::bots_hook::frame(&mut self.sim, scene, self.arms.as_mut(), &self.storm.game, world_dt) { self.backend.audio.event(e); }
+        crate::enhanced_sound::frame(self.backend.audio.as_mut(), &self.sim, world_dt);
         crate::platform::timed("pickups frame", || crate::pickups_hook::frame(scene)); // PICKUPS HOOK: world items' renderer models (FIRST USE: [slow] when a first draw builds)
         let mut camera = camera_for(&self.sim, w, h);
         crate::cam_pose::apply(&mut camera, self.run.as_ref().map(|r| r.frame)); // UE POSE CAMERA (dev): FN_CAM_UE
+        crate::enhanced_anim_load::orbit(&mut camera, &self.sim);
         let hash = pose_hash(scene.character.body_local());
         if let Some(run) = self.run.as_mut() { let f = run.frame; run.log_frame(f, &self.sim, Some(hash)); }
         // ui
@@ -1398,9 +1605,19 @@ impl App {
         let menu_open = ui.menu.is_open();
         self.hud_inputs.frame = self.clock.stats();
         { let o = crate::storm_hook::offset_cm(); self.hud_inputs.level_offset_cm = [o[0], o[1]]; } // MINIMAP FIX: the minimap maps the Athena_Terrain level point (fn_hud_adapter::minimap_uv)
+        self.hud_inputs.teammates = crate::mp_hook::team_hud();
+        self.hud_inputs.team_map = crate::mp_hook::team_map();
         let mut st = hud_state(&self.sim, &self.settings, &self.hud_inputs);
+        if let Some(me) = st.team.first_mut() { me.dbno = crate::mp_hook::local_knocked(); me.reviving = crate::mp_hook::local_being_revived(); me.dead = crate::mp_hook::local_dead(); }
         crate::bus_hook::hud(&self.sim, &mut st, self.backend.input.bindings.get(fn_settings::A_JUMP)[0].name());
+        st.world.radial = crate::emote_hook::picker_view(self.pad_state.is_some());
         self.storm.game.hud(&self.sim, &mut st);
+        st.game_over = self.storm.game.game_over(self.arms.as_ref().map_or(true, |a| a.health > 0.));
+        st.spectating = crate::mp_hook::spectating_for();
+        st.spectate_vitals = crate::mp_hook::spectate_vitals();
+        self.storm.game.set_cursor_mode(st.game_over.is_some());
+        st.action_alert = self.storm.game.take_alert().map(|a| (a, String::new()));
+        st.reticle_status = self.build_input.take_status();
         crate::kill_feed_hook::set_local_name(&self.hud_inputs.player_name);
         if crate::kill_feed_hook::take_zero_vitals() { if let Some(a) = self.arms.as_mut() { a.health = 0.; a.shield = 0.; } }
         st.kill_feed = crate::kill_feed_hook::frame(self.world_time, self.arms.as_ref().map(|a| a.health));
@@ -1410,8 +1627,13 @@ impl App {
         let harvest_frame = crate::harvest_fx::feed(&mut self.sim, &mut st, &camera, w as f32, h as f32); // HARVEST HOOK: strike events, reticle colour, Target Info
         st.world.building_prompt = st.world.target.and_then(|t| crate::building_hud::prompt(&self.sim, &self.backend.input.bindings, t.interaction)); st.world.ranged_targeting = crate::building_hud::ranged_targeting(); // BUILDING HUD: BuildingInfoIndicator interaction prompts
         { let key = self.backend.input.bindings.get(fn_settings::A_USE)[0].name().to_owned(); let full = st.backpack.0 >= st.backpack.1; if let Some((key, text, at, card)) = crate::pickups_hook::prompt(self.arms.as_ref(), &self.sim, &key, full) { st.world.interaction = Some(fn_ui::screens::reticle_state::InteractionPrompt { key, text, screen: crate::harvest_fx::project(&camera, at, w as f32, h as f32), pickup: Some(card) }); } } // PICKUPS HOOK: "Pick up" / "Swap equipped" of the pickup in front of the player
+        st.world.picked_up = crate::pickups_hook::take_picked_up();
         if st.world.interaction.is_none() { let key = self.backend.input.bindings.get(fn_settings::A_USE)[0].name().to_owned(); if let Some((key, text, at)) = crate::door_hook::prompt(&key) { st.world.interaction = Some(fn_ui::screens::reticle_state::InteractionPrompt { key, text, screen: crate::harvest_fx::project(&camera, at, w as f32, h as f32), pickup: None }); } } // DOOR HOOK: "Open" / "Close" of the focused door (Fort.Building.Door.Defaults)
         if st.world.interaction.is_none() { let key = self.backend.input.bindings.get(fn_settings::A_USE)[0].name().to_owned(); if let Some((key, text, at, pct)) = crate::chest_hook::prompt(&key) { st.world.interaction = Some(fn_ui::screens::reticle_state::InteractionPrompt { key, text, screen: crate::harvest_fx::project(&camera, at, w as f32, h as f32), pickup: None }); st.world.interaction_hold = Some(pct); } } // CHEST HOOK: "Search" + the KeybindWidget hold ring
+        if st.world.interaction.is_none() { let key = self.backend.input.bindings.get(fn_settings::A_USE)[0].name().to_owned(); if let Some((key, text, at)) = crate::supply_drop_hook::prompt(&key) { st.world.interaction = Some(fn_ui::screens::reticle_state::InteractionPrompt { key, text, screen: crate::harvest_fx::project(&camera, at, w as f32, h as f32), pickup: None }); } }
+        st.world.health_bars = crate::supply_drop_hook::health_bars().into_iter().filter_map(|(at, hp, max)| crate::harvest_fx::project(&camera, at, w as f32, h as f32).map(|screen| fn_ui::screens::health_bar::HealthBarView { screen, health: hp, max_health: max, display_text: String::new() })).collect();
+        st.world.team_indicators = crate::mp_hook::team_indicator_points().into_iter().filter_map(|(name, at, dbno, reviving)| crate::harvest_fx::project(&camera, at, w as f32, h as f32).map(|anchor| fn_ui::screens::team_indicator_cooked::TeamIndicator { name, anchor, dbno, reviving })).collect();
+        if st.world.interaction.is_none() { let key = self.backend.input.bindings.get(fn_settings::A_USE)[0].name().to_owned(); if let Some((key, text, at, pct)) = crate::mp_hook::revive_prompt(&key) { st.world.interaction = Some(fn_ui::screens::reticle_state::InteractionPrompt { key, text, screen: crate::harvest_fx::project(&camera, at, w as f32, h as f32), pickup: None }); st.world.interaction_hold = Some(pct); } }
         st.slot_keys = std::array::from_fn(|i| fn_settings::Bindings::action_index(&format!("PrimaryQuickbarSlot{}", i + 1)).map(|a| self.backend.input.bindings.get(a)[0]).filter(|k| *k != fn_settings::Key::NONE).map_or(String::new(), |k| k.name().to_owned()));
         st.backpack_key = toggle_inventory_keys(&self.backend.input.bindings)[0].name().to_owned(); // INVENTORY FIX2: the backpack KeybindWidget shows the bound ToggleInventory key
         if !menu_open && fn_live::var_os("FN_HUD_OFF").is_none() { ui.present_hud(&st, w as f32, h as f32, if stepped { Some(dt) } else { None }); } else { ui.hud.set_state(&st); }
@@ -1439,7 +1661,7 @@ impl App {
         if let Some(fx) = self.fx.as_mut() {
             fx.events(&harvest_frame.fx_events);
             fx.numbers_from(&self.sim.world.fx, &view, fx_time);
-            for (pos, amount, critical, kind) in crate::mp_hook::take_numbers() { fx.push_number(pos, amount, critical, kind, &view, fx_time); }
+            for (pos, amount, critical, kind) in crate::mp_hook::take_numbers().into_iter().chain(crate::bots_hook::take_numbers()) { fx.push_number(pos, amount, critical, kind, &view, fx_time); }
             fx_frame = fx.frame(&view, world_dt, fx_time); // SORTFIX: the ring advances with WORLD time (UE ticks it with the world delta; paused = frozen)
         }
         let feet = self.sim.feet(); self.storm.frame(&mut self.sim.storm, feet, &view, world_dt, mat_time, &mut fx_frame); // STORM HOOK: the safe-zone wall + storm clouds join the FX frame (storm_hook.rs)
@@ -1451,15 +1673,20 @@ impl App {
             let ev = crate::building_hook::edit_visuals();
             let off = crate::building_hook::world_to_fx(glam::Vec3::ZERO);
             let snd = crate::building_hook::with_world(|w| crate::platform::timed("building frame", || crate::building_render::frame(scene.renderer.fx(), w, off, pv.as_ref(), ev.as_ref(), &view, world_dt, &mut fx_frame)));
-            for e in snd { self.backend.audio.event(e); }
-            for c in crate::building_hook::drain_edit_sound_cues() { if let Some(e) = crate::building_render::edit_cue_event(c) { self.backend.audio.event(e); } }
+            let log_snd = fn_live::var("FN_BUILD_SOUND_LOG").map_or(false, |v| v == "1");
+            for e in snd { if log_snd { eprintln!("[build-sound] {e:?}"); } self.backend.audio.event(e); }
+            for c in crate::building_hook::drain_build_sound_cues().into_iter().chain(crate::building_hook::drain_edit_sound_cues()) { if let Some(e) = crate::building_render::edit_cue_event(c) { if log_snd { eprintln!("[build-sound] {e:?}"); } self.backend.audio.event(e); } }
         }
         crate::foot_fx::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame); // FOOT FX: walk / run / land dust on their cooked materials (foot_fx.rs)
         crate::heal_fx::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame); // HEAL FX: P_Consume_Item bursts on their cooked materials (heal_fx.rs)
-        crate::chest_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame); // CHEST HOOK: closed-chest mist / open bursts on their cooked materials
+        crate::chest_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame);
+        crate::supply_drop_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame); // CHEST HOOK: closed-chest mist / open bursts on their cooked materials
         crate::trap_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame);
+        crate::bounce_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame);
         crate::rocket_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame);
+        crate::gunfx_hook::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame);
         crate::bus_hook::fx_frame(scene.renderer.fx(), &view, &self.sim, &mut fx_frame);
+        crate::elim_fx::fx_frame(scene.renderer.fx(), &view, world_dt, &mut fx_frame);
         crate::backdrop_real::frame(scene.renderer.fx(), &view, &mut fx_frame); // BACKDROP REAL: far terraces / rocks, real cooked material, backdrop pass
         scene.renderer.occlusion_pickup(); // OCCLUSION: readbacks completed during this frame's CPU work
         crate::statics_render::set_lod_distance_factor(fn_render::quality::lod_distance_factor(camera.fov_deg)); crate::statics_render::set_view_distance_scale(options.view_distance_scale); // LOD 1:1: View.LODDistanceFactor, r.ViewDistanceScale
@@ -1473,7 +1700,17 @@ impl App {
         let mut shots: Vec<(PathBuf, Vec<u8>, (u32, u32))> = vec![];
         let had_shot_names = self.run.as_mut().map(|r| { let f = r.frame; r.driver.shots(f, &self.sim).len() }).unwrap_or(0);
         let had_shot = had_shot_names > 0;
-        { let (vw, vh) = fn_render::quality::scaled_view_size(camera.width, camera.height, options.screen_percentage); crate::outline_hook::submit(&mut scene.renderer, scene.real.as_ref(), &self.sim.world.props, &fn_render::CameraParams { width: vw, height: vh, ..camera }, time); } // OUTLINE HOOK: the build preview highlight (custom depth + SkinAndMeshOutlinePostProcess)
+        { let (vw, vh) = fn_render::quality::scaled_view_size(camera.width, camera.height, options.screen_percentage); crate::outline_hook::submit(&mut scene.renderer, scene.real.as_ref(), &self.sim.world.props, &fn_render::CameraParams { width: vw, height: vh, ..camera }, time); crate::decals_hook::submit(&mut scene.renderer, &fn_render::CameraParams { width: vw, height: vh, ..camera }, self.world_time); } // OUTLINE HOOK: the build preview highlight (custom depth + SkinAndMeshOutlinePostProcess)
+        if cfg!(target_arch = "wasm32") && self.run.is_none() && !PLAY_WARMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let t_warm = Instant::now();
+            let target = fn_render::OffscreenTarget::new(&gfx.gpu.device, w, h, gfx.format());
+            scene.draw(&camera, time, dt, &options, &target.view);
+            ui.render_texture(&target.texture, w, h, None);
+            gfx.gpu.queue.on_submitted_work_done(|| WARM_GPU_DONE.store(true, std::sync::atomic::Ordering::Relaxed));
+            WARM_T0.with(|t| t.set(Some(Instant::now())));
+            eprintln!("[load] first play frame drawn offscreen as a warm-up: {:.0} ms", t_warm.elapsed().as_secs_f32() * 1000.);
+            return;
+        }
         match gfx.acquire() {
             Acquire::Frame(frame) => {
                 let view = frame.texture.create_view(&Default::default());
@@ -1489,9 +1726,13 @@ impl App {
                     shots.push((run.shot_path(name, (w, h)), target.read_rgba8(&gfx.gpu), (w, h)));
                     if fn_live::var_os("FN_EXPOSURE_LOG").is_some() { let e = scene.renderer.read_exposure(); eprintln!("[exposure] shot {name}: exposure {:.4} avg_luminance {:.4} ev {:.4} target {:.4}", e.exposure, e.avg_luminance, e.ev, e.target_ev); } // verification aid
                 }
+                let batch = cfg!(target_arch = "wasm32");
+                if batch { scene.renderer.begin_batch(); }
                 scene.draw(&camera, time, if shot_names.is_empty() { dt } else { 0. }, &options, &view);
+                if batch { ui.renderer.submit_before_next(scene.renderer.take_batch()); }
                 let t_ui = Instant::now();
                 ui.render_texture(&frame.texture, w, h, None); // INVENTORY FIX3: the texture itself, for the SBackgroundBlur pass
+                if batch { ui.renderer.flush_pending(); scene.renderer.after_batch_submitted(); }
                 gfx.present(frame);
                 if let Some(run) = self.run.as_mut() { run.draw_ms.push((t_ui - t_draw).as_secs_f32() * 1000.); run.ui_present_ms.push(t_ui.elapsed().as_secs_f32() * 1000.); run.push_gpu(scene.renderer.take_pass_timings()); if let Some(s) = scene.last_stats.as_ref() { run.push_cpu_passes(s); } } // PERF
                 if let Some(cap) = self.cap.as_mut() {
@@ -1563,10 +1804,12 @@ impl App {
         report.push_str(&format!("load steps:\n{}", self.load_log));
         report.push_str(&crate::harvest_fx::run_report(&out, &name)); // HARVEST HOOK
         report.push_str(&crate::particles::run_report(&out, &name)); // PARTICLE HOOK
-        report.push_str(&crate::pickups_fx::report()); report.push_str(&crate::pickups_hook::run_report()); report.push_str(&crate::door_hook::report()); report.push_str(&crate::chest_hook::report()); report.push_str(&crate::demolition_hook::report()); // DOOR HOOK // PICKUPS FX / HOOK
+        report.push_str(&crate::pickups_fx::report()); report.push_str(&crate::pickups_hook::run_report()); report.push_str(&crate::door_hook::report()); report.push_str(&crate::chest_hook::report()); report.push_str(&crate::floor_loot_hook::report()); report.push_str(&crate::supply_drop_hook::report()); report.push_str(&crate::demolition_hook::report()); // DOOR HOOK // PICKUPS FX / HOOK
         report.push_str(&crate::building_hook::run_report()); // BUILDING HOOK (core)
         report.push_str(&crate::trap_hook::report());
+        report.push_str(&crate::bounce_hook::report());
         report.push_str(&crate::rocket_hook::report());
+        report.push_str(&crate::gunfx_hook::report());
         report.push_str(&crate::statics_render::report()); // STATIC MATERIALS
         report.push_str(&crate::spline_mesh::report()); // ROADS / SPLINES
         report.push_str(&fn_render::backdrop::run_report()); report.push_str(&crate::backdrop_real::run_report()); // PERF (2026-10-08): backdrop / landscape draw averages
@@ -1657,7 +1900,7 @@ impl App {
         if vk == keys::VK_RETURN && pressed && !repeat { self.flow.request_skip(); } // skips a fixed hold (splash, start-up minimum, loading minimum, 100 % hold), never real work
         if vk == keys::VK_ESCAPE && pressed && !repeat {
             if self.run.is_some() { el.exit(); return; }
-            match self.phase { Phase::Playing => self.open_menu(), Phase::Splash | Phase::StartupLoading | Phase::LoggingIn | Phase::GamePicker | Phase::Loading | Phase::Finishing | Phase::Failed(_) => { self.flow.note("Esc: closing"); el.exit() }, Phase::Lobby | Phase::Boot => {} }
+            match self.phase { Phase::Playing => if crate::emote_hook::picker_open() { crate::emote_hook::picker_cancel(); } else { self.open_menu() }, Phase::Splash | Phase::StartupLoading | Phase::LoggingIn | Phase::GamePicker | Phase::Loading | Phase::Finishing | Phase::Failed(_) => { self.flow.note("Esc: closing"); el.exit() }, Phase::Lobby | Phase::Boot => {} }
         }
     }
     /// F11 in the match, like the lobby: `UGameViewportClient::InputKey` @1421a0a70 toggles fullscreen on an F11 press because `bF11TogglesFullscreen=true`
@@ -1891,12 +2134,12 @@ impl App {
         let pressed = event.state == ElementState::Pressed;
         let vk = match event.physical_key { PhysicalKey::Code(c) => keys::vk(c), PhysicalKey::Unidentified(_) => None };
         if !self.console.console.is_open() {
-            if pressed && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F2) && self.console_may_open() { self.console_open(); return true; }
+            if pressed && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::Backquote) && self.console_may_open() { self.console_open(); return true; }
             return false;
         }
         match vk { Some(keys::VK_SHIFT_L | keys::VK_SHIFT_R) => self.input.shift = pressed, Some(keys::VK_CTRL_L | keys::VK_CTRL_R) => self.input.ctrl = pressed, _ => {} }
         if !pressed { if let Some(vk) = vk { self.input.set_key(vk, false); } return true; }
-        if event.physical_key == PhysicalKey::Code(KeyCode::F2) && event.repeat { return true; }
+        if event.physical_key == PhysicalKey::Code(KeyCode::Backquote) && event.repeat { return true; }
         for k in crate::console_hook::keys_from_winit(event, self.input.shift) { self.console_key(k); }
         true
     }
@@ -2017,6 +2260,11 @@ impl ApplicationHandler for App {
                 if let Some(e) = self.name_entry.as_mut() {
                     if event.state == ElementState::Pressed { for k in crate::console_hook::keys_from_winit(&event, self.input.shift) { e.key(k); } }
                     if let PhysicalKey::Code(c) = event.physical_key { if let Some(vk) = keys::vk(c) { match vk { keys::VK_SHIFT_L | keys::VK_SHIFT_R => self.input.shift = event.state == ElementState::Pressed, _ => {} } } }
+                    return;
+                }
+                if self.phase == Phase::Lobby && self.lobby.as_ref().is_some_and(|l| l.chat_open()) {
+                    if let PhysicalKey::Code(c) = event.physical_key { if let Some(vk) = keys::vk(c) { if matches!(vk, keys::VK_SHIFT_L | keys::VK_SHIFT_R) { self.input.shift = event.state == ElementState::Pressed; } } }
+                    if event.state == ElementState::Pressed { let ks = crate::console_hook::keys_from_winit(&event, self.input.shift); if let Some(l) = self.lobby.as_mut() { for k in ks { l.chat_key(k); } } }
                     return;
                 }
                 if self.chat_event(&event) { return; }

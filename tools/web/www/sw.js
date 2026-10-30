@@ -60,6 +60,74 @@ const recent = new Map();
 const RECENT_MS = 60000;
 let cacheHandle = null;
 const openCache = (name) => (cacheHandle && cacheHandle.name === name) ? cacheHandle.p : (cacheHandle = { name, p: caches.open(name) }).p;
+async function readSlice(r, a, b) {
+    const out = new Uint8Array(b - a + 1);
+    const reader = r.body.getReader();
+    let pos = 0, got = 0;
+    for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const lo = Math.max(a, pos), hi = Math.min(b + 1, pos + value.byteLength);
+        if (hi > lo) { out.set(value.subarray(lo - pos, hi - pos), lo - a); got += hi - lo; }
+        pos += value.byteLength;
+        if (pos > b) { reader.cancel().catch(() => {}); break; }
+    }
+    return got === out.byteLength ? out.buffer : out.slice(0, got).buffer;
+}
+async function fetchRetry(target, opts, bytes, slice) {
+    const ms = 20000 + Math.ceil((bytes || 0) / 1048576) * 1000;
+    for (let k = 0; ; k++) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), ms);
+        try {
+            const r = await fetch(target, { ...opts, signal: ac.signal });
+            if (slice && r.status === 200 && r.body) return { r, body: await readSlice(r, slice[0], slice[1]), sliced: true };
+            const body = await r.arrayBuffer();
+            return { r, body };
+        } catch (e) {
+            if (k >= 3 || !ac.signal.aborted) throw e;
+            console.warn('[fnweb sw] ' + target + ': no full answer in ' + (ms / 1000) + ' s, asking again');
+        } finally { clearTimeout(timer); }
+    }
+}
+async function streamRun(cfg, target, opts, start, total, parts, onPart) {
+    const ms = 20000 + Math.ceil(total / 1048576) * 1000;
+    for (let k = 0; ; k++) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), ms);
+        try {
+            const r = await fetch(target, { ...opts, signal: ac.signal });
+            if (r.status !== 206 && r.status !== 200) throw new Error('HTTP ' + r.status);
+            let pos = r.status === 200 ? 0 : start;
+            const open = parts.filter((p) => !p.done);
+            const reader = r.body.getReader();
+            for (;;) {
+                const t0 = performance.now();
+                const { value, done } = await reader.read();
+                if (done) break;
+                net.bytes += value.byteLength;
+                await throttle(cfg, 'bw', value.byteLength, t0);
+                const end = pos + value.byteLength;
+                for (const p of open) {
+                    if (p.done) continue;
+                    const lo = Math.max(p.a, pos), hi = Math.min(p.b + 1, end);
+                    if (hi <= lo) continue;
+                    if (!p.buf) { p.buf = new Uint8Array(p.b - p.a + 1); p.got = 0; }
+                    p.buf.set(value.subarray(lo - pos, hi - pos), lo - p.a);
+                    p.got += hi - lo;
+                    if (p.got === p.buf.byteLength) { p.done = true; const ab = p.buf.buffer; p.buf = null; onPart(p, ab); }
+                }
+                pos = end;
+                if (open.every((p) => p.done)) { reader.cancel().catch(() => {}); break; }
+            }
+            return;
+        } catch (e) {
+            for (const p of parts) if (!p.done) p.buf = null;
+            if (k >= 3 || !ac.signal.aborted) throw e;
+            console.warn('[fnweb sw] ' + target + ': no full answer in ' + (ms / 1000) + ' s, asking again');
+        } finally { clearTimeout(timer); }
+    }
+}
 const reply = (x) => new Response(x.body, { status: x.status === 206 ? 200 : x.status, statusText: x.statusText, headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(x.body.byteLength) } });
 
 async function handle(req, u, op, retried = false) {
@@ -100,7 +168,14 @@ async function handle(req, u, op, retried = false) {
         if (!want.length) return new Response(null, { status: 204 });
         const m = /^bytes=(\d+)-(\d+)$/.exec(range); if (!m) return new Response('bad run range', { status: 400 });
         const start = Number(m[1]);
-        const run = (async () => {
+        const ps = want.map(([a, b, k]) => { let res; const settled = new Promise((r) => { res = r; }); return { a, b, k, res, done: false, settled }; });
+        let ok = true;
+        const pending = ps.map((p) => {
+            const pp = p.settled.then(async (x) => { if (!x.failed) { try { await cache.put(p.k, reply(x)); } catch (_) {} } return x; }).finally(() => inflight.delete(p.k));
+            inflight.set(p.k, pp);
+            return pp;
+        });
+        (async () => {
             const headers = new Headers({ Range: range });
             const auth = req.headers.get('Authorization'); if (auth) headers.set('Authorization', auth);
             let target = `${worker}/__fnvfs/file`;
@@ -108,25 +183,10 @@ async function handle(req, u, op, retried = false) {
             for (let w = 0; gameInflight > 0 && w < 50; w++) await sleep(20);
             net.requests++; net.byOp.run = (net.byOp.run || 0) + 1;
             await throttle(cfg, 'rtt');
-            const t0 = performance.now();
-            const r = await fetch(target, { headers, cache: 'no-store', mode: 'cors', priority: 'low' });
-            if (r.status !== 206 && r.status !== 200) throw new Error('HTTP ' + r.status);
-            const body = await r.arrayBuffer();
-            net.bytes += body.byteLength;
-            await throttle(cfg, 'bw', body.byteLength, t0);
-            // a 200 (no range support) carries the whole file: offsets from 0
-            return r.status === 200 ? { body, base: 0 } : { body, base: start };
-        })();
-        let ok = true;
-        await Promise.all(want.map(([a, b, k]) => {
-            const pp = run.then(async ({ body, base }) => {
-                const x = { status: 200, statusText: 'OK', body: body.slice(a - base, b - base + 1) };
-                try { await cache.put(k, reply(x)); } catch (_) {}
-                return x;
-            }).catch((e) => { ok = false; return { status: 502, statusText: String(e), body: new ArrayBuffer(0), failed: true }; }).finally(() => inflight.delete(k));
-            inflight.set(k, pp);
-            return pp;
-        }));
+            await streamRun(cfg, target, { headers, cache: 'no-store', mode: 'cors', priority: 'low' }, start, Number(m[2]) - start + 1, ps, (p, body) => p.res({ status: 200, statusText: 'OK', body }));
+        })().catch((e) => { ok = false; for (const p of ps) if (!p.done) { p.done = true; p.res({ status: 502, statusText: String(e), body: new ArrayBuffer(0), failed: true }); } })
+            .finally(() => { for (const p of ps) if (!p.done) { ok = false; p.done = true; p.res({ status: 502, statusText: 'short answer', body: new ArrayBuffer(0), failed: true }); } });
+        await Promise.all(pending);
         return new Response(null, { status: ok ? 204 : 502 });
     }
     // one network fetch per key at a time (the start-up prefetch and the game may ask for the same range together)
@@ -149,13 +209,16 @@ async function handle(req, u, op, retried = false) {
             try {
                 await throttle(cfg, 'rtt');
                 t0 = performance.now();
-                try { r = await fetch(target, { headers, cache: 'no-store', mode: 'cors', priority: urgent ? 'high' : 'low' }); }
+                const rm0 = /^bytes=(\d+)-(\d+)$/.exec(range);
+                let got;
+                try { got = await fetchRetry(target, { headers, cache: 'no-store', mode: 'cors', priority: urgent ? 'high' : 'low' }, rm0 ? Number(rm0[2]) - Number(rm0[1]) + 1 : 100 << 20, rm0 ? [Number(rm0[1]), Number(rm0[2])] : null); }
                 catch (e) { return { status: 502, statusText: 'file Worker unreachable', body: new TextEncoder().encode('file Worker unreachable: ' + e).buffer, failed: true }; }
-                x = { status: r.status, statusText: r.statusText, body: await r.arrayBuffer() };
+                r = got.r;
+                x = { status: r.status, statusText: r.statusText, body: got.body, sliced: !!got.sliced };
             } finally { if (urgent) gameInflight--; }
             net.bytes += x.body.byteLength;
             await throttle(cfg, 'bw', x.body.byteLength, t0);
-            const rm = r.status === 200 && /^bytes=(\d+)-(\d+)$/.exec(range);
+            const rm = r.status === 200 && !x.sliced && /^bytes=(\d+)-(\d+)$/.exec(range);
             if (rm) x = { status: 200, statusText: r.statusText, body: x.body.slice(Number(rm[1]), Number(rm[2]) + 1) };
             // kept as a 200 (Cache Storage refuses 206); the game's file system takes either and reads the bytes. The in-flight entry stays until
             // the cache holds the reply, so a request in between cannot miss both.

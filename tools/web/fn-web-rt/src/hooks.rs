@@ -107,12 +107,24 @@ pub fn fnweb_heap_track(on: bool) { crate::mem::enable_tracking(on) }
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn fnweb_heap_report(top: usize) -> String { crate::mem::report(top) }
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn fnweb_heap_report_peak(top: usize) -> String { crate::mem::report_peak(top) }
+
 /// REMOTE MODE (the page, after its login, before the game starts): read the game files through `prefix`/__fnvfs (the page's service worker)
 /// with `token`; see vfs.rs.
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn fnweb_vfs_remote(prefix: &str, token: &str) { crate::vfs::set_remote(prefix, token) }
 
 /// REMOTE MODE: a /fn/user file saved by an earlier session (the page's IndexedDB), put back before the game starts.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn fnweb_io_done(id: u32, status: u32, body: Option<Vec<u8>>, err: String) { crate::vfs::io_done(id, status, body, err) }
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn fnweb_io_chunk(id: u32, chunk: &js_sys::Uint8Array) { crate::vfs::io_chunk(id, chunk) }
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn fnweb_vfs_tree(root: &str, text: &str) { crate::vfs::set_tree(root, text) }
+
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn fnweb_vfs_user_file(path: &str, bytes: Vec<u8>) { crate::vfs::preload_user_file(path, bytes) }
 

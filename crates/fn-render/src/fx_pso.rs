@@ -86,9 +86,25 @@ fn decode(r: &mut Rd) -> Option<(u8, FxPipelineDesc)> {
     Some((kind, FxPipelineDesc { label, wgsl, vs_entry, fs_entry, vertex_buffers, groups, blend, depth, cull, translucent, separate_translucency, responsive_aa }))
 }
 
-pub(super) struct Warm { raw: Vec<u8>, at: usize, made: usize, failed: usize, t0: std::time::Instant, logged: bool }
+pub(super) struct Warm { raw: Vec<u8>, at: usize, made: usize, failed: usize, total: usize, t0: std::time::Instant, logged: bool }
 
 fn cache_path() -> String { fn_live::var("FNWEB_PSO_CACHE").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "/fn/assets/webcook/pso/pso.bin".to_owned()) }
+
+static PREFETCH: std::sync::Mutex<Option<Option<std::sync::mpsc::Receiver<(Option<Vec<u8>>, usize)>>>> = std::sync::Mutex::new(None);
+pub fn prefetch() {
+    let Ok(mut g) = PREFETCH.lock() else { return };
+    if g.is_some() { return; }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new().name("pso cache".into()).spawn(move || { let raw = load(); let total = raw.as_deref().map_or(0, count); let _ = tx.send((raw, total)); });
+    *g = Some(Some(rx));
+}
+fn count(raw: &[u8]) -> usize { let mut r = Rd { b: raw, p: 0 }; let mut n = 0; while r.p < raw.len() && decode(&mut r).is_some() { n += 1; } n }
+fn take_prefetched() -> Option<(Option<Vec<u8>>, usize)> {
+    let mut g = PREFETCH.lock().ok()?;
+    let rx = g.as_mut()?.as_ref()?;
+    match rx.try_recv() { Ok(v) => { *g = Some(None); Some(v) } Err(std::sync::mpsc::TryRecvError::Empty) => None, Err(_) => { *g = Some(None); Some((load(), 0)) } }
+}
+fn prefetch_running() -> bool { PREFETCH.lock().map_or(false, |g| matches!(g.as_ref(), Some(Some(_)))) }
 
 fn load() -> Option<Vec<u8>> {
     let b = std::fs::read(cache_path()).ok()?;
@@ -100,22 +116,43 @@ fn load() -> Option<Vec<u8>> {
 
 impl FxRenderer {
     pub fn pso_warm_step(&mut self, budget_ms: f32) -> bool {
+        static PACE: std::sync::Mutex<(Option<std::time::Instant>, usize)> = std::sync::Mutex::new((None, 4));
+        let (pso_inflight, slow_frame) = PACE.lock().map_or((4, false), |mut g| {
+            let now = std::time::Instant::now();
+            let mut slow = false;
+            if let Some(prev) = g.0 { let iv = (now - prev).as_secs_f32() * 1000.; if iv > 40. { g.1 = (g.1 / 2).max(1); slow = true; } else if iv < 24. { g.1 = (g.1 + 1).min(24); } }
+            g.0 = Some(now);
+            (g.1, slow)
+        });
+        static SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let slow_frame = slow_frame && !SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+        SKIPPED.store(slow_frame, std::sync::atomic::Ordering::Relaxed);
         if fn_live::var("FNWEB_PSO_WARM").is_ok_and(|v| v == "0") { return true; }
         if self.pso_warm.is_none() {
-            let raw = load();
+            let (raw, total) = match take_prefetched() { Some((raw, total)) => { let t = if total == 0 { raw.as_deref().map_or(0, count) } else { total }; (raw, t) } None if prefetch_running() => return false, None => { let raw = load(); let t = raw.as_deref().map_or(0, count); (raw, t) } };
             match &raw { Some(r) => eprintln!("[pso] cache {}: {:.1} MB of pipeline descriptors", cache_path(), r.len() as f64 / 1048576.), None => eprintln!("[pso] no pipeline cache at {}", cache_path()) }
-            self.pso_warm = Some(Warm { raw: raw.unwrap_or_default(), at: 0, made: 0, failed: 0, t0: std::time::Instant::now(), logged: false });
+            let raw = raw.unwrap_or_default();
+            self.pso_warm = Some(Warm { raw, at: 0, made: 0, failed: 0, total, t0: std::time::Instant::now(), logged: false });
         }
         if self.scene.is_none() { return false; }
         let t = std::time::Instant::now();
         let backdrop = std::mem::replace(&mut self.building_backdrop, false);
+        let mut started = 0usize;
         loop {
+            if slow_frame { break; }
             let Some(w) = self.pso_warm.as_mut() else { break };
             if w.at >= w.raw.len() { break; }
+            if self.pending_pipelines() >= pso_inflight { break; }
+            let Some(w) = self.pso_warm.as_mut() else { break };
             let mut r = Rd { b: &w.raw, p: w.at };
             let Some((kind, d)) = decode(&mut r) else { w.at = w.raw.len(); break };
+            if started > 0 && d.wgsl.len() > (64 << 10) { break; }
+            started += 1;
             w.at = r.p;
+            let ti = std::time::Instant::now();
             let ok = match kind { 0 => self.create_pipeline(&d), 1 => self.create_scene_lit_pipeline(&d), _ => self.create_shadow_pipeline(&d) }.is_ok();
+            let ms = ti.elapsed().as_secs_f32() * 1000.;
+            if ms > 30. { eprintln!("[pso] slow pipeline {ms:.0} ms kind {kind} wgsl {} KB groups {}: {}", d.wgsl.len() / 1024, d.groups.len(), d.label); }
             if let Some(w) = self.pso_warm.as_mut() { if ok { w.made += 1 } else { w.failed += 1 } }
             if t.elapsed().as_secs_f32() * 1000. >= budget_ms { break; }
         }
@@ -130,5 +167,5 @@ impl FxRenderer {
         }
         done
     }
-    pub fn pso_warm_progress(&self) -> (usize, usize, usize) { self.pso_warm.as_ref().map_or((0, 0, 0), |w| (w.made, w.at, w.raw.len())) }
+    pub fn pso_warm_progress(&mut self) -> (usize, usize, bool) { let pending = self.pending_pipelines(); self.pso_warm.as_ref().map_or((0, 0, true), |w| ((w.made + w.failed).saturating_sub(pending).min(w.total), w.total, w.logged || w.total == 0)) }
 }

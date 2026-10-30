@@ -20,7 +20,7 @@ fn emit(level: u32, text: String) {
         h.push(text.clone());
     }
     if crate::is_main_thread() {
-        crate::js::fnweb_console(level, &text);
+        if level >= 2 { drain(); crate::js::fnweb_console(level, &text); } else if let Ok(mut q) = QUEUE.lock() { q.push((level, text)); }
     } else {
         // an error / panic line also goes to the worker's own console at once: when the main thread is the one stuck (waiting for this very
         // worker), the queue below is never drained
@@ -54,7 +54,15 @@ fn looks_like_error(t: &str) -> bool {
 pub fn drain() -> usize {
     let lines = match QUEUE.try_lock() { Ok(mut q) => std::mem::take(&mut *q), Err(_) => return 0 };
     let n = lines.len();
-    for (level, text) in lines { crate::js::fnweb_console(level, &text); }
+    let mut batch = String::new();
+    let mut batch_level = 0;
+    for (level, text) in lines {
+        if !batch.is_empty() && (level != batch_level || batch.len() > 64 << 10) { crate::js::fnweb_console(batch_level, &batch); batch.clear(); }
+        if !batch.is_empty() { batch.push(char::from(10u8)); }
+        batch_level = level;
+        batch.push_str(&text);
+    }
+    if !batch.is_empty() { crate::js::fnweb_console(batch_level, &batch); }
     n
 }
 

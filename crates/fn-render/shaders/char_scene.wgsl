@@ -43,6 +43,7 @@ struct VsOut {
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) world_tangent: vec4<f32>,
 }
 
 @vertex
@@ -52,6 +53,7 @@ fn vs_char(
     @location(2) uv: vec2<f32>,
     @location(3) joints: vec4<u32>,
     @location(4) weights: vec4<f32>,
+    @location(6) tangent: vec4<f32>,
 ) -> VsOut {
     var o: VsOut;
     let m = bones[joints.x] * weights.x + bones[joints.y] * weights.y + bones[joints.z] * weights.z + bones[joints.w] * weights.w;
@@ -63,6 +65,7 @@ fn vs_char(
     o.world_pos = wp.xyz;
     o.world_normal = (object.model * vec4<f32>(n_local, 0.0)).xyz;
     o.uv = uv;
+    o.world_tangent = vec4<f32>((object.model * vec4<f32>((m * vec4<f32>(tangent.xyz, 0.0)).xyz, 0.0)).xyz, tangent.w);
     return o;
 }
 
@@ -75,24 +78,25 @@ struct GBuf { emissive: vec3<f32>, normal_ue: vec3<f32>, metallic: f32, specular
 fn char_run(perm: u32, v: array<vec4<f32>, 8>, tw: vec3<f32>, cam_ue: vec3<f32>, time: f32) -> GBuf {
     var o: array<vec4<f32>, 6>;
     // head / hair declare 7 inputs (no front-face flag read), body 8
+    let pf4 = vec4<f32>((1.5 + sin((time - floor(time / 0.5) * 0.5) * 12.566371)) * 0.4, 0.0, 0.0, 0.0);
     var v7: array<vec4<f32>, 7>;
     for (var i = 0; i < 7; i = i + 1) { v7[i] = v[i]; }
     // PERF (2026-10-06): the programs' constant-buffer arrays are folded at load (char_material.rs fold_private_cbs): the written slots are the private vec4s
     // `<cb>_<slot>` below, the material registers (cb3) are read from `cmat.cb` directly, every other slot is the zero it always was
     if (perm == 0u) {
-        head_cb0_3 = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+        head_cb0_3 = pf4;
         head_cb1_43 = vec4<f32>(tw, 1.0);
         head_cb1_62 = vec4<f32>(-cam_ue, 0.0);
         head_cb1_131 = vec4<f32>(0.0, 0.0, time, 0.0);
         o = head_ps(v7);
     } else if (perm == 1u) {
-        hair_cb0_3 = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+        hair_cb0_3 = pf4;
         hair_cb1_43 = vec4<f32>(tw, 1.0);
         hair_cb1_62 = vec4<f32>(-cam_ue, 0.0);
         hair_cb1_131 = vec4<f32>(0.0, 0.0, time, 0.0);
         o = hair_ps(v7);
     } else {
-        body_cb0_3 = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+        body_cb0_3 = pf4;
         body_cb1_43 = vec4<f32>(tw, 1.0);
         body_cb1_62 = vec4<f32>(-cam_ue, 0.0);
         body_cb1_130 = vec4<f32>(0.0, 0.0, 0.0, 1.0);   // View.CullingSign (1 for the main view)
@@ -140,12 +144,11 @@ fn fs_char_depth(in: VsOut) {
     }
 }
 
-@fragment
-fn fs_char(in: VsOut, @builtin(front_facing) front: bool) -> LitOut {
+fn char_gbuffer(in: VsOut, front: bool) -> GBuf {
     let cam = camera.position.xyz;
     let p = in.world_pos;
     let n0 = normalize(in.world_normal);
-    // tangent frame of the renderer (screen-space derivatives, the exported meshes carry no tangents): same maths as perturb_normal
+    // tangent frame of the renderer (screen-space derivatives): same maths as perturb_normal; replaced by the cooked TangentX / TangentZ.w stream when the mesh carries one
     let dp1 = dpdx(p);
     let dp2 = gl_dfdy3(p);
     let duv1 = dpdx(in.uv);
@@ -157,23 +160,39 @@ fn fs_char(in: VsOut, @builtin(front_facing) front: bool) -> LitOut {
     let n_u = normalize(to_ue(n0));
     let t_u = normalize(to_ue(t_r) - n_u * dot(n_u, to_ue(t_r)));
     // the shader builds the bitangent as cross(Z, X) * sign: pick the sign that reproduces the renderer's bitangent direction
-    let w_sign = select(-1.0, 1.0, dot(cross(n_u, t_u), to_ue(b_r)) >= 0.0);
+    var w_sign = select(-1.0, 1.0, dot(cross(n_u, t_u), to_ue(b_r)) >= 0.0);
+    var t_v = t_u;
+    if (in.world_tangent.w != 0.0) {
+        t_v = to_ue(in.world_tangent.xyz);
+        w_sign = in.world_tangent.w;
+    }
     let tw = (to_ue(p) - to_ue(cam)) * 100.0;
     var v: array<vec4<f32>, 8>;
-    v[0] = vec4<f32>(t_u, 0.0);
+    v[0] = vec4<f32>(t_v, 0.0);
     v[1] = vec4<f32>(n_u, w_sign);
     v[2] = vec4<f32>(1.0);
     v[3] = vec4<f32>(in.uv, 0.0, 0.0);
     v[4] = vec4<f32>(0.0, 0.0, 0.0, 1.0);   // VELOCITY_PREV_POS (feeds only the velocity target o4, which is not used)
     v[6] = in.clip;   // SV_Position: the VsOut @builtin(position) is the fragment coordinate (must appear only once)
     v[7] = vec4<f32>(bitcast<f32>(select(0u, 1u, front)), 0.0, 0.0, 0.0);
-    let g = char_run(cmat.perm_info.x, v, tw, to_ue(cam) * 100.0, camera.position.w);
+    return char_run(cmat.perm_info.x, v, tw, to_ue(cam) * 100.0, camera.position.w);
+}
+@fragment
+fn fs_char(in: VsOut, @builtin(front_facing) front: bool) -> LitOut {
+    let p = in.world_pos;
+    let g = char_gbuffer(in, front);
 
     // SHADING MODELS (2026-10-05): the deferred resolve of the GBuffer the original program wrote, per ShadingModelID (o2.w) with its CustomData (o5), shared with
     // the scene-lit FX programs (fx_resolve_sm.wgsl sm_lit_world: DeferredLightingCommon.usf GetDynamicLighting for the sun x the projected CSM / DF shadow x the
     // light function, SkyLighting.usf sky diffuse with DFAO + GBufferAO, ReflectionApplyPS inputs, fog). The head / hair / body materials are
     // MSM_SubsurfaceProfile (docs/spec/material_coverage.md): StandardShading on the stored BaseColor, which is what UE computes without the screen-space subsurface
-    // pass (that pass is not implemented). Was a local DefaultLit copy without the directional light's MinRoughness clamp (0.08) and F_Schlick's
+    // pass (subsurface.rs replaces these pixels when r.SSS.Scale > 0: fs_char_sss writes its inputs). Was a local DefaultLit copy without the directional light's MinRoughness clamp (0.08) and F_Schlick's
     // saturate(50 * SpecularColor.g) term.
     return sm_lit_world(p, from_ue(g.normal_ue), g.emissive, g.base, g.metallic, g.specular, g.roughness, g.ao, g.shading_model, g.custom);
+}
+@fragment
+fn fs_char_sss(in: VsOut, @builtin(front_facing) front: bool) -> SssOut {
+    let g = char_gbuffer(in, front);
+    if (sm_decode_id(g.shading_model) != SM_SUBSURFACE_PROFILE || light.misc.x <= 0.5) { discard; }
+    return sm_sss_world(in.world_pos, from_ue(g.normal_ue), g.emissive, g.base, g.metallic, g.specular, g.roughness, g.ao, g.custom);
 }

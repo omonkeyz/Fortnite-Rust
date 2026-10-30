@@ -34,7 +34,7 @@ const log = (m) => { const l = `[${((Date.now() - t0) / 1000).toFixed(1).padStar
 const save = () => fs.writeFileSync(path.join(out, 'console.txt'), b.lines.join('\n') + '\n');
 let status = 0;
 try {
-    const url = server.url + '?' + new URLSearchParams({ args: gameArgs }).toString() + (query ? '&' + query : '');
+    const url = server.url + '?' + new URLSearchParams({ args: gameArgs }).toString() + (query ? '&' + query : '') + (/(^|&)FN_LOBBY=/.test(query || '') ? '' : '&FN_LOBBY=0');
     // --profile: sample the page's main thread (JS + wasm functions) from navigation until the world has been drawn for a few seconds
     let cdp = null;
     if (flag('--profile')) {

@@ -8,6 +8,7 @@
 //!              mesh-space additive with the tracked-bone mask ([`MeshAdditiveMode`]), HeadTrack, TwoBoneIk, hand retarget.
 //! * [`skin`]:  renderer-free CPU skinning of a pose ([`SkinnedMesh::pose`] = the old `Model::apply_pose`) plus the face-rigidity diagnostics.
 mod graph;
+pub mod enhanced_anim;
 pub mod anim_dynamics; // PART ANIM HOOK: AnimNode_AnimDynamics (BR character part AnimBPs)
 pub mod skeleton;
 pub mod skin;

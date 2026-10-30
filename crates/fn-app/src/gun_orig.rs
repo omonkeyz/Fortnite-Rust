@@ -30,6 +30,23 @@ pub fn install(renderer: &mut Renderer, res: &Resources, install_dir: &Path) -> 
     for l in scene.log.drain(..) { eprintln!("{l}"); }
     Ok(OrigGuns { scene, guns, pending: None, set, remote_models: HashMap::new(), remote_pending: vec![] })
 }
+static STARTER_PREP: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = std::sync::Mutex::new(None);
+pub fn start_starter_prepare(res: &Resources, install_dir: &Path) {
+    let Ok(mut g) = STARTER_PREP.lock() else { return };
+    if g.is_some() { return; }
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *g = Some(done.clone());
+    let jobs: Vec<(String, Vec<Option<String>>)> = (0..fn_pose::loadout_gun::STARTER_GUNS).filter_map(|i| res.gun_item(i).map(|it| (ITEMS[i].to_owned(), it.mesh_materials.clone()))).collect();
+    let dir = install_dir.to_path_buf();
+    let spawned = std::thread::Builder::new().name("starter guns prepare".into()).spawn(move || {
+        let t = std::time::Instant::now();
+        if let Ok(set) = fn_pak::PakSet::open_install(&dir) { for (w, m) in &jobs { if let Err(e) = fn_matshader::gun::prepare_weapon(&set, w, m) { eprintln!("[arms] {w}: starter prepare failed ({e})"); } } }
+        eprintln!("[arms] starter guns prepared on a worker in {:.0} ms", t.elapsed().as_secs_f32() * 1000.);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    if spawned.is_err() { if let Some(d) = g.as_ref() { d.store(true, std::sync::atomic::Ordering::Relaxed); } }
+}
+pub fn starter_prepare_done() -> bool { STARTER_PREP.lock().ok().and_then(|g| g.as_ref().map(|d| d.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(true) }
 pub fn install_lazy(renderer: &mut Renderer, install_dir: &Path) -> Result<OrigGuns, String> {
     let set = fn_pak::PakSet::open_install(install_dir).map_err(|e| e.to_string())?;
     Ok(OrigGuns { scene: GunScene::new(renderer.gun()), guns: vec![], pending: None, set, remote_models: HashMap::new(), remote_pending: vec![] })
@@ -86,7 +103,7 @@ impl OrigGuns {
         if let Some(p) = &self.pending {
             let (tx, ty) = camera.tan_half();
             let view = ViewInput { eye: camera.eye, forward: camera.forward, up: camera.up, tan_half: (tx, ty), near_m: camera.near, far_m: camera.far, width: camera.width, height: camera.height, time };
-            let input = FrameInput { view, gun_to_world: p.to_world, skin: &p.skin, sky_radiance: fn_render::lighting::sky_radiance(), time };
+            let input = FrameInput { view, gun_to_world: p.to_world, skin: &p.skin, sky_radiance: fn_render::lighting::sky_radiance(), time, vectors: &[] };
             self.guns[p.gun].model.frame(&input, &mut frame);
         }
         if !self.remote_pending.is_empty() {
@@ -94,7 +111,7 @@ impl OrigGuns {
             let view = ViewInput { eye: camera.eye, forward: camera.forward, up: camera.up, tan_half: (tx, ty), near_m: camera.near, far_m: camera.far, width: camera.width, height: camera.height, time };
             for (key, to_world) in &self.remote_pending {
                 let Some(Some((model, skin))) = self.remote_models.get_mut(key) else { continue };
-                let input = FrameInput { view, gun_to_world: *to_world, skin, sky_radiance: fn_render::lighting::sky_radiance(), time };
+                let input = FrameInput { view, gun_to_world: *to_world, skin, sky_radiance: fn_render::lighting::sky_radiance(), time, vectors: &[] };
                 model.frame(&input, &mut frame);
             }
         }

@@ -238,3 +238,35 @@ Source: `C:\FortniteRef\scratch\CookedIniVersion.txt`, extracted from the unencr
 - `bRadialClosesOnRelease=true` in every input preset, including `ConfigD_Athena` (line 2593). This resolves the UNCONFIRMED default: port it as **true**, not false.
 - `SocialPicker` is bound **only** to `Gamepad_DPad_Down` in every preset (`ConfigD_Athena` ActionMappings:109, line 2736). No keyboard key for SocialPicker appears anywhere in the cooked ini.
 - Do not assume B. Before porting the keyboard key, check the `InputActionDataTable` row, the 1.8 keybind settings widget data and the exe default action mappings. If none of them gives a keyboard key, the 1.8 PC default is unbound, and the port must match that and leave it to user rebinding.
+
+## Port addendum (2026-10-25): resolved items, from the decompile at `D:\Fortnite\FortniteRef\decomp\named` and the paks
+
+* **Keyboard key = B, through `ChatPicker`.** `AFortPlayerControllerAthena` vtable (0x144070898) overrides slot 661 (`SocialPicker`) AND slot 662
+  (`ChatPicker`) with the same thunk 140443920 (`mov rax,[rcx]; jmp [rax+0x1960]` = vfunc_812, the emote). Slot 663 (`NotePicker`) is 141a68a80 (`ret 0`).
+  `ChatPicker` is the "Quick Chat Message" row of the 1.8 keybinds with default `B` (`fn-settings` table, recovered). So in BR, B (KBM) and D-pad Down
+  (gamepad, `SocialPicker`) both run vfunc_812. `PickerCancel` also lists B, but only on the picker's own input component (open picker: B cancels).
+  Note: the cooked ini rows quoted above are the `Mac.`-prefixed ones (the only ones `CookedIniVersion.txt` stores).
+* **The gate.** `vfunc_812` calls vtbl+0x1360 with `&Tags + 0x2c8`, where `Tags` = `FUN_1405c94c0()` = the native tag table filled by `FUN_1405af6c0`
+  (`[0x59]` = `Gameplay.Action.Player.InteractUse`; `[0x5a]` = `...Emote`, `[0x51]` = `...Move`). It is NOT `GameData+0x2c8`. Athena 0x1360 =
+  `14041ed80`: if the tag is `AimDownsights` (`[0x5e]`) it checks the weapon, else base `140816400`: pawn (`PC+0x770`) exists, pawn byte +0xf58 == 0,
+  then pawn vtbl+0xa90 = `1407d0730` -> `ASC(+0xc40)` -> `14028fb20` = `!AreAbilityTagsBlocked({InteractUse})`. `AbilityTagRelationships` rows whose
+  `AbilityTagsToBlock` contain `InteractUse`: Medium, Heavy, DBNO, DBNOAthena, Death, Stunned, KnockedBack, AbilityWeapon, Skydive. Healing
+  (`InterruptibleHealingItem`) does not block it.
+* **Pawn vfuncs before a picker opens** (`FortPlayerPawnAthena` vtable 0x144072328): +0x980 = `1407f8b80` (clears the fire-pressed byte and releases the
+  fire ability input), +0x938 = `1407f8be0` (same for targeting).
+* **Server path.** `ServerPlayEmoteItem_Implementation` = slot 428 = `140847700` -> `FUN_1408251c0`: needs the pawn + ASC, repeats the gate, loads
+  `GameData+0x1808` (`EmoteGameplayAbility` = `GAB_Emote_Generic_C`), for an `AthenaConsumableEmoteItemDefinition` requires `FUN_140426390` (count > 0,
+  then an MCP consume command), then `GiveAbilityAndActivateOnce` (`FUN_143e3c570`) with the item as the spec's source object.
+* **Move cancel = the 75 cm leash.** `UFortAbilitySystemComponent` `FUN_14029f800`: when an ability whose tags are in the `Move` relationship's
+  `AbilityTagsToCancel` activates (Emote is), it calls PC vtbl+0x13b0 (`StartMovementCancellableAction`, `FUN_14084e5e0`). The Athena PC tick
+  (`FUN_14044e880`) applies the `Move` cancel when the pawn is more than `MovementCancellableActionLeashLength` (+0x31dc, 75 cm, 3D) from the leash
+  location. Athena's movement-input override (slot 629 = `14044e460`) does NOT apply the immediate base cancel. So walking cancels after 75 cm.
+* **No emote camera.** No Athena camera mode, no cooked BP and no native tag use for emotes (the pak scan finds `IsPlayingEmote` only in the STW
+  `BP_PlayerSpawnTeleportPad`). The normal third-person camera stays.
+* **`bLimitToOwner`** on `fort_dance_music_ridethepony_Cue` is a concurrency setting (MaxCount 1 per owner), not "only the owner hears it".
+  `fort_dance_01_Cue` is MaxCount 1, PreventNew (one at a time in the world).
+* **Locker.** `AthenaCustomizationTab` has `CharacterSlot`, `PickaxeSlot`, `GliderSlot`, `BannerSlot`: no dance slot in 1.8, so `Loadout.Dance` stays
+  null and `FallbackDance` applies. Nothing to port in the lobby.
+* Still open: `bRadialClosesOnRelease` (no cooked caller of `DoesRadialCloseOnRelease`, SocialPicker binds pressed only: not ported), the meaning of
+  pawn byte +0xf58, the `M-PieMenu` gradient formula (cooked material keeps no expression graph), `PlayFeedbackLine` VO (no feedback banks in the port),
+  who plays the victory pose (`Loadout+0x60` reader not found).

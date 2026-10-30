@@ -215,6 +215,7 @@ pub fn frame(sim: &mut GameSim, use_down: bool, pickup_focused: bool, dt: f32) -
         let locals: Vec<Arc<Vec<Hull>>> = s.map.iter().map(|m| m.local.clone()).collect();
         let blocked_map = |i: usize, yaw: f32, d: &Door| -> bool { let (t, q, sc, off) = map_root(i); capsule_overlaps(&hulls_at(&locals[i], leaf_l2w(t, q, sc, off, d.closed_yaw, yaw)), pawn) };
         if edge {
+            if s.focus.is_some() { crate::interact::note_tap(); }
             match s.focus {
                 Some(Key::Map(i)) => {
                     let mut d = s.map[i].door.clone();

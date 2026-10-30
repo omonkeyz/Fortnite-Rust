@@ -205,7 +205,7 @@ pub fn gpu_material(cmd: &MaterialCmd, assets: &UiAssets) -> Option<MatDraw> {
             set_meta(&mut p, 0, false, false, true);
             set_meta(&mut p, 1, false, false, true);
             p.extend_from_slice(&[[0.0, 0.0, 0.0, 1.0], [0.0; 4], [0.0; 4]]);
-            Some(MatDraw { shader: ShaderId::Hud(PHASE_ICON_BASE + (*shader as u32).min(3)), p, tex: [b, i, TexSrc::Dummy, TexSrc::Dummy] })
+            Some(MatDraw { shader: ShaderId::Hud(PHASE_ICON_BASE + (*shader as u32).min(4)), p, tex: [b, i, TexSrc::Dummy, TexSrc::Dummy] })
         }
     }
 }

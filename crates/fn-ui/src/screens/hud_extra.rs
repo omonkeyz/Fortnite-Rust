@@ -85,7 +85,8 @@ pub struct Layout {
 }
 
 /// `*_w` are measured text widths in PIXELS (kills: 40 + text; players-left: icon + 4 + text; backpack row: key text, count text, max text).
-pub fn layout(w: f32, h: f32, alive_text_w: f32, kills_text_w: f32, key_text_w: f32, count_w: f32, max_w: f32) -> Layout {
+pub fn layout(w: f32, h: f32, alive_text_w: f32, kills_text_w: f32, key_text_w: f32, count_w: f32, max_w: f32) -> Layout { layout_with_stream(w, h, alive_text_w, kills_text_w, key_text_w, count_w, max_w, 0.) }
+pub fn layout_with_stream(w: f32, h: f32, alive_text_w: f32, kills_text_w: f32, key_text_w: f32, count_w: f32, max_w: f32, stream_h: f32) -> Layout {
     let s = dpi_scale(w, h);
     let compass = Rect::new((w - COMPASS_SIZE.0 * s) * 0.5, 0., COMPASS_SIZE.0 * s, COMPASS_SIZE.1 * s);
     let compass_mark = Rect::new(compass.x + COMPASS_MARK.0 * s, compass.y + COMPASS_MARK.1 * s, COMPASS_MARK.2 * s, COMPASS_MARK.3 * s);
@@ -103,7 +104,7 @@ pub fn layout(w: f32, h: f32, alive_text_w: f32, kills_text_w: f32, key_text_w: 
     let panel_w = 3. * PACK_SIZE.0 + 2. * PACK_DIVIDER;
     let panel_h = PACK_SIZE.1 + 2. * PACK_PAD_V;
     let right = w - PICKUP_RIGHT * s;
-    let bottom = h - (PICKUP_BOTTOM + STREAM_PAD) * s;
+    let bottom = h - (PICKUP_BOTTOM + STREAM_PAD + stream_h) * s;
     let pack_panel = Rect::new(right - panel_w * s, bottom - panel_h * s, panel_w * s, panel_h * s);
     let mut packs = [Rect::ZERO; 3];
     for (i, p) in packs.iter_mut().enumerate() { *p = Rect::new(pack_panel.x + i as f32 * (PACK_SIZE.0 + PACK_DIVIDER) * s, pack_panel.y + PACK_PAD_V * s, PACK_SIZE.0 * s, PACK_SIZE.1 * s); }
@@ -153,15 +154,31 @@ pub struct HudExtraState {
     /// `Border_HUD_ResourceBg_Highlighted` = `M_Border_LightNavy_VGrad`). ASSUMED wood (the native building-material default is not serialised).
     pub current_resource: usize,
     pub storm_map: Option<StormMap>,
+    pub bus: Option<MapIcon>,
+    pub teammates: Vec<TeamMapIcon>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapIcon { pub uv: (f32, f32), pub yaw_deg: f32 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TeamMapIcon { pub uv: (f32, f32), pub yaw_deg: f32, pub tint: [f32; 3], pub dbno: bool }
+pub const TEAM_ICON_SIZE: f32 = 20.;
+pub const BUS_ICON_TEXTURE: &str = "T_AthenaBus_Top.png";
+pub const BUS_ICON_IMAGE_SIZE: f32 = 256.;
+pub const BUS_ICON_SCALE: f32 = 0.5;
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StormMap { pub current: [f32; 3], pub next: [f32; 3] }
-impl Default for HudExtraState { fn default() -> Self { Self { players_alive: None, kills: 0, resources: [0; 3], heading_override: None, backpack: (0, BACKPACK_MAX_ASSUMED), backpack_key: BACKPACK_KEY_DEFAULT.into(), map_centre: (0.5, 0.5), arrow_deg: None, show_minimap: true, show_pickups: true, current_resource: 0, storm_map: None } } }
+impl Default for HudExtraState { fn default() -> Self { Self { players_alive: None, kills: 0, resources: [0; 3], heading_override: None, backpack: (0, BACKPACK_MAX_ASSUMED), backpack_key: BACKPACK_KEY_DEFAULT.into(), map_centre: (0.5, 0.5), arrow_deg: None, show_minimap: true, show_pickups: true, current_resource: 0, storm_map: None, bus: None, teammates: vec![] } } }
+pub fn team_tint(c: [f32; 3]) -> [f32; 4] { let t = crate::screens::srgb3(c); [t[0], t[1], t[2], 1.] }
 pub const PLAYERS_LEFT_DEFAULT: &str = "100";
 /// MINIMAP FIX (2026-10-05): `AFortInGameMapManager::MapLayerSize` of the Athena map manager = the side of the map in map units (one unit =
 /// `FortWorldSettings.MapWorldScale` cm). `AFortGameStateAthena::BeginPlay` (exe 0x14041d400) spawns the NATIVE `AFortInGameMapManagerAthena` (no BP), so the
 /// value is the `AFortInGameMapManager` ctor default (exe 0x1405f60c0: `*(this + 0x3d0) = 0x380`); the minimap paint reads it through `FUN_14060c8c0`.
 pub const MAP_LAYER_SIZE: f32 = 896.;
+pub const STORM_RING_THICKNESS: f32 = 4.;
+pub const STORM_RING_SEGMENTS: usize = 100;
+pub const STORM_CURRENT_RING_COLOR: [f32; 4] = [0., 0., 1., 1.];
+pub const STORM_NEXT_RING_COLOR: [f32; 4] = [1., 1., 1., 1.];
+pub const PLAYER_ARROW_TEXTURE: &str = "UI_Radar_AthenaPlayerArrow.png";
 /// `AFortWorldSettings::MiniMapZoom` (Slate units per map unit at zoom 1): `AFortWorldSettings` ctor default 2.5 (exe 0x1406535b0: `+0x684 = 0x40200000`),
 /// not overridden by `Athena_Terrain`'s FortWorldSettings (its tagged properties: MapWorldScale 290, MapZOffset 42000, AthenaMapImage, ...).
 pub const MINIMAP_ZOOM: f32 = 2.5;
@@ -216,20 +233,25 @@ impl CountAnim {
 }
 
 #[derive(Clone, Default)]
-pub struct HudExtra { pub state: HudExtraState, pub count: CountAnim, tex: Option<Tex>, pub alive_row: Option<Rect> }
+pub struct HudExtra { pub state: HudExtraState, pub count: CountAnim, tex: Option<Tex>, pub alive_row: Option<Rect>, pub stream: (f32, f32), pub stream_anchor: Option<(f32, f32)> }
 
 impl HudExtra {
     pub fn new() -> Self { Self::default() }
-    pub fn with_state(state: HudExtraState) -> Self { Self { state, count: CountAnim::default(), tex: None, alive_row: None } }
+    pub fn with_state(state: HudExtraState) -> Self { Self { state, count: CountAnim::default(), tex: None, alive_row: None, stream: (0., 0.), stream_anchor: None } }
     /// Game-time step: the pack numbers count up to the new value over [`COUNT_INTERP_SECS`] (not calling it shows the numbers as they are).
     pub fn tick(&mut self, dt: f32) { self.count.step(self.state.resources, dt); }
 
+    pub fn prewarm(&mut self, ctx: &mut UiContext) -> TextureId { self.ensure_tex(ctx).map }
+    pub fn kept_textures(&self) -> Vec<TextureId> { self.tex.map(|t| vec![t.map, t.minimap.id]).unwrap_or_default() }
     fn ensure_tex(&mut self, ctx: &mut UiContext) -> Tex {
-        if let Some(t) = self.tex { return t; }
+        if let Some(t) = self.tex {
+            let live = |id: TextureId| id == TextureId::NONE || ctx.assets.store.get(id).is_some();
+            if [t.alive, t.kills, t.compass_mark, t.minimap.id, t.map, t.arrow, t.wood, t.stone, t.metal, t.backpack, t.keycap.id, t.compass_strip, t.compass_feather, t.line_mask].into_iter().all(live) { return t; }
+        }
         // optional: a missing icon is skipped (TextureId::NONE quads are dropped by the RenderList), not fatal
         let t = Tex {
             alive: art(ctx, "AliveIco.png").id, kills: art(ctx, "KillsIco.png").id, compass_mark: art(ctx, "Compass_CenterMark.png").id, minimap: art(ctx, "minimap_Art_square.png"),
-            map: art(ctx, "MiniMapAthena.png").id, arrow: art(ctx, "UI_Radar_PlayerArrow.png").id,
+            map: art(ctx, "MiniMapAthena.png").id, arrow: art(ctx, PLAYER_ARROW_TEXTURE).id,
             wood: art(ctx, "T-Icon-Logs.png").id, stone: art(ctx, "T-Icon-S-Loot-Stone.png").id, metal: art(ctx, "T-Icon-IBeam.png").id, backpack: art(ctx, "T-Icon-Backpack-64.png").id,
             keycap: art(ctx, "Keybind-Frame-S.png"),
             compass_strip: mat_tex(ctx, "T_Compass.png", true).id, compass_feather: mat_tex(ctx, "T_CompassFeather.png", false).id, line_mask: mat_tex(ctx, "T-Border-HUD-Line-Vert.png", false).id,
@@ -253,8 +275,71 @@ impl HudExtra {
         out.fill(outer, FULL_MAP_BACKING);
         let r = Rect::new(outer.x + pad, outer.y + pad, side, side);
         match self.state.storm_map { Some(sm) => out.material(MaterialKind::MinimapStorms { map: tex.map, current: sm.current }, r, WHITE, false), None => out.quad(tex.map, r, [0., 0., 1., 1.], WHITE) }
+        if let Some(sm) = self.state.storm_map { out.push_clip(r); Self::storm_rings(out, &sm, self.state.map_centre, |u, v| (r.x + u * r.w, r.y + v * r.h), r.w, s); out.pop_clip(); }
+        if let Some(b) = self.state.bus { out.push_clip(r); Self::bus_icon(ctx, out, (r.x + r.w * b.uv.0, r.y + r.h * b.uv.1), b.yaw_deg, s); out.pop_clip(); }
         let c = self.state.map_centre; let a = 20. * s;
+        out.push_clip(r);
+        for t in &self.state.teammates { let d = TEAM_ICON_SIZE * s; out.rotated(tex.arrow, (r.x + r.w * t.uv.0, r.y + r.h * t.uv.1), (d, d), t.yaw_deg.to_radians(), team_tint(t.tint)); }
+        out.pop_clip();
         out.rotated(tex.arrow, (r.x + r.w * c.0.clamp(0., 1.), r.y + r.h * c.1.clamp(0., 1.)), (a, a), self.state.arrow_deg.unwrap_or(yaw_deg).to_radians(), WHITE);
+    }
+    fn segment(out: &mut RenderList, a: (f32, f32), b: (f32, f32), thickness: f32, color: [f32; 4]) {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 0. { return; }
+        out.rotated(TextureId::WHITE, ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5), (len + thickness, thickness), dy.atan2(dx), color);
+    }
+    fn ring(out: &mut RenderList, c: (f32, f32), r: f32, thickness: f32, color: [f32; 4]) {
+        let pt = |i: usize| { let a = i as f32 * std::f32::consts::TAU / STORM_RING_SEGMENTS as f32; (c.0 + a.cos() * r, c.1 + a.sin() * r) };
+        for i in 0..STORM_RING_SEGMENTS { Self::segment(out, pt(i), pt(i + 1), thickness, color); }
+    }
+    fn line_to_circle(out: &mut RenderList, c: (f32, f32), r: f32, player: (f32, f32), thickness: f32, color: [f32; 4]) {
+        let (dx, dy) = (c.0 - player.0, c.1 - player.1);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist <= r { return; }
+        let (nx, ny) = if dist * dist <= 1e-8 { (0., 0.) } else { (dx / dist, dy / dist) };
+        let edge = (player.0 + nx * (dist - r), player.1 + ny * (dist - r));
+        Self::segment(out, edge, player, thickness, color);
+    }
+    pub fn storm_rings(out: &mut RenderList, sm: &StormMap, player_uv: (f32, f32), to_px: impl Fn(f32, f32) -> (f32, f32), px_per_uv: f32, s: f32) {
+        let t = STORM_RING_THICKNESS * s;
+        let (cur, next) = (to_px(sm.current[0], sm.current[1]), to_px(sm.next[0], sm.next[1]));
+        let (rc, rn) = (sm.current[2] * px_per_uv, sm.next[2] * px_per_uv);
+        let p = to_px(player_uv.0, player_uv.1);
+        Self::ring(out, cur, rc, t, STORM_CURRENT_RING_COLOR);
+        Self::ring(out, next, rn, t, STORM_NEXT_RING_COLOR);
+        Self::line_to_circle(out, next, rn, p, t, STORM_NEXT_RING_COLOR);
+        Self::line_to_circle(out, cur, rc, p, t, STORM_CURRENT_RING_COLOR);
+    }
+    fn bus_icon(ctx: &mut UiContext, out: &mut RenderList, at: (f32, f32), yaw_deg: f32, s: f32) {
+        let t = art(ctx, BUS_ICON_TEXTURE).id;
+        let d = BUS_ICON_IMAGE_SIZE * BUS_ICON_SCALE * s;
+        out.rotated(t, at, (d, d), yaw_deg.to_radians(), WHITE);
+    }
+    pub fn draw_minimap_interior(&mut self, ctx: &mut UiContext, r: Rect, yaw_deg: f32, s: f32, out: &mut RenderList) {
+        let tex = self.ensure_tex(ctx);
+        let st = self.state.clone();
+        let heading = st.heading_override.unwrap_or(yaw_deg);
+        Self::minimap_interior(ctx, &tex, &st, r, heading, s, out);
+    }
+    fn minimap_interior(ctx: &mut UiContext, tex: &Tex, st: &HudExtraState, r: Rect, heading: f32, s: f32, out: &mut RenderList) {
+        let c = st.map_centre; let f = MAP_VIEW_FRACTION * 0.5;
+        // MINIMAP FIX: the exe draws the whole map offset by the player's point and clips it to the widget, so near the map edge the texture
+        // stops short of the box (nothing is drawn past it) instead of being squeezed: crop the box with the uv window.
+        let (u0, v0, u1, v1) = (c.0 - f, c.1 - f, c.0 + f, c.1 + f);
+        let (cu0, cv0, cu1, cv1) = (u0.max(0.), v0.max(0.), u1.min(1.), v1.min(1.));
+        let (sx, sy) = (r.w / (u1 - u0), r.h / (v1 - v0));
+        let vis = Rect::new(r.x + (cu0 - u0) * sx, r.y + (cv0 - v0) * sy, (cu1 - cu0).max(0.) * sx, (cv1 - cv0).max(0.) * sy);
+        match st.storm_map {
+            Some(sm) => { out.push_clip(r); out.material(MaterialKind::MinimapStorms { map: tex.map, current: sm.current }, Rect::new(r.x - u0 * sx, r.y - v0 * sy, sx, sy), WHITE, false); Self::storm_rings(out, &sm, c, |u, v| (r.x + (u - u0) * sx, r.y + (v - v0) * sy), sx, s); out.pop_clip(); }
+            None => out.quad(tex.map, vis, [cu0, cv0, cu1, cv1], WHITE),
+        }
+        if let Some(b) = st.bus { out.push_clip(r); Self::bus_icon(ctx, out, (r.x + (b.uv.0 - u0) * sx, r.y + (b.uv.1 - v0) * sy), b.yaw_deg, s); out.pop_clip(); }
+        out.push_clip(r);
+        for t in &st.teammates { let d = TEAM_ICON_SIZE * s; out.rotated(tex.arrow, (r.x + (t.uv.0 - u0) * sx, r.y + (t.uv.1 - v0) * sy), (d, d), t.yaw_deg.to_radians(), team_tint(t.tint)); }
+        out.pop_clip();
+        let a = 20. * s; let centre = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+        out.rotated(tex.arrow, centre, (a, a), st.arrow_deg.unwrap_or(heading).to_radians(), WHITE);
     }
     pub fn build(&mut self, ctx: &mut UiContext, w: f32, h: f32, yaw_deg: f32, out: &mut RenderList) {
         let tex = self.ensure_tex(ctx);
@@ -269,8 +354,11 @@ impl HudExtra {
         let key_owned = if key_icon.is_some() { String::new() } else { crate::screens::target_info::hud_key_text(&st.backpack_key) };
         let (count_txt, max_txt, key_txt) = (st.backpack.0.to_string(), st.backpack.1.to_string(), key_owned.as_str()); // INVENTORY FIX2: the bound ToggleInventory key, not a hardcoded "TAB"
         let tw = |ctx: &UiContext, t: &str, px: u32| text_width(ctx, FontId::Bold, t, px);
-        let l = layout(w, h, tw(ctx, &alive_txt, kpx), tw(ctx, &kills_txt, kpx), tw(ctx, key_txt, kcpx), tw(ctx, &count_txt, ppx), tw(ctx, &max_txt, ppx));
+        let l = layout_with_stream(w, h, tw(ctx, &alive_txt, kpx), tw(ctx, &kills_txt, kpx), tw(ctx, key_txt, kcpx), tw(ctx, &count_txt, ppx), tw(ctx, &max_txt, ppx), self.stream.0);
         self.alive_row = Some(l.alive_icon);
+        let right = l.pack_panel.x + l.pack_panel.w;
+        let box_w = (l.pack_panel.w).max(l.bp_row.w).max(self.stream.1 * s);
+        self.stream_anchor = if st.show_pickups { Some((right - box_w, l.pack_panel.y + l.pack_panel.h + STREAM_PAD * s)) } else { None };
         let shadow = Some(([SHADOW_OFFSET.0 * s, SHADOW_OFFSET.1 * s], SHADOW_COLOR));
         // Compass (AthenaCompass): centre mark first (Overlay_2 slot order), then the M_Compass image (translated pixel shader, baked at pixel size).
         let heading = st.heading_override.unwrap_or(yaw_deg);
@@ -282,21 +370,7 @@ impl HudExtra {
         if st.show_minimap { out.nine_slice(tex.minimap, l.minimap, MINIMAP_FRAME_MARGIN, s, WHITE); }
         // Native SFortMiniMapAthena interior: the 1.8 island texture, `MAP_VIEW_FRACTION` of it across the box, centred on `map_centre`, north up;
         // the local player arrow (UI_Radar_PlayerArrow) at the centre rotated by the view yaw (or `arrow_deg`).
-        if st.show_minimap {
-            let r = l.minimap_inner; let c = st.map_centre; let f = MAP_VIEW_FRACTION * 0.5;
-            // MINIMAP FIX: the exe draws the whole map offset by the player's point and clips it to the widget, so near the map edge the texture
-            // stops short of the box (nothing is drawn past it) instead of being squeezed: crop the box with the uv window.
-            let (u0, v0, u1, v1) = (c.0 - f, c.1 - f, c.0 + f, c.1 + f);
-            let (cu0, cv0, cu1, cv1) = (u0.max(0.), v0.max(0.), u1.min(1.), v1.min(1.));
-            let (sx, sy) = (r.w / (u1 - u0), r.h / (v1 - v0));
-            let vis = Rect::new(r.x + (cu0 - u0) * sx, r.y + (cv0 - v0) * sy, (cu1 - cu0).max(0.) * sx, (cv1 - cv0).max(0.) * sy);
-            match st.storm_map {
-                Some(sm) => { out.push_clip(r); out.material(MaterialKind::MinimapStorms { map: tex.map, current: sm.current }, Rect::new(r.x - u0 * sx, r.y - v0 * sy, sx, sy), WHITE, false); out.pop_clip(); }
-                None => out.quad(tex.map, vis, [cu0, cv0, cu1, cv1], WHITE),
-            }
-            let a = 20. * s; let centre = (r.x + r.w * 0.5, r.y + r.h * 0.5);
-            out.rotated(tex.arrow, centre, (a, a), st.arrow_deg.unwrap_or(heading).to_radians(), WHITE);
-        }
+        if st.show_minimap { Self::minimap_interior(ctx, &tex, &st, l.minimap_inner, heading, s, out); }
         // Players alive / eliminations (text top-aligned: default slot alignment is Fill and STextBlock paints from the top of its geometry).
         let line_h = crate::screens::line_height(ctx, FontId::Bold, kpx).max(1.);
         out.sprite(tex.alive, l.alive_icon, WHITE);

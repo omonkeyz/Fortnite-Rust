@@ -219,6 +219,29 @@ pub(crate) fn pellet_dir(gun: &GunHit, spread: &SpreadState, ctx: &FireContext, 
     if half > 0. { vrand_cone(aim, half, half, rs) } else { safe_normal(aim) }
 }
 
+pub fn cosmetic_cartridge(gun: &GunHit, world: &World, start: Vec3, aim: Vec3, seed: i32) -> Vec<(Vec3, Option<Impact>)> {
+    let s = &gun.stats;
+    let (bullets, max_m, sweep) = (s.bullets_per_cartridge.max(1), s.trace_range_m(), s.sweep_radius_m());
+    let spread = SpreadState::default();
+    let ctx = FireContext::default();
+    let mut rs = RandomStream::new(seed);
+    (0..bullets).map(|index| {
+        let dir = pellet_dir(gun, &spread, &ctx, aim, index, &mut rs);
+        if dir == Vec3::ZERO { return (start, None); }
+        let world_hit = trace_world(&world.props, start, dir, max_m, sweep);
+        if let Some(b) = building_trace(start, dir, world_hit.map_or(max_m, |h| h.t), sweep) { let pos = start + dir * b.t; return (pos, Some(building_impact(gun, &b, pos, b.t, 0.))); }
+        match world_hit {
+            Some(WorldHit { t, normal, prop }) => {
+                let pos = start + dir * t;
+                let surface = prop.map_or(SURFACE_DEFAULT, |i| crate::surface::of_prop(&world.props[i]));
+                (pos, Some(Impact { pos, normal, surface, distance_m: t, prop, object: 0, damage: 0., destroyed: false, zone: Zone::Normal,
+                    effect: gun.pres.impact_effect(surface).map(str::to_owned), sound: gun.pres.impact_sound(surface).map(str::to_owned) }))
+            }
+            None => (start + dir * max_m, None),
+        }
+    }).collect()
+}
+
 /// Applies one cartridge (`BulletsPerCartridge` pellets) to the world, RVA 0x933630: `seed` is the CRT `rand()` value that seeds the `FRandomStream` (one per call), every
 /// pellet leaves the chosen aim ray inside the spread cone (the first pellet of a multi-pellet cartridge exactly on it), the nearest prop / the ground takes the hit, props lose
 /// `EnvDmg` at that range (through `Harvestable::health`; a destroyed prop emits `FxEvent::Broke`), `LastFireTime` is stamped per pellet and the heat is added once at the end.
@@ -260,7 +283,7 @@ pub fn fire_at(gun: &GunHit, world: &mut World, pawns: &mut [PawnTarget], opts: 
             stopped_at = Some(t); n_taken += 1;
             // a teammate's mesh is in the trace result (FortPawnMesh blocks FCC_Trace_Weapon) but the target filter's bExcludePawnFriends drops it: no damage, no hit
             if opts.shooter_team.is_some() && opts.shooter_team == Some(pawns[ph.pawn].team) { continue; }
-            let (imp, hit) = hit_pawn(gun, pawns, ph, aim.start + dir * t, t, index, ctx.level);
+            let (imp, hit) = hit_pawn(gun, pawns, ph, aim.start + dir * t, t, index, ctx.level, opts.damage_enabled && pawn_damage_gate());
             rep.impacts.push(imp); rep.pawn_hits.push(hit);
         }
         if stopped_at.is_some() && (!opts.trace_through_pawns || n_taken >= opts.trace_through_limit as usize) { rep.tracer_ends.push(aim.start + dir * stopped_at.unwrap()); continue; }
@@ -301,12 +324,16 @@ pub fn fire_at(gun: &GunHit, world: &mut World, pawns: &mut [PawnTarget], opts: 
     rep
 }
 
+thread_local! { static PAWN_DAMAGE_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+pub fn set_pawn_damage_gate(enabled: bool) { PAWN_DAMAGE_GATE.with(|g| g.set(enabled)); }
+pub fn pawn_damage_gate() -> bool { PAWN_DAMAGE_GATE.with(|g| g.get()) }
+
 /// One pellet / projectile landing on a pawn: `Combat` damage at `range_m` x the zone column, shield first, numbers and hit-marker flags.
-pub(crate) fn hit_pawn(gun: &GunHit, pawns: &mut [PawnTarget], ph: PawnTraceHit, pos: Vec3, range_m: f32, pellet: u32, level: i32) -> (Impact, PawnHit) {
+pub(crate) fn hit_pawn(gun: &GunHit, pawns: &mut [PawnTarget], ph: PawnTraceHit, pos: Vec3, range_m: f32, pellet: u32, level: i32, damage: bool) -> (Impact, PawnHit) {
     let s = &gun.stats;
     let raw = s.damage_at(DamageKind::Combat, range_m * 100., level) * s.zone_multiplier(ph.zone);
     let pawn = &mut pawns[ph.pawn];
-    let applied = pawn.vitals.apply_damage(raw);
+    let applied = if damage { pawn.vitals.apply_damage(raw) } else { Applied::default() };
     // exe 0x65f1c0: bIsCriticalHit when the zone is Critical AND its multiplier exceeds 1.0 (a Critical column of 1, e.g. the launchers, is not a critical hit)
     let critical = ph.zone == Zone::Critical && s.zone_critical > 1.;
     let numbers = damage_numbers(pawn.id, &applied, critical, pos, ph.normal);
@@ -396,7 +423,7 @@ impl Projectile {
                 self.pos += dir * t; self.travelled += t; self.age += dt; self.vel = Vec3::ZERO;
                 let friend = opts.shooter_team.is_some() && opts.shooter_team == Some(pawns[ph.pawn].team);
                 if friend && gun.ability.selection(crate::data::APPLICATION_HIT).is_some_and(|s| s.exclude_pawn_friends) { return (None, hits); }
-                let (imp, hit) = hit_pawn(gun, pawns, ph, self.pos, range, 0, level);
+                let (imp, hit) = hit_pawn(gun, pawns, ph, self.pos, range, 0, level, opts.damage_enabled && pawn_damage_gate());
                 hits.push(hit);
                 return (Some(imp), hits);
             }
@@ -445,16 +472,17 @@ pub fn projectile_gravity_m_s2() -> f32 { -fn_movement::params::WORLD_GRAVITY_Z 
 //  * EXACT  (SDK) `FFortDamageNumberInfo { WorldLocation, HitNormal, bIsCriticalDamage, int Damage, EFortDamageNumberType (None 0 Pawn 1 Building 2 Player 3 Shield 4 Score 5 DBNO 6) }`,
 //           `FFortGameplayEffectContext { bIsFatalHit, bIsCriticalHit, bIsFullBodyHit, KnockbackMagnitude, KnockbackZAngle, StunTime }`.
 //  * EXACT  (data) the player's collision capsule is radius 42 cm (AFortPawn ctor @1407c9ff0) / half height 75 cm (crouched 40, clamped to the radius by SetCapsuleSize = 42), `fn_movement::params`. The BR physics asset
-//           `Characters/Player/Male/Male_Avg_Base/MPR/Player_Medium_Apose_PhysicsAsset` has one `SkeletalBodySetup` (a `KSphylElem`: bone-local Center / Orientation / Radius / Length, cm)
-//           per bone, among them `head` (radius 9.14 cm). The WID flag `bTraceThroughPawns` is serialized true on the bolt-action sniper only.
+//           `Characters/Player/Male/Male_Avg_Base/Fortnite_M_Avg_Player_Physics` (the PhysicsAsset of `Fortnite_M_Avg_Player`, the SkeletalMesh of `PlayerPawn_Athena_Generic.CharacterMesh0`) has one `SkeletalBodySetup` (a `KSphylElem`: bone-local Center / Orientation / Radius / Length, cm)
+//           per bone, among them `head` (radius 12.05 cm). The WID flag `bTraceThroughPawns` is serialized true on the bolt-action sniper only.
 //  * EXACT  (data) `GA_Ranged_GenericDamage` target filter: `Damageable` actors, `bExcludeInstigator`, `bExcludePawnFriends` true, `bExcludeDBNOPawns` false, `bTraceComplexCollision` false,
 //           `bExcludeObstructedByWorld` true; the damage `GE_Ranged_GenericDamage` (template `GET_DirectPhysicalDamage`) adds the `Damage` meta attribute of `UFortHealthSet`.
 //  * INFERENCE: the default `DamageZones` content (constructor of `AFortPawn` in the exe; no BR pawn Blueprint serializes it): Critical = {head}. The default of the line-test flag / radius.
 //  * EXACT  (exe) `AFortPawn::GetDamageZone` RVA 0x7dd390; damage chain `UFortDamageFormulaExecutionCalculation::Execute` RVA 0x65f1c0 (weapon curve x zone column x resistance /
 //           vulnerability, shield absorbs first with overflow into `Damage` -> Health, `FFortGameplayEffectContext.bIsCriticalHit` (+0x69) set when the zone is Critical and its
 //           multiplier exceeds 1.0 or a dice crit fires); hit-flag bits RVA 0x937880. See `Vitals::apply_damage`.
-//  * INFERENCE: round-to-nearest for the damage number integer (the `FFortDamageNumberInfo` producer is not located yet); a capsule miss means no hit even when a body would be
-//           touched; no body hit inside the capsule is the Normal zone (the Normal fall-through itself is exact).
+//  * INFERENCE: round-to-nearest for the damage number integer (the `FFortDamageNumberInfo` producer is not located yet).
+//  * EXACT  (data) `FortPawnCapsule` (CookedIniVersion L1342) does not list `FCC_Trace_Weapon`, whose DefaultResponse is Ignore (L1379): the weapon trace passes through the
+//           capsule and only the `FortPawnMesh` physics bodies block it, so a ray inside the capsule that misses every body is no pawn hit.
 //  * NOT 1:1: bone transforms come from the caller (the animation pose); `PawnTarget::coarse_bodies` is a stand-in pose-less body set.
 
 /// `EPhysicalSurface` of a player (the weapon actor's `ImpactPhysicalSurfaceSounds[4]` is the player impact sound).
@@ -507,7 +535,7 @@ impl DamageZoneBones {
 
 /// A physics-asset body in world space (metres): capsule segment `a..b` with `radius` (a sphere has `a == b`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct HitBody { pub bone: String, pub a: Vec3, pub b: Vec3, pub radius: f32 }
+pub struct HitBody { pub bone: String, pub a: Vec3, pub b: Vec3, pub radius: f32, pub obb: Option<glam::Mat4> }
 
 /// One player-like hit target.
 #[derive(Clone, Debug, PartialEq)]
@@ -532,10 +560,10 @@ impl PawnTarget {
     /// INFERENCE stand-in for a pose: head / torso / legs bodies stacked in the capsule (head radius = the physics asset's `head` body, 9.14 cm). Use real bodies when a pose exists.
     pub fn coarse_bodies(&self) -> Vec<HitBody> {
         let (_, hh) = self.capsule_m(); let k = 2. * hh / 1.5; let y = |h: f32| self.feet + Vec3::Y * (h * k);
-        vec![HitBody { bone: "head".into(), a: y(1.28), b: y(1.39), radius: 0.0914 },
-             HitBody { bone: "spine_03".into(), a: y(0.92), b: y(1.04), radius: 0.15 },
-             HitBody { bone: "pelvis".into(), a: y(0.80), b: y(0.90), radius: 0.15 },
-             HitBody { bone: "thigh_l".into(), a: y(0.10), b: y(0.75), radius: 0.11 }]
+        vec![HitBody { bone: "head".into(), a: y(1.28), b: y(1.39), radius: 0.0914, obb: None },
+             HitBody { bone: "spine_03".into(), a: y(0.92), b: y(1.04), radius: 0.15, obb: None },
+             HitBody { bone: "pelvis".into(), a: y(0.80), b: y(0.90), radius: 0.15, obb: None },
+             HitBody { bone: "thigh_l".into(), a: y(0.10), b: y(0.75), radius: 0.11, obb: None }]
     }
 }
 
@@ -552,9 +580,10 @@ pub struct PawnFire {
     pub trace_through_limit: u32,
     /// `bUseLineTestForDamageZoneBoneDetection` radius (`LineTestForDamageZoneBoneDetectionRadius`), metres; INFERENCE default 0.
     pub line_test_radius_m: f32,
+    pub damage_enabled: bool,
 }
 impl Default for PawnFire { fn default() -> Self {
-        PawnFire { shooter: u64::MAX, shooter_team: None, trace_through_pawns: false, trace_through_limit: u32::MAX, line_test_radius_m: 0. } } }
+        PawnFire { shooter: u64::MAX, shooter_team: None, trace_through_pawns: false, trace_through_limit: u32::MAX, line_test_radius_m: 0., damage_enabled: true } } }
 impl PawnFire { fn pawn_hit_cap(&self) -> usize { if self.trace_through_pawns { self.trace_through_limit as usize } else { 1 } } }
 
 /// `EFortDamageNumberType` values of the number a hit spawns.
@@ -617,6 +646,28 @@ pub fn ray_capsule(o: Vec3, d: Vec3, max_t: f32, a: Vec3, b: Vec3, r: f32) -> Op
     Some((t, (p - (a + ba * s)).normalize_or_zero()))
 }
 
+pub fn ray_body(o: Vec3, d: Vec3, max_t: f32, body: &HitBody, extra: f32) -> Option<(f32, Vec3)> {
+    let Some(w) = body.obb else { return ray_capsule(o, d, max_t, body.a, body.b, body.radius + extra) };
+    let grow = Vec3::new(w.x_axis.truncate().length(), w.y_axis.truncate().length(), w.z_axis.truncate().length());
+    let w = w * glam::Mat4::from_scale(Vec3::ONE + Vec3::splat(extra) / grow.max(Vec3::splat(1e-6)));
+    let inv = w.inverse();
+    let lo = inv.transform_point3(o);
+    let ld = inv.transform_vector3(d);
+    let (mut t0, mut t1, mut axis) = (0f32, max_t, None);
+    for k in 0..3 {
+        if ld[k].abs() < 1e-9 { if lo[k].abs() > 1. { return None; } continue; }
+        let (mut a, mut b) = ((-1. - lo[k]) / ld[k], (1. - lo[k]) / ld[k]);
+        let mut s = -1f32;
+        if a > b { std::mem::swap(&mut a, &mut b); s = 1.; }
+        if a > t0 { t0 = a; axis = Some((k, s)); }
+        t1 = t1.min(b);
+        if t0 > t1 { return None; }
+    }
+    let (k, s) = axis?;
+    let mut n = Vec3::ZERO; n[k] = s;
+    Some((t0, inv.transpose().transform_vector3(n).normalize_or_zero()))
+}
+
 /// Pawns a ray crosses before `max_m` (nearest first). Only the shooter is skipped (the trace's single ignored actor, the Instigator: see [`trace_world`]); teammates are
 /// returned (their mesh blocks the weapon channel) and [`fire_at`] drops them from damage (`bExcludePawnFriends`). Dead pawns are skipped (INFERENCE: the `Ragdoll` profile,
 /// CookedIniVersion.txt L1323, keeps the game channels at their DefaultResponse Ignore).
@@ -628,10 +679,12 @@ pub fn trace_pawns(pawns: &[PawnTarget], opts: &PawnFire, o: Vec3, d: Vec3, max_
         let (a, b, r) = p.capsule_segment();
         let Some((t, normal)) = ray_capsule(o, d, max_m, a, b, r + sweep_m) else { continue };
         if t >= max_m { continue; }
-        let mut bone: Option<(f32, &str)> = None;
+        let mut bone: Option<(f32, &str, Vec3)> = None;
         for body in &p.bodies {
-            if let Some((bt, _)) = ray_capsule(o, d, max_m, body.a, body.b, body.radius + opts.line_test_radius_m) { if bone.map_or(true, |x| bt < x.0) { bone = Some((bt, body.bone.as_str())); } }
+            if let Some((bt, bn)) = ray_body(o, d, max_m, body, sweep_m + opts.line_test_radius_m) { if bone.map_or(true, |x| bt < x.0) { bone = Some((bt, body.bone.as_str(), bn)); } }
         }
+        if !p.bodies.is_empty() && bone.is_none() { continue; }
+        let (t, normal) = bone.map_or((t, normal), |x| (x.0, x.2));
         let bone = bone.map(|x| x.1.to_owned());
         v.push(PawnTraceHit { pawn: i, t, normal, zone: p.zones.zone_of(bone.as_deref()), bone });
     }
@@ -645,7 +698,9 @@ pub fn trace_pawns(pawns: &[PawnTarget], opts: &PawnFire, o: Vec3, d: Vec3, max_
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sphyl { pub center: Vec3, pub orientation: [f32; 4], pub radius: f32, pub length: f32 }
 #[derive(Clone, Debug, PartialEq)]
-pub struct BodySetup { pub bone: String, pub shapes: Vec<Sphyl> }
+pub struct BodySetup { pub bone: String, pub shapes: Vec<Sphyl>, pub boxes: Vec<BoxElem> }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxElem { pub center: Vec3, pub orientation: [f32; 4], pub extent: Vec3 }
 
 /// Reads the `SkeletalBodySetup` exports (`BoneName`, `AggGeom.SphylElems` / `SphereElems`) of a physics asset package, e.g.
 /// `/Game/Characters/Player/Male/Male_Avg_Base/MPR/Player_Medium_Apose_PhysicsAsset`.
@@ -672,7 +727,16 @@ pub fn load_body_setups(src: &fn_pose::ClipSourceDir, package: &str) -> Result<V
                 shapes.push(Sphyl { center: c, orientation: [0., 0., 0., 1.], radius: f.float("Radius").unwrap_or(0.) as f32, length: 0. });
             }
         }
-        if !shapes.is_empty() { out.push(BodySetup { bone: bone.to_owned(), shapes }); }
+        let mut boxes = vec![];
+        if let Some(g) = p.fields("AggGeom") {
+            for el in g.array("BoxElems").map(|v| v.as_slice()).unwrap_or(&[]) {
+                let Some(f) = el.as_fields() else { continue };
+                let c = match f.get("Center") { Some(PropValue::Vec3(c)) => Vec3::from(*c), _ => Vec3::ZERO };
+                let q = match f.get("Orientation") { Some(PropValue::Vec4(q)) => *q, _ => [0., 0., 0., 1.] };
+                boxes.push(BoxElem { center: c, orientation: q, extent: Vec3::new(f.float("X").unwrap_or(0.) as f32, f.float("Y").unwrap_or(0.) as f32, f.float("Z").unwrap_or(0.) as f32) });
+            }
+        }
+        if !shapes.is_empty() || !boxes.is_empty() { out.push(BodySetup { bone: bone.to_owned(), shapes, boxes }); }
     }
     Ok(out)
 }
@@ -687,7 +751,13 @@ pub fn place_bodies(setups: &[BodySetup], bone_to_world: impl Fn(&str) -> Option
         for sh in &s.shapes {
             let q = glam::Quat::from_xyzw(sh.orientation[0], sh.orientation[1], sh.orientation[2], sh.orientation[3]).normalize();
             let half = q * Vec3::Z * (sh.length * 0.5);
-            v.push(HitBody { bone: s.bone.clone(), a: m.transform_point3(sh.center - half), b: m.transform_point3(sh.center + half), radius: sh.radius * scale });
+            v.push(HitBody { bone: s.bone.clone(), a: m.transform_point3(sh.center - half), b: m.transform_point3(sh.center + half), radius: sh.radius * scale, obb: None });
+        }
+        for bx in &s.boxes {
+            let q = glam::Quat::from_xyzw(bx.orientation[0], bx.orientation[1], bx.orientation[2], bx.orientation[3]).normalize();
+            let local = glam::Mat4::from_scale_rotation_translation(bx.extent * 0.5, q, bx.center);
+            let c = m.transform_point3(bx.center);
+            v.push(HitBody { bone: s.bone.clone(), a: c, b: c, radius: 0., obb: Some(m * local) });
         }
     }
     v
@@ -699,7 +769,7 @@ mod pawn_tests {
     use crate::data::{Presentation, StatRow};
     use crate::spread::SpreadInputs;
     #[allow(dead_code)] fn ar_synthetic() -> StatRow { StatRow { spread: 0.15, standing_still_spread_mult: 0.55, heat: [(2.85, 8.75), (4.1, 8.75), (5.5, 10.)], cool: [(2.85, 2.7), (4.1, 3.), (5.5, 3.2)], bullets_per_cartridge: 1, base_level: 1, dmg: [32., 22.848, 22.848, 22.848], rng: [2500., 3750., 25000., 25000.], zone_normal: 1., zone_critical: 2.5, ..Default::default() } }
-    fn gun(stats: StatRow) -> GunHit { GunHit { wid: "t".into(), row: "t".into(), stats, pres: Presentation::default(), ability: Default::default(), projectile: None, perfect_aim_when_targeting_min_spread: true, trigger: String::new(), ammo: String::new(), rarity: String::new(), tier: String::new(), min_level: 0, ammo_path: String::new(), ability_path: String::new(), actor_path: String::new(), stat_table: String::new() } }
+    fn gun(stats: StatRow) -> GunHit { GunHit { wid: "t".into(), row: "t".into(), stats, pres: Presentation::default(), ability: Default::default(), projectile: None, perfect_aim_when_targeting_min_spread: true, trigger: String::new(), ammo: String::new(), rarity: String::new(), tier: String::new(), min_level: 0, ammo_path: String::new(), ability_path: String::new(), actor_path: String::new(), stat_table: String::new(), tracer: None, projectile_particles: vec![] } }
     /// Shooter eye at the origin looking down -Z; a perfect-aim state (ADS at rest) so the single bullet is exactly on the aim ray.
     fn shoot(g: &GunHit, pawns: &mut [PawnTarget], eye: Vec3, opts: &PawnFire) -> ShotReport {
         let mut st = SpreadState::default();
@@ -720,6 +790,29 @@ mod pawn_tests {
     const COMMON_PUMP: &str = "/Game/Athena/Items/Weapons/WID_Shotgun_Standard_Athena_C_Ore_T03";
 
     #[test]
+    fn every_br_row_damage_falloff_and_headshot_match_the_cooked_columns() {
+        let dir = fn_live::var("FN_INSTALL").unwrap_or_else(|_| r"C:\Users\Brady\Downloads\1.8\Fortnite\Fortnite\FortniteGame".into());
+        let Ok(paks) = fn_pak::PakSet::open_install(&dir) else { eprintln!("install missing, skipped"); return };
+        let src = fn_pose::ClipSourceDir::Pak(&paks);
+        let guns: Vec<GunHit> = crate::data::br_weapon_wids(&paks).iter().filter_map(|w| crate::data::load(&src, w).ok()).filter(|g| g.stat_table.ends_with("AthenaRangedWeapons")).collect();
+        assert_eq!(guns.len(), 45);
+        for g in &guns {
+            let s = &g.stats;
+            let col = |n: &str| -> f32 { s.columns.iter().find(|c| c.0 == n).unwrap_or_else(|| panic!("{}: no column {n}", g.row)).1.parse().unwrap() };
+            assert_eq!(s.dmg, [col("DmgPB"), col("DmgMid"), col("DmgLong"), col("DmgMaxRange")], "{}", g.row);
+            assert_eq!(s.rng, [col("RngPB"), col("RngMid"), col("RngLong"), col("RngMax")], "{}", g.row);
+            assert_eq!((s.zone_critical, s.zone_normal, s.dmg_scale), (col("DamageZone_Critical"), col("DamageZone_Normal"), col("DmgScale")), "{}", g.row);
+            assert_eq!(s.bullets_per_cartridge, col("BulletsPerCartridge") as u32, "{}", g.row);
+            let at = |cm: f32| s.damage_at(DamageKind::Combat, cm, 1);
+            for (r, d) in [(0., s.dmg[0]), (s.rng[0], s.dmg[0]), (s.rng[1], s.dmg[1]), (s.rng[2], s.dmg[2]), (s.rng[3], s.dmg[3]), (s.rng[3] * 2., s.dmg[3])] { assert!((at(r) - d).abs() < 1e-3, "{} at {r} cm: {} vs {d}", g.row, at(r)); }
+            if s.rng[1] > s.rng[0] { let m = (s.rng[0] + s.rng[1]) * 0.5; assert!((at(m) - (s.dmg[0] + s.dmg[1]) * 0.5).abs() < 1e-3, "{} linear between PB and Mid", g.row); }
+            let mut v = Vitals::new(100., 100.);
+            let crit = s.damage_at(DamageKind::Combat, 500., 1) * s.zone_multiplier(Zone::Critical);
+            let a = v.apply_damage(crit);
+            assert!((a.shield_damage + a.health_damage - crit.min(200.)).abs() < 1e-3 && a.shield_damage == crit.min(100.), "{} shield first", g.row);
+        }
+    }
+    #[test]
     fn body_shot_damage_follows_falloff_at_several_ranges() {
         let Some(g) = real(SR_AR) else { eprintln!("install missing, skipped"); return };
         let s = &g.stats;
@@ -738,8 +831,25 @@ mod pawn_tests {
             let _ = expect;
             let want = if m >= 100. { long } else { at(h.distance_m) };
             assert!((h.damage - want).abs() < 0.02, "{m} m: {} vs {want}", h.damage);
-            assert!((h.distance_m - (m - fn_movement::params::CAPSULE_RADIUS / 100.)).abs() < 0.02);
+            assert!(h.distance_m < m && h.distance_m > m - fn_movement::params::CAPSULE_RADIUS / 100., "{m} m: body surface at {}", h.distance_m);
         }
+    }
+    #[test]
+    fn spawn_island_hits_mark_and_react_but_leave_health_and_shield() {
+        let g = gun(ar_synthetic());
+        let mut p = [enemy(-20.)];
+        let r = shoot(&g, &mut p, Vec3::new(0., 1.0, 0.), &PawnFire { damage_enabled: false, ..opts() });
+        let h = &r.pawn_hits[0];
+        assert!(h.damage > 0. && h.feedback.hit_marker && !h.feedback.fatal && h.numbers.is_empty());
+        assert_eq!(h.applied, Applied::default());
+        assert_eq!((p[0].vitals.health, p[0].vitals.shield), (100., 100.));
+        assert!(r.impacts.iter().any(|i| i.surface == SURFACE_PLAYER && i.damage > 0.));
+        set_pawn_damage_gate(false);
+        let r = shoot(&g, &mut p, Vec3::new(0., 1.0, 0.), &opts());
+        set_pawn_damage_gate(true);
+        assert!(r.pawn_hits[0].feedback.hit_marker && (p[0].vitals.health, p[0].vitals.shield) == (100., 100.));
+        let r = shoot(&g, &mut p, Vec3::new(0., 1.0, 0.), &opts());
+        assert!(r.pawn_hits[0].applied.shield_damage > 0. && p[0].vitals.shield < 100.);
     }
     #[test]
     fn headshot_is_critical_zone_column_and_shows_a_critical_number() {
@@ -838,10 +948,10 @@ mod pawn_tests {
         let (t, _) = ray_capsule(Vec3::new(0., 3., 0.), -Vec3::Y, 100., a, b, 0.34).unwrap(); // down onto the cap
         assert!((t - (3. - 1.5)).abs() < 1e-4);
         assert!(ray_capsule(Vec3::new(0., 0.8, 5.), -Vec3::Z, 4., a, b, 0.34).is_none(), "beyond max range");
-        // a pellet that misses the 42 cm capsule (AFortPawn ctor @1407c9ff0) by 4 cm still hits when the weapon sweeps 10 cm
+        // a pellet inside the capsule that misses the 15 cm pelvis body by 5 cm hits only when the weapon sweeps 10 cm (the capsule ignores FCC_Trace_Weapon)
         let p = enemy(-5.); let o = PawnFire::default();
-        assert!(trace_pawns(&[p.clone()], &o, Vec3::new(0.46, 0.9, 0.), -Vec3::Z, 50., 0.).is_empty());
-        assert_eq!(trace_pawns(&[p], &o, Vec3::new(0.46, 0.9, 0.), -Vec3::Z, 50., 0.10).len(), 1);
+        assert!(trace_pawns(&[p.clone()], &o, Vec3::new(0.20, 0.85, 0.), -Vec3::Z, 50., 0.).is_empty());
+        assert_eq!(trace_pawns(&[p], &o, Vec3::new(0.20, 0.85, 0.), -Vec3::Z, 50., 0.10).len(), 1);
     }
     #[test]
     fn damage_zone_lookup_uses_active_bone_lists() {
@@ -854,20 +964,27 @@ mod pawn_tests {
     }
     #[test]
     fn placed_physics_bodies_use_the_local_z_axis() {
-        let s = [BodySetup { bone: "head".into(), shapes: vec![Sphyl { center: Vec3::ZERO, orientation: [0., 0., 0., 1.], radius: 9.14, length: 10.97 }] }];
+        let s = [BodySetup { bone: "head".into(), shapes: vec![Sphyl { center: Vec3::ZERO, orientation: [0., 0., 0., 1.], radius: 9.14, length: 10.97 }], boxes: vec![] }];
         let m = glam::Mat4::from_translation(Vec3::new(1., 2., 3.)) * glam::Mat4::from_scale(Vec3::splat(0.01));
         let v = place_bodies(&s, |b| (b == "head").then_some(m));
         assert_eq!(v.len(), 1);
         assert!((v[0].a - Vec3::new(1., 2., 3. - 0.05485)).length() < 1e-4 && (v[0].b - Vec3::new(1., 2., 3. + 0.05485)).length() < 1e-4 && (v[0].radius - 0.0914).abs() < 1e-5);
         assert!(place_bodies(&s, |_| None).is_empty());
+        let bx = [BodySetup { bone: "hand_l".into(), shapes: vec![], boxes: vec![BoxElem { center: Vec3::new(10., 0., 0.), orientation: [0., 0., 0., 1.], extent: Vec3::new(20., 10., 18.) }] }];
+        let v = place_bodies(&bx, |_| Some(m));
+        let (t, n) = ray_body(Vec3::new(1.1, 2., 5.), -Vec3::Z, 10., &v[0], 0.).unwrap();
+        assert!((t - (5. - 3. - 0.09)).abs() < 1e-4 && (n - Vec3::Z).length() < 1e-4, "{t} {n}");
+        assert!(ray_body(Vec3::new(1.25, 2., 5.), -Vec3::Z, 10., &v[0], 0.).is_none());
+        assert!(ray_body(Vec3::new(1.25, 2., 5.), -Vec3::Z, 10., &v[0], 0.06).is_some());
     }
     #[test]
     #[ignore = "reads the install"]
     fn real_physics_asset_has_a_head_body() {
         let paks = fn_pak::PakSet::open_install(&fn_live::var("FN_INSTALL").unwrap_or_else(|_| r"C:\Users\Brady\Downloads\1.8\Fortnite\Fortnite\FortniteGame".into())).unwrap();
         let src = fn_pose::ClipSourceDir::Pak(&paks);
-        let b = load_body_setups(&src, "/Game/Characters/Player/Male/Male_Avg_Base/MPR/Player_Medium_Apose_PhysicsAsset").unwrap();
+        let b = load_body_setups(&src, "/Game/Characters/Player/Male/Male_Avg_Base/Fortnite_M_Avg_Player_Physics").unwrap();
         let head = b.iter().find(|s| s.bone == "head").expect("head body");
-        assert!((head.shapes[0].radius - 9.1435).abs() < 1e-3 && b.len() >= 30, "{} bodies", b.len());
+        assert!((head.shapes[0].radius - 12.0475).abs() < 1e-3 && b.len() == 21, "{} bodies", b.len());
+        assert!(b.iter().all(|s| !s.bone.starts_with("clavicle")), "the pawn mesh physics asset has no clavicle bodies");
     }
 }

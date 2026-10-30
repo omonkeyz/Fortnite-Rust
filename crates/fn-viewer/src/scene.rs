@@ -42,7 +42,7 @@ impl Scene {
     pub fn load(gpu: &Gpu, index: &AssetIndex, output_format: fn_render::wgpu::TextureFormat, cfg: &SceneConfig) -> Result<Scene, String> {
         let sky = timed("sky assets", || SkyAssets::load(&index.root.join("sky")))?;
         let ground_texture = timed("grass texture", || index.load_rgba("T_Grasslands_D.png"))?;
-        let mut renderer = timed("renderer + pipelines", || Renderer::new(&gpu.device, &gpu.queue, output_format, &RendererAssets { sky, ground_texture }))?;
+        let mut renderer = timed("renderer + pipelines", || Renderer::new(&gpu.device, &gpu.queue, output_format, &RendererAssets { sky, ground_texture, ground_mips: None }))?;
         let body_m: LoadedModel = timed("body gltf + textures", || character::load_gltf(index, "SK_M_Med_Soldier_04.gltf", MaterialKind::Character))?;
         let head_m: LoadedModel = timed("head gltf + textures", || character::load_gltf(index, "SK_M_MED_Head_01_ATH.gltf", MaterialKind::Character))?;
         let mut pick_m = timed("SK_Pick gltf + textures", || character::load_gltf(index, "SK_Pick.gltf", MaterialKind::Prop))?;

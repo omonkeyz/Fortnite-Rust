@@ -9,7 +9,7 @@
 //! Per bone the old `Clip::fit` rules run on the sampled value, with the bone's *target* bind transform (`bind`, the mesh skeleton's local
 //! bind) and the clip's retarget metadata: `Skeleton` (1) -> bind translation (0 for additive clips; the retarget base pose's translation when
 //! the sequence carries an explicit one), `AnimationScaled` (2) -> `anim * |bind| / |source|`, everything else (`Animation` 0,
-//! **`AnimationRelative` 3 is left unimplemented as in UEViewer / the old runtime**, `OrientAndScale` 4) keeps the animated translation.
+//! **`AnimationRelative` 3 is left unimplemented as in UEViewer / the old runtime**) keeps the animated translation; `OrientAndScale` 4 rotates and scales it from the source pose onto the bind (`FindBetweenNormals`).
 //! Additive clips: the cooked data already holds the delta (`GetBonePose_Additive`'s base is baked in by the cooker; `ADDITIVE_IDENTITY` is
 //! the scale-0 pose), so a bone without a track is the identity delta. [`FnClip::additive_kind`] tells whether the graph must apply the
 //! clip as local-space (`ApplyAdditive`) or mesh-space rotation offset (`ApplyMeshAdditive` / `AimOffset`); that choice is the graph's.
@@ -180,7 +180,12 @@ impl FnClip {
                 let length = b.source.length();
                 if length > 0.00001 { (p * (bind.0.length() / length), q) } else if self.additive { (Vec3::ZERO, Quat::IDENTITY) } else { bind }
             }
-            // Animation, AnimationRelative (unimplemented, as before), OrientAndScale: the animated translation
+            TranslationRetarget::OrientAndScale if !self.additive => {
+                let (s, t) = (b.source, bind.0);
+                let (ls, lt) = (s.length(), t.length());
+                if (s - t).length_squared() > 1e-12 && ls > 1e-8 && lt > 1e-8 { (Quat::from_rotation_arc(s / ls, t / lt) * p * (lt / ls), q) } else { (p, q) }
+            }
+            // Animation, AnimationRelative (unimplemented, as before), OrientAndScale on additive clips: the animated translation
             _ => (p, q),
         }
     }

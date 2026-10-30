@@ -19,55 +19,6 @@
     border-top-color: rgba(255,255,255,.85); animation: fnweb-spin .9s linear infinite; will-change: transform; z-index: 6; pointer-events: none; }
   @keyframes fnweb-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { #fnweb-busy { animation-duration: 3s; } }
-  /* remote mode: the login (fnweb-remote.json beside the page) */
-    background: #0e1117; border: 1px solid #262c36; border-radius: 10px; display: none; flex-direction: column; gap: 12px; z-index: 8; }
-  @font-face { font-family: "Burbank Big Condensed"; src: url("/assets/fonts/BurbankBigCondensed.otf") format("opentype"); font-display: swap; }
-  #fnweb-launch { position: fixed; inset: 0; z-index: 9; display: none; overflow: hidden; background: #0b0b0d; color: #fff; user-select: none; -webkit-user-select: none;
-    font-family: "Burbank Big Condensed", Impact, "Arial Black", sans-serif; }
-  #fnweb-launch video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .9; }
-  #fnweb-launch .shade { position: absolute; inset: 0; background: radial-gradient(circle at center, rgba(0,0,0,.05) 30%, rgba(0,0,0,.55) 100%), linear-gradient(180deg, rgba(0,0,0,.15), rgba(0,0,0,.35)); }
-  #fnweb-launch .logo { position: absolute; top: 20px; right: 24px; width: clamp(110px, 13vw, 190px); filter: drop-shadow(0 6px 18px rgba(0,0,0,.55)); pointer-events: none; }
-  #fnweb-launch .page { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 16px; box-sizing: border-box; text-align: center; }
-  #fnweb-launch .page.on { display: flex; animation: fnweb-appear .55s cubic-bezier(.16,.84,.24,1) both; }
-  @keyframes fnweb-appear { from { opacity: 0; transform: translateY(36px) scale(.97); } to { opacity: 1; transform: none; } }
-  #fnweb-launch h1 { margin: 0; font-weight: 400; font-size: clamp(48px, 8vw, 112px); line-height: .9; letter-spacing: .04em; text-transform: uppercase; transform: skewX(-8deg); text-shadow: 0 8px 40px rgba(0,0,0,.7); }
-  #fnweb-launch .btn { font: inherit; display: inline-block; border: 0; cursor: pointer; padding: 14px 44px 11px; font-size: clamp(26px, 3vw, 40px); letter-spacing: .05em; text-transform: uppercase;
-    color: #111; text-decoration: none; background: #ffe14d; transform: skewX(-8deg); box-shadow: 0 6px 24px rgba(0,0,0,.45), inset 0 -5px 0 rgba(0,0,0,.18); transition: transform .15s ease, background .15s ease; }
-  #fnweb-launch .btn:hover { background: #fff07a; transform: skewX(-8deg) scale(1.05); }
-  #fnweb-launch .btn:active { transform: skewX(-8deg) scale(.98); }
-  #fnweb-launch .btn:focus-visible { outline: 3px solid #fff; outline-offset: 4px; }
-  #fnweb-launch .btn.big { font-size: clamp(34px, 4.4vw, 64px); padding: 18px 64px 14px; }
-  #fnweb-launch .btn.alt { background: #2a7cff; color: #fff; font-size: clamp(20px, 2.2vw, 28px); padding: 10px 28px 8px; }
-  #fnweb-launch .btn.alt:hover { background: #4b92ff; }
-  #fnweb-launch .card { width: min(720px, 100%); box-sizing: border-box; padding: 24px 28px; background: linear-gradient(180deg, rgba(20,40,90,.92), rgba(10,20,50,.92)); border: 3px solid #4b92ff;
-    box-shadow: 0 12px 48px rgba(0,0,0,.6); transform: skewX(-3deg); text-align: left; }
-  #fnweb-launch .card > * { transform: skewX(3deg); }
-  #fnweb-launch .card h2 { margin: 0 0 10px; font-weight: 400; font-size: clamp(30px, 3.6vw, 48px); letter-spacing: .04em; text-transform: uppercase; color: #ffe14d; }
-  #fnweb-launch .card h3 { margin: 16px 0 6px; font-weight: 400; font-size: clamp(22px, 2.4vw, 30px); letter-spacing: .04em; text-transform: uppercase; }
-  #fnweb-launch .card p, #fnweb-launch .card li { font: 15px/1.5 system-ui, "Segoe UI", sans-serif; color: #dfe7f5; margin: 0; }
-  #fnweb-launch .card ul { margin: 0; padding-left: 20px; display: grid; gap: 4px; }
-  #fnweb-launch .card b { color: #fff; }
-  #fnweb-launch .row { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
-  #fnweb-launch .err { font: 14px/1.4 system-ui, sans-serif; color: var(--bad); min-height: 1.4em; }
-  #fnweb-launch .card.mp { width: min(560px, 100%); display: grid; gap: 14px; }
-  #fnweb-launch .mp-label { font-size: clamp(18px, 2vw, 24px); letter-spacing: .05em; text-transform: uppercase; color: #ffe14d; }
-  #fnweb-launch .mp-input { font: 20px/1.2 "Burbank Big Condensed", Impact, sans-serif; letter-spacing: .04em; color: #fff; background: rgba(0,0,0,.45); border: 2px solid #4b92ff; padding: 10px 12px; outline: none; }
-  #fnweb-launch .mp-input:focus { border-color: #ffe14d; }
-  #fnweb-launch .mp-input.code { text-transform: uppercase; width: 9ch; text-align: center; font-size: 26px; letter-spacing: .2em; }
-  #fnweb-launch .mp-modes, #fnweb-launch .mp-join { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
-  #fnweb-launch .mp-modes .btn, #fnweb-launch .mp-join .btn { font-size: clamp(20px, 2.2vw, 28px); padding: 10px 26px 8px; }
-  #fnweb-launch .btn.small { font-size: 18px; padding: 6px 16px 4px; }
-  #fnweb-launch .btn:disabled { opacity: .5; cursor: default; }
-  #fnweb-launch .mp-code-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-  #fnweb-launch .mp-code { font-size: clamp(36px, 5vw, 56px); letter-spacing: .18em; color: #fff; }
-  #fnweb-launch .mp-players { margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
-  #fnweb-launch .mp-players li { font-size: 22px; letter-spacing: .03em; padding: 6px 10px 4px; background: rgba(0,0,0,.35); border-left: 4px solid #4b92ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #fnweb-launch .mp-players li.host { border-left-color: #ffe14d; }
-  #fnweb-launch .mp-players li.me { color: #ffe14d; }
-  #fnweb-launch .mp-hint { color: #b9c6dd; }
-  #fnweb-mp-feed { position: fixed; right: 18px; top: 120px; z-index: 7; display: grid; gap: 4px; justify-items: end; pointer-events: none;
-    font: 20px/1.2 "Burbank Big Condensed", Impact, sans-serif; letter-spacing: .03em; color: #fff; text-shadow: 0 2px 4px #000; }
-  #fnweb-mp-feed div { background: rgba(0,0,0,.35); padding: 3px 10px 1px; transition: opacity .6s ease; }
   #fnweb-dl { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); font: 12px/1.3 ui-monospace, Consolas, monospace; color: rgba(255,255,255,.8);
     text-shadow: 0 1px 2px #000; pointer-events: none; z-index: 6; display: none; }
   #fnweb-note { position: fixed; left: 10px; top: 8px; font: 12px/1.3 ui-monospace, Consolas, monospace; color: rgba(255,255,255,.72); text-shadow: 0 1px 2px #000; pointer-events: none; white-space: pre; z-index: 5; }
@@ -80,124 +31,75 @@
 <div id="fnweb-dl"></div>
 <div id="fnweb-busy" title="loading"></div>
 <div id="fnweb-error"><h1>The game stopped</h1><pre id="fnweb-error-text"></pre></div>
-<div id="fnweb-launch">
-  <video src="/assets/bg-loop.mp4" autoplay muted loop playsinline preload="auto"></video>
-  <div class="shade"></div>
-  <img class="logo" src="/assets/logo.png" alt="Fortnite Battle Royale OG">
-  <div class="page" id="fnweb-page-start">
-    <h1>Fortnite 1.8</h1>
-    <button class="btn big" id="fnweb-launch-go" type="button">Click to Launch</button>
-  </div>
-  <div class="page" id="fnweb-page-notice">
-    <div class="card">
-      <h3>Get the most out of your browser</h3>
-      <ul>
-        <li>Use the latest <b>Chrome, Edge or Brave</b> on a desktop or laptop (WebGPU is required).</li>
-        <li>Turn on <b>hardware acceleration</b> in your browser settings (Settings &rsaquo; System), then restart the browser.</li>
-        <li>On laptops, make the browser use your <b>dedicated GPU</b> (Windows Settings &rsaquo; Display &rsaquo; Graphics &rsaquo; High performance).</li>
-        <li>Close other tabs and heavy apps so the game gets more GPU memory and RAM. <b>16 GB RAM</b> recommended.</li>
-        <li>The first load downloads the game files; later visits load faster from your browser's cache.</li>
-      </ul>
-    </div>
-    <div class="row">
-      <button class="btn" id="fnweb-notice-go" type="button">Continue</button>
-      <a class="btn alt" href="https://pump.fun/coin/FyGhuKZgCDUBbGJkG2qx1pX2ZfRpgtnEwiZcneKspump" target="_blank" rel="noopener noreferrer">Support the project</a>
-    </div>
-    <div class="err" id="fnweb-launch-error" role="alert"></div>
-  </div>
-  <div class="page" id="fnweb-page-mode">
-    <h1>Play</h1>
-    <div class="card mp">
-      <label class="mp-label" for="fnweb-mp-name">Display name</label>
-      <input class="mp-input" id="fnweb-mp-name" maxlength="16" autocomplete="nickname" spellcheck="false" placeholder="3-16 letters or numbers">
-      <div class="mp-modes">
-        <button class="btn" id="fnweb-mode-solo" type="button">Solo</button>
-        <button class="btn alt" id="fnweb-mode-create" type="button">Create private lobby</button>
-      </div>
-      <div class="mp-join">
-        <input class="mp-input code" id="fnweb-mp-code" maxlength="6" spellcheck="false" autocomplete="off" placeholder="CODE">
-        <button class="btn alt" id="fnweb-mode-join" type="button">Join with code</button>
-      </div>
-    </div>
-    <div class="err" id="fnweb-mode-error" role="alert"></div>
-  </div>
-  <div class="page" id="fnweb-page-lobby">
-    <h1>Private lobby</h1>
-    <div class="card mp">
-      <div class="mp-code-row"><span class="mp-label">Lobby code</span><span class="mp-code" id="fnweb-lobby-code">------</span><button class="btn alt small" id="fnweb-lobby-copy" type="button">Copy</button></div>
-      <ol class="mp-players" id="fnweb-lobby-players"></ol>
-      <p class="mp-hint" id="fnweb-lobby-hint"></p>
-    </div>
-    <div class="row">
-      <button class="btn" id="fnweb-lobby-start" type="button">Start match</button>
-      <button class="btn alt" id="fnweb-lobby-leave" type="button">Leave</button>
-    </div>
-    <div class="err" id="fnweb-lobby-error" role="alert"></div>
-  </div>
-</div>
-<div id="fnweb-mp-feed" aria-live="polite"></div>
+<script src="fnweb-psowarm.js"></script>
 <script>
 (() => {
   const qs = new URLSearchParams(location.search);
-  const MP_ON = qs.get('fnweb_mp') === '1';
   const MP_URL = (qs.get('fnweb_mp_url') || 'wss://fortniteog-mp.fn-web-worker.workers.dev').replace(/\/$/, '');
-  const $ = (id) => document.getElementById(id);
-  const mp = { ws: null, wasm: null, queue: [], slot: -1, host: false, code: '', players: [], started: false, phase: 'off' };
+  const HTTP_URL = MP_URL.replace(/^ws/, 'http');
+  const mp = { ws: null, match: null, wasm: null, queue: [], slot: -1, host: false, code: '', started: false, phase: 'off', name: '' };
   const deliver = (fn, arg) => {
     if (mp.wasm && mp.wasm[fn]) { try { mp.wasm[fn](arg); } catch (e) { console.warn('[mp] ' + e); } }
     else if (mp.queue.length < 4096) mp.queue.push([fn, arg]);
   };
-  const feed = (text, err) => {
-    if (window.__fnwebStarted && mp.wasm && mp.wasm.fnweb_chat_text) { deliver('fnweb_chat_text', JSON.stringify({ t: 'sys', text: String(text), err: !!err })); return; }
-    const box = $('fnweb-mp-feed'), el = document.createElement('div');
-    el.textContent = text;
-    box.appendChild(el);
-    while (box.children.length > 6) box.removeChild(box.firstChild);
-    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 700); }, 6000);
-  };
-  globalThis.__fnweb_mp_send = (bytes) => { if (mp.ws && mp.ws.readyState === 1) mp.ws.send(bytes); };
+  const feed = (text, err) => deliver('fnweb_chat_text', JSON.stringify({ t: 'sys', text: String(text), err: !!err }));
+  const text = (o) => deliver('fnweb_mp_text', JSON.stringify(o));
+  globalThis.__fnweb_mp_send = (bytes) => { const w = mp.match && mp.match.readyState === 1 ? mp.match : mp.ws; if (w && w.readyState === 1) w.send(bytes); };
   globalThis.__fnweb_mp_feed = feed;
   globalThis.__fnweb_mp_text_send = (s) => { if (mp.ws && mp.ws.readyState === 1 && typeof s === 'string' && s.length <= 512) { mp.ws.send(s); return true; } return false; };
   globalThis.__fnweb_mp_code = () => (mp.ws && mp.ws.readyState === 1 && mp.slot >= 0 ? mp.code : '');
-  globalThis.__fnweb_mp_leave = () => {
+  const leaveMatch = () => {
+    const m = mp.match;
+    if (m) { m.__left = true; try { m.close(1000, 'leave'); } catch (_) {} }
+    mp.match = null;
+  };
+  function connectMatch(code, ticket) {
+    leaveMatch();
+    const ws = new WebSocket(MP_URL + '/match/' + encodeURIComponent(code));
+    ws.binaryType = 'arraybuffer';
+    mp.match = ws;
+    let welcomed = false;
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', name: mp.name, ticket }));
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') { if (mp.started) deliver('fnweb_mp_bin', new Uint8Array(ev.data)); return; }
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      deliver('fnweb_mp_text', JSON.stringify(Object.assign(m, { m: 1 })));
+      if (m.t === 'welcome') welcomed = true;
+      else if (m.t === 'start') begin();
+    };
+    ws.onclose = (ev) => {
+      if (mp.match === ws) mp.match = null;
+      if (ws.__left) return;
+      text({ t: 'end', reason: welcomed ? (ev.reason || 'closed') : 'match_unreachable', m: 1 });
+    };
+  }
+  const leave = () => {
+    leaveMatch();
     const ws = mp.ws;
     if (ws) { ws.__left = true; try { if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'leave' })); ws.close(1000, 'leave'); } catch (_) {} }
-    Object.assign(mp, { ws: null, slot: -1, host: false, code: '', players: [], started: false, phase: 'off' });
+    Object.assign(mp, { ws: null, slot: -1, host: false, code: '', phase: 'off' });
   };
+  globalThis.__fnweb_mp_leave = leave;
+  globalThis.__fnweb_mp_create = (name) => { leave(); connect('/create', String(name || '')); };
   globalThis.__fnweb_mp_join = (code, name) => {
-    if (mp.ws) { globalThis.__fnweb_mp_leave(); deliver('fnweb_mp_text', JSON.stringify({ t: 'end', reason: 'left' })); }
-    mp.inGame = true;
-    connect('/join/' + code, name, () => feed(mp.phase === 'match' ? 'Joined lobby ' + mp.code : 'Joined lobby ' + mp.code + '. Waiting for the host to start the match'), (why) => feed(why, true));
+    if (mp.ws) { leave(); text({ t: 'end', reason: 'left' }); }
+    connect('/join/' + encodeURIComponent(String(code || '')), String(name || ''));
   };
-  const savedName = () => { try { return localStorage.getItem('fnweb-mp-name') || ''; } catch (_) { return ''; } };
-  const saveName = (n) => { try { localStorage.setItem('fnweb-mp-name', n); } catch (_) {} };
-  const ERRORS = { bad_name: 'That name is not allowed. Use 3-16 letters, numbers, spaces, dots, dashes or underscores.', no_lobby: 'No lobby with that code.', full: 'That lobby is full (16 players).', hello_timeout: 'The lobby did not answer in time.', host_left: 'The host left, so the lobby closed.', ttl: 'The lobby expired.', idle: 'The lobby closed after being idle.', kicked: 'You were removed from the lobby.', host: 'The host removed you from the lobby.', host_ended: 'The host ended the match.' };
-  const say = (c) => ERRORS[c] || ('Lobby error: ' + c);
-  function renderLobby() {
-    $('fnweb-lobby-code').textContent = mp.code || '------';
-    const ol = $('fnweb-lobby-players');
-    ol.textContent = '';
-    for (const p of mp.players) {
-      const li = document.createElement('li');
-      li.textContent = p.name + (p.host ? '  (host)' : '');
-      if (p.host) li.classList.add('host');
-      if (p.slot === mp.slot) li.classList.add('me');
-      ol.appendChild(li);
-    }
-    $('fnweb-lobby-start').style.display = mp.host ? '' : 'none';
-    $('fnweb-lobby-hint').textContent = mp.host ? 'Share the code with your friends. Start when everyone is in (' + mp.players.length + '/16).' : 'Waiting for the host to start the match (' + mp.players.length + '/16).';
-  }
-  function showPage(id) { for (const p of document.querySelectorAll('#fnweb-launch .page')) p.classList.toggle('on', p.id === id); }
+  globalThis.__fnweb_mp_peek = (code) => {
+    const c = String(code || '');
+    fetch(HTTP_URL + '/peek/' + encodeURIComponent(c), { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then((j) => text(Object.assign({}, j, { t: 'peek', code: c, reached: true })))
+      .catch(() => text({ t: 'peek', code: c, reached: false, open: false }));
+  };
   function begin() {
     if (mp.started) return;
     mp.started = true;
-    $('fnweb-launch').style.display = 'none';
-    if (!mp.inGame) deliver('fnweb_mp_autoplay');
-    const busy = $('fnweb-busy'); if (busy) busy.style.display = '';
-    feed('Match starting');
+    deliver('fnweb_mp_autoplay');
   }
-  function connect(path, name, onWelcome, onFail) {
+  function connect(path, name) {
     let welcomed = false;
+    mp.name = name;
     const ws = new WebSocket(MP_URL + path);
     ws.binaryType = 'arraybuffer';
     mp.ws = ws;
@@ -207,54 +109,22 @@
       let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
       if (m.t === 'chat' || m.t === 'renamed' || m.t === 'chat_reject') { deliver('fnweb_chat_text', JSON.stringify(Object.assign(m, { me: m.slot === mp.slot || m.t === 'chat_reject' }))); return; }
       deliver('fnweb_mp_text', ev.data);
-      if (m.t === 'welcome') { welcomed = true; mp.slot = m.slot; mp.host = m.host; mp.code = m.code; mp.phase = m.phase; onWelcome(); if (m.phase === 'match') { deliver('fnweb_mp_text', JSON.stringify({ t: 'start' })); begin(); } }
-      else if (m.t === 'lobby') { mp.players = m.players; mp.code = m.code; renderLobby(); }
+      if (m.t === 'welcome') { welcomed = true; if (m.name) mp.name = m.name; Object.assign(mp, { slot: m.slot, host: m.host, code: m.code, phase: m.phase }); if (m.phase === 'match') { text({ t: 'start' }); begin(); } }
+      else if (m.t === 'lobby') mp.code = m.code;
       else if (m.t === 'start') begin();
-      else if (m.t === 'error') { if (!welcomed) onFail(say(m.code)); else feed(say(m.code)); }
-      else if (m.t === 'end' || m.t === 'kicked') { const why = say(m.reason); if (mp.started) feed(why); else { $('fnweb-lobby-error').textContent = why; $('fnweb-lobby-start').disabled = true; } }
+      else if (m.t === 'assign') { mp.started = false; connectMatch(m.match, m.ticket); }
     };
     ws.onclose = (ev) => {
       if (mp.ws === ws) mp.ws = null;
       if (ws.__left) return;
-      if (!welcomed) { onFail(ev.code === 1006 ? 'Could not reach the lobby server.' : say(ev.reason || 'closed')); return; }
-      if (mp.started) feed('Disconnected from the lobby');
-      else if (!$('fnweb-lobby-error').textContent) $('fnweb-lobby-error').textContent = 'Disconnected from the lobby.';
+      if (!welcomed) { text({ t: 'closed', code: ev.code === 1006 ? 'unreachable' : (ev.reason || 'closed') }); return; }
+      text({ t: 'end', reason: ev.reason || 'closed' });
+      if (mp.started) feed('Disconnected from the lobby', true);
     };
   }
   globalThis.__fnwebMp = {
     state: mp,
     attach(wasm) { mp.wasm = wasm; const q = mp.queue; mp.queue = []; for (const [fn, arg] of q) deliver(fn, arg); },
-    choose() {
-      if (!MP_ON) return Promise.resolve(false);
-      return new Promise((resolve) => {
-        showPage('fnweb-page-mode');
-        const name = $('fnweb-mp-name'), code = $('fnweb-mp-code'), err = $('fnweb-mode-error');
-        name.value = savedName();
-        const buttons = ['fnweb-mode-solo', 'fnweb-mode-create', 'fnweb-mode-join'].map($);
-        const busy = (b) => buttons.forEach((x) => { x.disabled = b; });
-        const checkName = () => {
-          const n = name.value.trim().replace(/\s+/g, ' ');
-          if (n.length < 3 || n.length > 16 || !/^[A-Za-z0-9 _.\-]+$/.test(n)) { err.textContent = say('bad_name'); name.focus(); return null; }
-          saveName(n); return n;
-        };
-        const go = (path, n) => {
-          busy(true); err.textContent = '';
-          connect(path, n, () => { showPage('fnweb-page-lobby'); renderLobby(); resolve(true); }, (why) => { err.textContent = why; busy(false); });
-        };
-        $('fnweb-mode-solo').onclick = () => { showPage(''); resolve(false); };
-        $('fnweb-mode-create').onclick = () => { const n = checkName(); if (n) go('/create', n); };
-        $('fnweb-mode-join').onclick = () => {
-          const n = checkName(); if (!n) return;
-          const c = code.value.trim().toUpperCase();
-          if (!/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/.test(c)) { err.textContent = 'Enter the 6-character lobby code.'; code.focus(); return; }
-          go('/join/' + c, n);
-        };
-        code.addEventListener('input', () => { code.value = code.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
-        $('fnweb-lobby-start').onclick = () => { if (mp.ws && mp.host) { $('fnweb-lobby-start').disabled = true; mp.ws.send(JSON.stringify({ t: 'start' })); } };
-        $('fnweb-lobby-leave').onclick = () => { try { mp.ws && mp.ws.close(1000, 'leave'); } catch (_) {} location.reload(); };
-        $('fnweb-lobby-copy').onclick = () => { try { navigator.clipboard.writeText(mp.code); } catch (_) {} };
-      });
-    },
   };
 })();
 </script>
@@ -292,7 +162,7 @@ globalThis.__fnweb_phase = (p, code) => {
   if (p === 'stage:GamePicker') busy.style.display = 'none';
   // PLAY: the game reports the Loading stage from inside the Play key / click (a user gesture): fullscreen, and the Escape key locked to the page
   // (navigator.keyboard.lock), so Esc opens the game's menu instead of leaving fullscreen (holding Esc still leaves it). ?fnweb_fullscreen=off: no.
-  if (p === 'stage:Loading' && new URLSearchParams(location.search).get('fnweb_fullscreen') !== 'off' && !document.fullscreenElement && document.documentElement.requestFullscreen) {
+  if ((p === 'stage:Loading' || p === 'stage:LobbyPlay') && new URLSearchParams(location.search).get('fnweb_fullscreen') !== 'off' && !document.fullscreenElement && document.documentElement.requestFullscreen) {
     document.documentElement.requestFullscreen({ navigationUI: 'hide' }).then(() => navigator.keyboard && navigator.keyboard.lock ? navigator.keyboard.lock(['Escape']) : null).catch((e) => console.warn('[fnweb] no fullscreen: ' + e));
   }
   if (p === 'stage:StartupLoading' || p === 'stage:Loading' || p === 'stage:Finishing' || p === 'stage:Playing') busy.style.display = '';
@@ -339,7 +209,7 @@ document.addEventListener('pointerlockchange', () => {
     for (const type of ['keydown', 'keyup']) canvas.dispatchEvent(new KeyboardEvent(type, { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
   }, 60);
 });
-// KEYS: winit listens on the canvas (and prevents the browser's default there, so F-keys such as F2 = the dev console reach the game). A key
+// KEYS: winit listens on the canvas (and prevents the browser's default there, so F-keys such as F2 = the Floor slot reach the game). A key
 // pressed while the focus drifted off the canvas (e.g. after the login form) is handed to the canvas, which keeps the focus from then on.
 for (const type of ['keydown', 'keyup']) window.addEventListener(type, (e) => {
   if (e.target === canvas || !window.__fnwebStarted) return;
@@ -439,42 +309,14 @@ async function tokenAccepted(t) {
   try { const r = await fetch('__fnvfs/stat?p=%2Ffn%2Fpaks', { headers: { Authorization: 'Bearer ' + t }, cache: 'no-store' }); return r.status !== 401 && r.status !== 403; }
   catch (_) { return true; } // offline: the cached listings answer
 }
-async function launchScreen(early) {
-  const root = document.getElementById('fnweb-launch'), start = document.getElementById('fnweb-page-start'), notice = document.getElementById('fnweb-page-notice');
-  const err = document.getElementById('fnweb-launch-error'), go = document.getElementById('fnweb-notice-go');
-  globalThis.__fnweb_status('');
-  document.getElementById('fnweb-busy').style.display = 'none';
-  root.style.display = 'block';
-  start.classList.add('on');
-  await new Promise((res) => document.getElementById('fnweb-launch-go').addEventListener('click', res, { once: true }));
-  start.classList.remove('on');
-  return await new Promise((resolve) => {
-    go.addEventListener('click', async () => {
-      go.disabled = true; err.textContent = '';
-      notice.classList.remove('on');
-      const multi = globalThis.__fnwebMp ? await globalThis.__fnwebMp.choose() : false;
-      const hide = () => { if (!multi) root.style.display = 'none'; };
-      try {
-        const e = early ? await early : null;
-        if (e) { tokenStore.set(e); hide(); document.getElementById('fnweb-busy').style.display = ''; globalThis.__fnweb_status('loading'); resolve(e.token); return; }
-        const r = await fetch('__fnvfs/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: '' }), cache: 'no-store' });
-        if (r.status === 401 || r.status === 403) { hide(); resolve(null); return; }
-        if (!r.ok) throw new Error('Could not reach the game files (HTTP ' + r.status + '). Try again in a moment.');
-        const t = await r.json();
-        tokenStore.set(t);
-        hide();
-        document.getElementById('fnweb-busy').style.display = '';
-        globalThis.__fnweb_status('loading');
-        resolve(t.token);
-      } catch (x) { err.textContent = x.message || String(x); go.disabled = false; notice.classList.add('on'); }
-    });
-    go.click();
-  });
-}
 async function login(early) {
   tokenStore.clear();
-  const t = await launchScreen(early);
-  if (t) return t;
+  let t = early ? await early : null;
+  if (!t) {
+    const r = await fetch('__fnvfs/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: '' }), cache: 'no-store' }).catch(() => null);
+    t = r && r.ok ? await r.json().catch(() => null) : null;
+  }
+  if (t && t.token) { tokenStore.set(t); return t.token; }
   globalThis.__fnweb_status('');
   document.getElementById('fnweb-busy').style.display = 'none';
   throw new Error('The game files are unavailable right now. Try again in a few minutes.');
@@ -489,6 +331,7 @@ async function userFiles() {
   return out;
 }
 const remote = await remoteConfig();
+const earlyTrees = remote ? [] : ['/fn/paks', '/fn/assets', '/fn/bin', '/fn/windows/Fonts'].map((root) => fetch('__fnvfs/tree?p=' + encodeURIComponent(root)).then((r) => (r.ok ? r.text() : null)).then((t) => [root, t]).catch(() => [root, null]));
 let remoteToken = null;
 let bootEarly = null;
 let prefetchStarted = false;
@@ -510,15 +353,6 @@ try {
     // the fetched files stay in this browser (Cache Storage, see sw.js): ask the browser not to evict them under storage pressure
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().then((ok) => console.log('[fnweb] persistent storage: ' + ok)); } catch (_) {}
     startPrefetch(remoteToken);
-  } else if (globalThis.__fnwebMp && new URLSearchParams(location.search).get('fnweb_mp') === '1') {
-    (async () => {
-      const root = document.getElementById('fnweb-launch'), start = document.getElementById('fnweb-page-start'), notice = document.getElementById('fnweb-page-notice');
-      root.style.display = 'block';
-      start.classList.add('on');
-      await new Promise((res) => document.getElementById('fnweb-launch-go').addEventListener('click', res, { once: true }));
-      start.classList.remove('on');
-      if (!(await globalThis.__fnwebMp.choose())) root.style.display = 'none';
-    })();
   }
   function startPrefetch(token) {
     if (prefetchStarted) return;
@@ -540,6 +374,7 @@ try {
   }
   const { wasm, memory } = await (bootEarly || boot({ onStatus: globalThis.__fnweb_status, onFatal: globalThis.__fnweb_fatal }));
   if (new URLSearchParams(location.search).get("fnweb_audio") !== "off" && window.AudioWorkletNode) startAudioRing(wasm, memory).catch((e) => console.warn("[fnweb-audio] no AudioWorklet output: " + e));
+  if (!remote && wasm.fnweb_vfs_tree) for (const [root, t] of await Promise.all(earlyTrees)) if (t != null) wasm.fnweb_vfs_tree(root, t);
   if (remote) {
     // the page's directory: the game's file requests go to <dir>/__fnvfs/..., answered by sw.js
     wasm.fnweb_vfs_remote(location.pathname.replace(/\/[^/]*$/, ''), remoteToken);

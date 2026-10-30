@@ -62,13 +62,18 @@ pub const LINE_VERT_ALPHA: f32 = 0.2; // M_Border_HUD_Line_Vert "Global Alpha"
 pub const GRADIENT_STEPS: usize = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind { Health, Shield }
+pub enum Kind { Health, Shield, Energy }
 /// All colours are LINEAR (as stored in the assets).
 #[derive(Clone, Copy, Debug)]
 pub struct Style { pub fill_a: [f32; 3], pub fill_b: [f32; 3], pub delta_a: [f32; 3], pub delta_b: [f32; 3], pub text: [f32; 3] }
 pub const HEALTH: Style = Style { fill_a: [0.07619, 0.50289, 0.0356], fill_b: [0.17789, 0.73046, 0.08022], delta_a: [0.78354, 0.05448, 0.05448], delta_b: [1., 0.16513, 0.16513], text: [0.47932, 0.87962, 0.23074] };
 pub const SHIELD: Style = Style { fill_a: [0.0382, 0.18116, 0.83077], fill_b: [0.0865, 0.43966, 0.9131], delta_a: [0.0865, 0.43966, 0.9131], delta_b: [0.20508, 0.68669, 0.95597], text: [0.20508, 0.68669, 0.95597] };
-pub fn style(k: Kind) -> Style { match k { Kind::Health => HEALTH, Kind::Shield => SHIELD } }
+pub const THIRD: Style = Style { fill_a: [0.66539, 0.2462, 0.02956], fill_b: [0.82279, 0.55201, 0.0648], delta_a: [0.82279, 0.55201, 0.0648], delta_b: [0.9131, 0.76052, 0.14996], text: [0.9131, 0.76052, 0.14996] };
+pub fn style(k: Kind) -> Style { match k { Kind::Health => HEALTH, Kind::Shield => SHIELD, Kind::Energy => THIRD } }
+pub fn energy_rows(l: &Layout) -> (Rect, Rect) {
+    let top = l.shield.y - ROW_GAP * l.scale - ROW_H * l.scale;
+    (Rect::new(l.shield_icon.x, top, l.shield_icon.w, l.shield_icon.h), Rect::new(l.shield.x, top, l.shield.w, l.shield.h))
+}
 
 #[allow(dead_code)] // the gradient itself is evaluated by the HudBar material; kept for the endpoint test
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] { [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t] }
@@ -136,8 +141,8 @@ struct Tex { plate: TexInfo, edge: TexInfo, shield_icon: TextureId, health_icon:
 
 /// Health/shield bar state: the animated (fill, delta) fractions plus lazily resolved textures.
 #[derive(Clone)]
-pub struct Vitals { health: Anim, shield: Anim, primed: bool, tex: Option<Tex> }
-impl Default for Vitals { fn default() -> Self { Self { health: Anim::new(1.), shield: Anim::new(0.), primed: false, tex: None } } }
+pub struct Vitals { health: Anim, shield: Anim, primed: bool, tex: Option<Tex>, energy: Option<Anim> }
+impl Default for Vitals { fn default() -> Self { Self { health: Anim::new(1.), shield: Anim::new(0.), primed: false, tex: None, energy: None } } }
 
 impl Vitals {
     pub fn new() -> Self { Self::default() }
@@ -146,6 +151,19 @@ impl Vitals {
         let (h, s) = (percent(health as f32, MAX_VALUE), percent(shield as f32, MAX_VALUE));
         if !self.primed { self.health = Anim::new(h); self.shield = Anim::new(s); self.primed = true; }
         self.health.step(h, dt); self.shield.step(s, dt);
+    }
+    pub fn tick_energy(&mut self, dt: f32, energy: Option<f32>) {
+        match energy {
+            Some(e) => { let p = percent(e, MAX_VALUE); match self.energy.as_mut() { Some(a) => a.step(p, dt), None => self.energy = Some(Anim::new(p)) } }
+            None => self.energy = None,
+        }
+    }
+    pub fn build_energy(&mut self, ctx: &mut UiContext, w: f32, h: f32, energy: Option<f32>, out: &mut RenderList) {
+        let (Some(e), Some(anim)) = (energy, self.energy) else { return };
+        let tex = self.ensure_tex(ctx);
+        let l = layout(w, h);
+        let (icon, row) = energy_rows(&l);
+        Self::row(&tex, ctx, out, Kind::Energy, row, icon, anim, e.round().clamp(0., MAX_VALUE) as u16, l.scale);
     }
     /// Snap both bars (no trail); used by the capture scenes to set a known state.
     pub fn snap(&mut self, health: u16, shield: u16) { self.health = Anim::new(percent(health as f32, MAX_VALUE)); self.shield = Anim::new(percent(shield as f32, MAX_VALUE)); self.primed = true; }
@@ -193,7 +211,7 @@ impl Vitals {
         let t = srgb3(st.text);
         put_text(ctx, out, FontId::Bold, px, max_x, base, &max, [t[0], t[1], t[2], 1.], None, Snap::Pen);
         // 5. Stat icon cell left of the bar: 24x24 icon (+ black 0.5 shadow 2 units lower; the 26-tall overlay centres the icon 1 unit down).
-        let icon = if kind == Kind::Health { tex.health_icon } else { tex.shield_icon };
+        let icon = match kind { Kind::Health => tex.health_icon, Kind::Shield => tex.shield_icon, Kind::Energy => return };
         let ic = Rect::new(icon_cell.x + (icon_cell.w - ICON * scale) * 0.5, icon_cell.y + scale, ICON * scale, ICON * scale);
         out.sprite(icon, Rect::new(ic.x, ic.y + scale, ic.w, ic.h), SHADOW_TINT);
         out.sprite(icon, ic, WHITE);

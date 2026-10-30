@@ -12,53 +12,6 @@
 // GBuffer of the base pass (BasePassPixelShader.usf:1036-1096, cooked r.BasePassOutputsVelocity=True, r.SelectiveBasePassOutputs=True): SV_Target4 = velocity,
 // SV_Target5 = GBufferD = CustomData (written only by the models that use it: WRITES_CUSTOMDATA_TO_GBUFFER).
 
-const SM_UNLIT: u32 = 0u;
-const SM_DEFAULT_LIT: u32 = 1u;
-const SM_SUBSURFACE: u32 = 2u;
-const SM_PREINTEGRATED_SKIN: u32 = 3u;
-const SM_CLEAR_COAT: u32 = 4u;
-const SM_SUBSURFACE_PROFILE: u32 = 5u;
-const SM_TWOSIDED_FOLIAGE: u32 = 6u;
-const SM_HAIR: u32 = 7u;
-const SM_CLOTH: u32 = 8u;
-const SM_EYE: u32 = 9u;
-
-// DecodeShadingModelId (DeferredShadingCommon.usf:285): GBufferB.a = (ShadingModelID | SelectiveOutputMask) / 255
-fn sm_decode_id(gbuffer_b_a: f32) -> u32 { return u32(round(clamp(gbuffer_b_a, 0.0, 1.0) * 255.0)) & 0xFu; }
-// IsSubsurfaceModel (DeferredShadingCommon.usf:295)
-fn sm_is_subsurface(id: u32) -> bool {
-    return id == SM_SUBSURFACE || id == SM_PREINTEGRATED_SKIN || id == SM_SUBSURFACE_PROFILE || id == SM_TWOSIDED_FOLIAGE || id == SM_HAIR || id == SM_EYE;
-}
-fn sm_subsurface_color(custom: vec4<f32>) -> vec3<f32> { return custom.rgb * custom.rgb; }
-
-// SubsurfaceShadingSubsurface (ShadingModels.usf:606)
-fn sm_shading_subsurface(custom: vec4<f32>, gbuffer_ao: f32, l: vec3<f32>, v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let sss = sm_subsurface_color(custom);
-    let opacity = custom.a;
-    let h = normalize(v + l);
-    let in_scatter = pow(clamp(dot(l, -v), 0.0, 1.0), 12.0) * mix(3.0, 0.1, opacity);
-    let normal_contribution = clamp(dot(n, h) * opacity + 1.0 - opacity, 0.0, 1.0);
-    let back_scatter = gbuffer_ao * normal_contribution / (3.14159265 * 2.0);
-    return sss * mix(back_scatter, 1.0, in_scatter);
-}
-// SubsurfaceShadingTwoSided (ShadingModels.usf:625)
-fn sm_shading_two_sided(sss: vec3<f32>, l: vec3<f32>, v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let wrap = 0.5;
-    let nol = clamp((dot(-n, l) + wrap) / ((1.0 + wrap) * (1.0 + wrap)), 0.0, 1.0);
-    let vol = clamp(dot(v, -l), 0.0, 1.0);
-    let a = 0.6;
-    let a2 = a * a;
-    let d = (vol * a2 - vol) * vol + 1.0;
-    let ggx = (a2 / 3.14159265) / (d * d);
-    return nol * ggx * sss;
-}
-// SubsurfaceShading (ShadingModels.usf:726) for the models this port draws; PREINTEGRATED_SKIN (needs the PreintegratedSkinBRDF texture), HAIR and EYE return 0
-// here: no material of the audited foliage / character set uses them (docs/spec/material_coverage.md), they are reported instead of approximated.
-fn sm_subsurface_shading(id: u32, custom: vec4<f32>, gbuffer_ao: f32, l: vec3<f32>, v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    if (id == SM_SUBSURFACE) { return sm_shading_subsurface(custom, gbuffer_ao, l, v, n); }
-    if (id == SM_TWOSIDED_FOLIAGE) { return sm_shading_two_sided(sm_subsurface_color(custom), l, v, n); }
-    return vec3<f32>(0.0);
-}
 
 // ---- the whole-scene directional shadow's subsurface transmission (LightAttenuation.y) ----
 // ShadowProjectionPixelShader.usf:132-168 for IsSubsurfaceModel pixels: Density = -.05 * log(1 - min(Opacity, .999)) (HAIR / EYE: Opacity = Density = 1);

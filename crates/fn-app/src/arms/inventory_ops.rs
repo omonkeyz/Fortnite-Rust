@@ -26,7 +26,9 @@ pub enum Loc { Slot(usize), Stash(usize) }
 
 /// Something the player lost to the world (for the world-item system).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Dropped { Stack(Item), Ammo { gun: usize, count: u32 }, Resource { kind: usize, count: u32 } }
+pub enum Dropped { Stack(Item), Ammo { gun: usize, count: u32 }, Resource { kind: usize, count: u32 }, LooseAmmo { item: String, count: u32 } }
+
+pub fn ammo_key(path: &str) -> &str { let p = path.split('.').next().unwrap_or(path); p.rsplit('/').next().unwrap_or(p) }
 
 /// What a pickup did.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -277,6 +279,35 @@ impl Arms {
         let ammo = self.data.guns[g].def.ammo.clone();
         for h in 0..self.reserve.len() { if self.data.guns[h].def.ammo == ammo { self.reserve[h] = new; } }
         Ok((added, plan.leftover))
+    }
+
+    pub fn ammo_gun_of(&self, item: &str) -> Option<usize> { let k = ammo_key(item); self.data.guns.iter().position(|g| ammo_key(&g.def.ammo) == k) }
+    pub fn ammo_count(&self, item: &str) -> u32 {
+        match self.ammo_gun_of(item) { Some(g) => self.reserve[g], None => { let k = ammo_key(item); self.loose_ammo.iter().find(|(p, _)| ammo_key(p) == k).map_or(0, |e| e.1) } }
+    }
+    pub fn pickup_ammo_item(&mut self, item: &str, max_stack: u32, count: u32) -> (u32, u32) {
+        if let Some(g) = self.ammo_gun_of(item) { return self.pickup_ammo(g, count).unwrap_or((0, count)); }
+        let k = ammo_key(item).to_owned();
+        let have = self.ammo_count(item);
+        let held = [have]; let plan = m::plan_pickup(&ItemRules::ammo(max_stack), if have > 0 { &held[..] } else { &[] }, count, 0);
+        let added = count - plan.leftover;
+        if added > 0 {
+            match self.loose_ammo.iter_mut().find(|(p, _)| ammo_key(p) == k) { Some(e) => e.1 += added, None => self.loose_ammo.push((item.to_owned(), added)) }
+            self.log(format!("pickup {added} {k}: no firearm uses it, kept in the ammo pool ({} now)", have + added));
+        }
+        (added, plan.leftover)
+    }
+    pub fn take_loose_ammo(&mut self, item: &str) -> Option<u32> {
+        let k = ammo_key(item);
+        let i = self.loose_ammo.iter().position(|(p, _)| ammo_key(p) == k)?;
+        Some(self.loose_ammo.remove(i).1)
+    }
+    pub fn drop_loose_ammo(&mut self, idx: usize, quantity: u32) -> Result<u32, String> {
+        let (item, have) = self.loose_ammo.get(idx).cloned().ok_or("no such ammo stack")?;
+        let (d, rem) = m::drop_amount(&ItemRules::ammo(u32::MAX), have, quantity).ok_or("nothing to drop")?;
+        if rem == 0 { self.loose_ammo.remove(idx); } else { self.loose_ammo[idx].1 = rem; }
+        self.drops.push(Dropped::LooseAmmo { item, count: d });
+        Ok(d)
     }
 
     // ----------------------------------------------------------------------------------------------------------------------------------- drop / unequip / equip / move

@@ -172,8 +172,11 @@ pub fn tick(sim: &mut GameSim) {
             return;
         }
         let mut queue: Vec<u32> = vec![];
-        for (i, h) in props.iter().enumerate() {
-            if st.alive.get(i).copied().unwrap_or(false) && !h.alive() && is_poi_proto(h.proto) { queue.push(h.proto & !POI_PROTO); }
+        st.alive.resize(props.len(), false);
+        for (h, was) in props.iter().zip(st.alive.iter_mut()) {
+            let a = h.alive();
+            if *was && !a && is_poi_proto(h.proto) { queue.push(h.proto & !POI_PROTO); }
+            *was = a;
         }
         while let Some(a) = queue.pop() {
             let Some(kids) = st.children.get(&a).cloned() else { continue };
@@ -182,13 +185,12 @@ pub fn tick(sim: &mut GameSim) {
                 let h = &mut props[ci];
                 if !h.alive() { continue; }
                 h.health = 0.;
+                st.alive[ci] = h.alive();
                 st.killed.insert(POI_PROTO | c);
                 eprintln!("[demolition] f{} cascade: {} #{} destroyed with its parent {} #{}", sim.frames, class_name(&poi, c), c, class_name(&poi, a), a);
                 queue.push(c);
             }
         }
-        st.alive.clear();
-        st.alive.extend(props.iter().map(|h| h.alive()));
     });
 }
 

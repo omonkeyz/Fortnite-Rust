@@ -443,3 +443,16 @@ fn gpu_and_cpubake_modes_agree_where_bake_exists() {
         r.set_material_mode(MaterialMode::Gpu);
     });
 }
+
+#[test]
+fn every_game_phase_icon_shader_draws_on_the_gpu() {
+    let Some(()) = with_gpu(|r| {
+        let mut a = new_assets();
+        let bg = make_tex(&mut a, 64, 64, Sampler { filter: fn_ui::assets::Filter::Linear, mips: false, wrap: false }, |x, y| { let d = ((x as i32 - 32).pow(2) + (y as i32 - 32).pow(2)) as f32; if d < 900. { [40, 80, 200, 255] } else { [0, 0, 0, 0] } });
+        let icon = make_tex(&mut a, 64, 64, Sampler { filter: fn_ui::assets::Filter::Linear, mips: false, wrap: false }, |x, _| if x > 20 && x < 44 { [255, 255, 255, 255] } else { [0, 0, 0, 0] });
+        for shader in 0..5u8 {
+            let img = gpu_one(r, &mut a, MaterialKind::GamePhaseIcon { shader, bg, icon }, Rect::new(0., 0., 64., 64.), [1.; 4], false, 64, 64);
+            assert!(img.chunks_exact(4).any(|p| p[3] > 0), "phase icon shader {shader} drew nothing");
+        }
+    }) else { return };
+}

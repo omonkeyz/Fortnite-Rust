@@ -71,13 +71,16 @@ struct State {
     log: Vec<String>,
     /// OUTLINE: the build preview's highlight of this frame (`HighlightColors` index, Valid, `world.props` indices).
     highlight: Option<(u8, bool, Vec<usize>)>,
+    cues: Vec<&'static str>,
+    focus: Option<fn_building::world::PieceId>,
+    last_class: Option<String>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(|| State { world: BuildingWorld::new(), edit: None, catalog: None, set: None, loading: None, load_tried: false, preview: BuildPreview::default(), building: false,
-        requests: vec![], event_cursor: 0, hull_rev: u64::MAX, afford: true, script: parse_script(), run_time: 0., log: vec![], highlight: None }))
+        requests: vec![], event_cursor: 0, hull_rev: u64::MAX, afford: true, script: parse_script(), run_time: 0., log: vec![], highlight: None, cues: vec![], focus: None, last_class: None }))
 }
 
 /// Script entries to place this frame: every entry whose time has come and which is not done; untimed (t = 0) entries run one per
@@ -120,6 +123,8 @@ pub fn rotate_preview() { with(|s| s.requests.push(Request::Rotate)); }
 pub fn edit_visuals() -> Option<fn_building::edit::EditVisuals> { with(|s| s.edit.as_ref().and_then(|e| e.visuals(&s.world))) }
 /// Sound cues of the edit session since the last call.
 pub fn drain_edit_sound_cues() -> Vec<&'static str> { with(|s| s.edit.as_mut().map(|e| e.drain_sound_cues()).unwrap_or_default()) }
+pub fn drain_build_sound_cues() -> Vec<&'static str> { with(|s| std::mem::take(&mut s.cues)) }
+pub fn preview_focus() -> Option<fn_building::world::PieceId> { with(|s| s.focus) }
 /// SCRIPT BUILD KEYS: world-space (cm) centre of an edit tile / stair indicator of the running edit session (scripted aiming, `aimtile=` / `aimarrow=`).
 pub fn edit_target_center(t: fn_building::edit::EditTarget) -> Option<Vec3> { with(|s| { let e = s.edit.as_ref()?; e.ctl.session.as_ref()?.target_center(&s.world, t) }) }
 
@@ -300,6 +305,7 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
             }
         }
         s.run_time += dt;
+        if s.cues.len() > 64 { let n = s.cues.len() - 64; s.cues.drain(..n); }
         // scripted placements (verification)
         let due = due_script_entries(&s.script, s.run_time);
         for i in &due {
@@ -310,6 +316,7 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
             if let Some(m) = m { s.requests.push(Request::Material(m)); }
             s.requests.push(Request::ScriptPlace(*i));
         }
+        let material_before = s.preview.material;
         if input.trap_held() { s.building = false; s.preview.active = false; }
         else if input.is_building() { s.building = true; s.preview.material = input.material(); if let Some(k) = input.piece() { s.preview.set_piece(k); } }
         let Some(cat) = s.catalog.as_ref() else { s.requests.clear(); return };
@@ -321,13 +328,14 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
                 Request::Enter(k) => { s.building = true; s.preview.set_piece(k); }
                 Request::Exit => { s.building = false; s.preview.active = false; }
                 Request::Select(k) => s.preview.set_piece(k),
-                Request::Material(m) => s.preview.material = m,
-                Request::Rotate => s.preview.rotate(true),
+                Request::Material(m) => { if s.building && m != material_before { s.cues.push(fn_building::edit::data::sounds::SELECT[m.index()].1); } s.preview.material = m; }
+                Request::Rotate => { s.preview.rotate(true); if s.building { s.cues.push(fn_building::edit::data::sounds::ROTATE.1); } }
                 r @ (Request::Place | Request::ScriptPlace(_)) => {
                     let scripted = if let Request::ScriptPlace(i) = r { Some(i) } else { None };
                     if !s.building { continue; }
                     s.preview.prepare_place();
                     s.preview.update(&s.world, cat, &env, &vi);
+                    if s.preview.snapped { s.cues.push(fn_building::edit::data::sounds::GRID_SNAP.1); }
                     let have = resources(sim, s.preview.material);
                     match placement::place(&mut s.world, cat, &env, &s.preview, have) {
                         Ok((id, cost)) => {
@@ -335,8 +343,9 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
                             let gone = destroy_for_placement(sim, &placement::placement_destroys(&env, s.preview.kind, s.preview.loc, s.preview.rot.yaw));
                             s.log.push(format!("placed #{id} {:?} {:?} at {:?} yaw {}{}", s.preview.kind, s.preview.material, s.preview.loc, s.preview.rot.yaw, if gone > 0 { format!(" (destroyed {gone} prop(s) in the way)") } else { String::new() }));
                         }
-                        Err(QueryResult::InvalidActor) if cat.def(s.preview.kind, s.preview.material).map_or(false, |d| have < d.cost) => {
+                        Err(QueryResult::InvalidActor) if cat.def(s.preview.kind, s.preview.material).map_or(false, |d| have < d.cost && placement::query(&s.world, cat, d, s.preview.loc, s.preview.rot.yaw, s.preview.mirrored, &env) == QueryResult::CanAdd) => {
                             unable = Some(s.preview.material);
+                            s.cues.push(fn_building::edit::data::sounds::UNABLE_TO_AFFORD.1);
                             // a scripted entry that cannot be afforded yet (resources arrive later, e.g. `mats=`) is retried next frame, not dropped
                             if let Some(i) = scripted {
                                 s.script[i].3 = false;
@@ -344,11 +353,14 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
                                 if s.log.last() != Some(&msg) { s.log.push(msg); } // logged once per wait, never silent
                             }
                         }
-                        Err(r) => { let msg = format!("place refused: {r:?} ({:?} at {:?})", s.preview.kind, s.preview.loc); if s.log.last() != Some(&msg) && s.log.len() < 4096 { s.log.push(msg); } }
+                        Err(r) => { s.cues.push(fn_building::edit::data::sounds::UNABLE_TO_PLACE.1); let msg = format!("place refused: {r:?} ({:?} at {:?})", s.preview.kind, s.preview.loc); if fn_live::var("FN_BUILD_SOUND_LOG").map_or(false, |v| v == "1") { let (blocking, _) = placement::sweep_listing(&env, s.preview.kind, s.preview.loc, s.preview.rot.yaw); eprintln!("[build-place] {msg} blocking {:?}", blocking.iter().filter_map(|&i| sim.world.props.get(i as usize).map(|p| p.proto)).collect::<Vec<_>>()); } if s.log.last() != Some(&msg) && s.log.len() < 4096 { s.log.push(msg); } }
                     }
                 }
             }
         }
+        let class = if s.building { cat.def(s.preview.kind, s.preview.material).map(|d| d.class.class_path.clone()) } else { None };
+        if class.is_some() && !s.edit.as_ref().map_or(false, |e| e.is_editing()) && class != s.last_class { s.cues.push(fn_building::edit::data::sounds::CHANGE.1); }
+        if !s.edit.as_ref().map_or(false, |e| e.is_editing()) { s.last_class = class; }
         // editing (PerformBuildingEditInteraction / tile select / reset / confirm / cancel), on this world; target = the piece under the crosshair
         if let Some(edit) = s.edit.as_mut() {
             let hulls: Vec<(fn_building::world::PieceId, fn_hull::Hull)> = s.world.iter().flat_map(|p| placement::piece_hulls(cat, p).into_iter().map(move |h| (p.id, h))).collect();
@@ -359,7 +371,7 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
             let along = (vi.pawn - vi.camera).dot(dir);
             let start = vi.camera + dir * along;
             let reach = EDIT_MODE_DISTANCE - along;
-            let target = if reach <= 0. { None } else {
+            let target = if let Some(f) = s.focus.filter(|_| s.building && !edit.is_editing()) { Some(f) } else if reach <= 0. { None } else {
                 hulls.iter().filter(|(_, h)| h.sdf(start) >= 0.).filter_map(|(id, h)| h.ray(start, dir, reach).map(|(t, _)| (t, *id))).min_by(|a, b| a.0.total_cmp(&b.0)).map(|x| x.1)
             };
             let intents = input.last_intents().to_vec();
@@ -381,7 +393,8 @@ pub fn frame(sim: &mut fn_game::GameSim, input: &mut crate::build_input::BuildIn
             edit.tick_frame(&s.world, vi.pawn, false, vi.camera, dir, dt);
         }
         let editing = s.edit.as_ref().map_or(false, |e| e.is_editing());
-        if s.building && !editing { s.preview.update(&s.world, cat, &env, &vi); } else if editing { s.preview.active = false; }
+        if s.building && !editing { s.preview.update(&s.world, cat, &env, &vi); if s.preview.snapped { s.cues.push(fn_building::edit::data::sounds::GRID_SNAP.1); } } else if editing { s.preview.active = false; }
+        s.focus = match s.preview.result { QueryResult::ExistingActor(id) if s.building && !editing && s.preview.active && id != placement::POI_PIECE_ID => Some(id), _ => None };
         // OUTLINE: FUN_140835750 -> vfunc_672: Obstructed by building actors -> those, HighlightColors[0] Invalid; otherwise (not ExistingActor) the actors the
         // placement would destroy, HighlightColors[2] Valid; nothing else is highlighted
         s.highlight = if s.building && !editing && s.preview.active {
@@ -441,7 +454,7 @@ pub fn placeholder_vertices(rev: &mut u64) -> Option<Vec<fn_render::PropVertex>>
         *rev = h;
         let mut out = Vec::new();
         let mut push = |hulls: Vec<fn_hull::Hull>, color: [f32; 3]| {
-            for hull in hulls { for t in &hull.tris {
+            for hull in hulls { for t in hull.tris.iter() {
                 let p = t.map(|i| world_to_sim(hull.verts[i as usize]));
                 // world -> sim is a reflection: re-wind so the normal points out
                 let n = (p[2] - p[0]).cross(p[1] - p[0]).normalize_or_zero();
@@ -543,6 +556,7 @@ mod script_schedule_tests {
 
 /// OUTLINE: the build preview's highlight of this frame: (`UFortGameData::HighlightColors` index, Valid side, indices into `sim.world.props`).
 pub fn highlight() -> Option<(u8, bool, Vec<usize>)> { with(|s| s.highlight.clone()) }
+pub fn highlight_piece() -> Option<(String, Vec3, f32, bool)> { with(|s| { let id = s.focus?; let p = s.world.get(id)?; let cls = s.catalog.as_ref()?.class(p.effective_class())?; Some((cls.static_mesh.clone(), world_to_fx(p.location), p.yaw_deg, p.edit.mirrored)) }) }
 /// BUILDING HUD: the preview's `InteractionCost` (the buildable's resource cost), `BuildingMaterial` and `GetResourceCount(BuildingMaterial)`.
 pub fn preview_cost(sim: &fn_game::GameSim) -> Option<(u32, Material, u32)> {
     with(|s| {

@@ -77,6 +77,8 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "walk", aliases: &[], usage: "", help: "back to walking after fly / ghost", arg: Arg::None, cite: "engine UCheatManager::Walk" },
     Command { name: "addkillfeedmessage", aliases: &["killfeed"], usage: "", help: "five test lines in the elimination feed (every name style)", arg: Arg::None, cite: "UFortCheatManager::AddKillFeedMessage" },
     Command { name: "startbus", aliases: &["startaircraft"], usage: "", help: "end any warmup and put the player on a fresh Battle Bus at the start of its flight", arg: Arg::None, cite: "AFortGameModeAthena exec STARTAIRCRAFT -> StartAircraftPhase (FUN_140407e40)" },
+    Command { name: "playemote", aliases: &[], usage: "<emote>", help: "play any emote item of the paks (dance, consumable emote, victory pose) by id or name, bypassing the picker", arg: Arg::None, cite: "port-only: AFortPlayerController::ServerPlayEmoteItem" },
+    Command { name: "win", aliases: &[], usage: "", help: "the local player wins the match (Victory Royale screen)", arg: Arg::None, cite: "port-only: AthenaHUDContext.OnLocalPlayerWon -> AthenaGameOverScreen On Player Won" },
     Command { name: "die", aliases: &["eliminate"], usage: "<storm|fall|self|banhammer>", help: "eliminate the player now with that death cause (health 0 + the elimination feed line)", arg: Arg::Values(DIE_ARGS), cite: "port-only: forces AFortPlayerStateAthena::DeathInfo (OnRep_DeathInfo builds the feed line)" },
 ];
 

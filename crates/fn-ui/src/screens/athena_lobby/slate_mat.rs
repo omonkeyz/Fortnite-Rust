@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+#[derive(Clone)]
 pub struct MatTex { pub w: usize, pub h: usize, pub rgba: Vec<u8>, pub srgb: bool, pub wrap_x: bool, pub wrap_y: bool }
 
 struct Prog {
@@ -31,14 +32,17 @@ struct Prog {
 pub struct SlateMat {
     pub path: String,
     pub root: String,
-    default: Option<Prog>,
-    disabled: Option<Prog>,
+    default: Option<std::sync::Arc<Prog>>,
+    disabled: Option<std::sync::Arc<Prog>>,
     pub cb: Vec<[f32; 4]>,
-    pub tex: Vec<Option<MatTex>>,
+    pub tex: std::sync::Arc<Vec<Option<MatTex>>>,
     pub warnings: Vec<String>,
     pub textures: Vec<String>,
     pub params: Overrides,
     pub time_dependent: bool,
+    set: UniformSet,
+    chain_params: Overrides,
+    chain_tex: HashMap<String, String>,
 }
 
 fn srgb_to_lin(c: f32) -> f32 { if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } }
@@ -149,6 +153,7 @@ impl SlateMat {
                 for p in a { if let (Some(n), Some(t)) = (p.get("ParameterName").and_then(|v| v.as_str()), p.get("ParameterValue").and_then(obj_path)) { texture_overrides.insert(n.to_owned(), t); } }
             }
         }
+        let (chain_params, chain_tex) = (ov.clone(), texture_overrides.clone());
         for (k, v) in &extra.scalars { ov.scalars.insert(k.clone(), *v); }
         for (k, v) in &extra.vectors { ov.vectors.insert(k.clone(), *v); }
         for (k, v) in extra_tex { texture_overrides.insert(k.clone(), v.clone()); }
@@ -189,8 +194,8 @@ impl SlateMat {
 
         // ---- shaders: classify the Slate permutations (default / disabled effect) ----
         let blobs = scan_blobs(&uexp);
-        let mut default: Option<Prog> = None;
-        let mut disabled: Option<Prog> = None;
+        let mut default: Option<std::sync::Arc<Prog>> = None;
+        let mut disabled: Option<std::sync::Arc<Prog>> = None;
         for b in &blobs {
             let Ok(sh) = Shader::parse(&b.bytes) else { continue };
             if !is_slate_ps(&sh) || is_font_variant(&sh) || reads_cb0_3(&sh) { continue; }
@@ -216,10 +221,31 @@ impl SlateMat {
                 for (i, r) in sh.decls.resources.iter().enumerate() { tex_regs.push((r.slot, i)); }
                 warnings.push(format!("shader {}: texture bindings by declaration order", b.id));
             }
-            *slot = Some(Prog { shader: sh, tex_regs, mat_slot, view_slot, file: b.id });
+            *slot = Some(std::sync::Arc::new(Prog { shader: sh, tex_regs, mat_slot, view_slot, file: b.id }));
         }
         if default.is_none() { warnings.push("no default Slate pixel shader permutation".into()); }
-        Ok(SlateMat { path: object_path.to_owned(), root: format!("{root_path} (shaders of {owner_long})"), default, disabled, cb: packed.cb, tex, warnings, textures: referenced, params: ov, time_dependent })
+        Ok(SlateMat { path: object_path.to_owned(), root: format!("{root_path} (shaders of {owner_long})"), default, disabled, cb: packed.cb, tex: std::sync::Arc::new(tex), warnings, textures: referenced, params: ov, time_dependent, set, chain_params, chain_tex })
+    }
+
+    pub fn respecialize(&self, store: &Store, assets: &mut UiAssets, extra: &Overrides, extra_tex: &HashMap<String, String>) -> SlateMat {
+        let mut ov = self.chain_params.clone();
+        let mut texture_overrides = self.chain_tex.clone();
+        for (k, v) in &extra.scalars { ov.scalars.insert(k.clone(), *v); }
+        for (k, v) in &extra.vectors { ov.vectors.insert(k.clone(), *v); }
+        for (k, v) in extra_tex { texture_overrides.insert(k.clone(), v.clone()); }
+        let packed = evaluate(&self.set, &ov, 0.0);
+        let mut warnings = vec![];
+        let mut tex = vec![];
+        for e in &self.set.textures2d {
+            let mut p = match e {
+                Expr::Texture { index, .. } => self.textures.get(*index as usize).cloned(),
+                Expr::TextureParameter { name, index, .. } => texture_overrides.get(name).cloned().or_else(|| self.textures.get(*index as usize).cloned()),
+                _ => None,
+            };
+            if let Some(s) = p.as_ref().and_then(|s| extra_tex.get(s)) { p = Some(s.clone()); }
+            tex.push(p.as_ref().and_then(|p| load_tex(store, assets, p, &mut warnings)));
+        }
+        SlateMat { path: self.path.clone(), root: self.root.clone(), default: self.default.clone(), disabled: self.disabled.clone(), cb: packed.cb, tex: std::sync::Arc::new(tex), warnings, textures: self.textures.clone(), params: ov, time_dependent: self.time_dependent, set: self.set.clone(), chain_params: self.chain_params.clone(), chain_tex: self.chain_tex.clone() }
     }
 
     pub fn is_ready(&self) -> bool { self.default.is_some() }
@@ -240,15 +266,30 @@ impl SlateMat {
     /// brush (nine-patch uv mapping for Box brushes), `tint` = linear brush tint x widget colour.
     #[allow(clippy::too_many_arguments)]
     pub fn raster(&self, w: u32, h: u32, size: (f32, f32), native: (f32, f32), margin: [f32; 4], boxed: bool, tint: [f32; 4], disabled: bool, time: f32) -> Vec<u8> {
+        self.raster_rows(w, h, size, native, margin, boxed, tint, disabled, time, 0, h.max(1))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn raster_rows(&self, w: u32, h: u32, size: (f32, f32), native: (f32, f32), margin: [f32; 4], boxed: bool, tint: [f32; 4], disabled: bool, time: f32, r0: u32, r1: u32) -> Vec<u8> {
+        self.job().raster_rows(w, h, size, native, margin, boxed, tint, disabled, time, r0, r1)
+    }
+    pub fn job(&self) -> RasterJob { RasterJob { default: self.default.clone(), disabled: self.disabled.clone(), cb: self.cb.clone(), tex: self.tex.clone() } }
+}
+
+#[derive(Clone)]
+pub struct RasterJob { default: Option<std::sync::Arc<Prog>>, disabled: Option<std::sync::Arc<Prog>>, cb: Vec<[f32; 4]>, tex: std::sync::Arc<Vec<Option<MatTex>>> }
+impl RasterJob {
+    #[allow(clippy::too_many_arguments)]
+    pub fn raster_rows(&self, w: u32, h: u32, size: (f32, f32), native: (f32, f32), margin: [f32; 4], boxed: bool, tint: [f32; 4], disabled: bool, time: f32, r0: u32, r1: u32) -> Vec<u8> {
         let (w, h) = (w.max(1), h.max(1));
-        let mut out = vec![0u8; (w * h * 4) as usize];
+        let (r0, r1) = (r0.min(h), r1.min(h).max(r0.min(h)));
+        let mut out = vec![0u8; (w * (r1 - r0) * 4) as usize];
         let prog = match (disabled, &self.disabled, &self.default) { (true, Some(d), _) => d, (_, _, Some(d)) => d, _ => return out };
         let gamma = 2.2f32;
         let cb0 = [[0.0f32; 4], [0.0; 4], [2.2 / gamma, 1.0 / gamma, 0.0, 0.0]];
         let mut view = vec![[0.0f32; 4]; 132];
         view[131] = [0.0, 0.0, time, 0.0];
         let tint_p = pack_tint(tint);
-        struct E<'a> { mat: &'a SlateMat, prog: &'a Prog }
+        struct E<'a> { mat: &'a RasterJob, prog: &'a Prog }
         impl<'a> Env for E<'a> {
             fn texture(&mut self, req: &TexReq) -> [f32; 4] {
                 let k = self.prog.tex_regs.iter().find(|(r, _)| *r == req.texture).map(|(_, k)| *k);
@@ -278,13 +319,15 @@ impl SlateMat {
                 }
             }
         };
-        let threads = if w * h >= 4096 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8) } else { 1 };
-        if threads <= 1 { band(0, h, &mut out); return out; }
-        let rows = h.div_ceil(threads as u32);
+        let n = r1 - r0;
+        if n == 0 { return out; }
+        let threads = if w * n >= 65536 { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8) } else { 1 };
+        if threads <= 1 { band(r0, r1, &mut out); return out; }
+        let rows = n.div_ceil(threads as u32);
         std::thread::scope(|s| {
             for (i, chunk) in out.chunks_mut((rows * w * 4) as usize).enumerate() {
-                let y0 = i as u32 * rows;
-                let y1 = (y0 + rows).min(h);
+                let y0 = r0 + i as u32 * rows;
+                let y1 = (y0 + rows).min(r1);
                 let band = &band;
                 s.spawn(move || band(y0, y1, chunk));
             }

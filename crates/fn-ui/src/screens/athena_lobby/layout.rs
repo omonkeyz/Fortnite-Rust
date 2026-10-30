@@ -45,6 +45,7 @@ impl<'a> Ctx<'a> {
             if self.ui.w[id].text.as_deref().map_or(true, |t| t.is_empty()) { st.color[3] = EDITABLE_HINT_ALPHA; }
         }
         if let Some(sc) = self.ui.w[id].props.get("ShadowOffset").and_then(|_| jvec::<2>(self.ui.w[id].props.get("ShadowOffset"))) { st.shadow_offset = sc; st.uses_shadow = true; if st.shadow_color[3] == 0.0 { st.shadow_color = [0.0, 0.0, 0.0, 1.0]; } }
+        if let Some(c) = jvec::<4>(self.ui.w[id].props.get("ShadowColorAndOpacity")) { st.shadow_color = c; }
         st
     }
 
@@ -181,7 +182,7 @@ impl<'a> Ctx<'a> {
                 let idx = self.ui.w[id].props.get("ActiveWidgetIndex").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as usize;
                 match kids.get(idx) { Some(&k) if self.ui.w[k].vis.takes_space() => self.child_total(k), _ => [0.0, 0.0] }
             }
-            "VerticalBox" | "HorizontalBox" => {
+            "VerticalBox" | "HorizontalBox" | "CommonTreeView" | "CommonListView" => {
                 let horiz = class == "HorizontalBox";
                 let (mut along, mut cross) = (0.0f32, 0.0f32);
                 for k in self.visible_kids(id) {
@@ -286,7 +287,7 @@ impl<'a> Ctx<'a> {
         let class = self.ui.w[id].class.clone();
         if class == "AthenaRotator_C" { /* handled as a user widget below */ }
         match class.as_str() {
-            "VerticalBox" | "HorizontalBox" => {
+            "VerticalBox" | "HorizontalBox" | "CommonTreeView" | "CommonListView" => {
                 let horiz = class == "HorizontalBox";
                 let kids = self.visible_kids(id);
                 let avail = if horiz { rect[2] } else { rect[3] };
@@ -333,6 +334,33 @@ impl<'a> Ctx<'a> {
                 let inner = [rect[0] + pad[0], rect[1] + pad[1], (rect[2] - pad[0] - pad[2]).max(0.0), (rect[3] - pad[1] - pad[3]).max(0.0)];
                 for k in self.visible_kids(id) { self.arrange(k, inner); }
             }
+            "ScaleBox" => {
+                let p = self.ui.w[id].props.clone();
+                let stretch = p.get("Stretch").and_then(|v| v.as_str()).unwrap_or("EStretch::ScaleToFit").rsplit("::").next().unwrap_or("ScaleToFit").to_owned();
+                let dir = p.get("StretchDirection").and_then(|v| v.as_str()).unwrap_or("EStretchDirection::Both").rsplit("::").next().unwrap_or("Both").to_owned();
+                let user = p.get("UserSpecifiedScale").and_then(jf).unwrap_or(1.0);
+                for k in self.visible_kids(id) {
+                    let d = self.child_total(k);
+                    let (sx, sy) = (if d[0] > 0.0 { rect[2] / d[0] } else { 1.0 }, if d[1] > 0.0 { rect[3] / d[1] } else { 1.0 });
+                    let (mut ax, mut ay) = match stretch.as_str() {
+                        "None" => (1.0, 1.0),
+                        "Fill" => (sx, sy),
+                        "ScaleToFitX" => (sx, sx),
+                        "ScaleToFitY" => (sy, sy),
+                        "ScaleToFill" => { let m = sx.max(sy); (m, m) }
+                        "UserSpecified" => (user, user),
+                        _ => { let m = sx.min(sy); (m, m) }
+                    };
+                    match dir.as_str() { "DownOnly" => { ax = ax.min(1.0); ay = ay.min(1.0); } "UpOnly" => { ax = ax.max(1.0); ay = ay.max(1.0); } _ => {} }
+                    let (w, h) = (d[0] * ax, d[1] * ay);
+                    let s = &self.ui.w[k].slot;
+                    let hal = s.get("HorizontalAlignment").and_then(|v| v.as_str()).map(ha).unwrap_or(HA::Center);
+                    let val = s.get("VerticalAlignment").and_then(|v| v.as_str()).map(va).unwrap_or(VA::Center);
+                    let x = match hal { HA::Left | HA::Fill => rect[0], HA::Center => rect[0] + (rect[2] - w) * 0.5, HA::Right => rect[0] + rect[2] - w };
+                    let y = match val { VA::Top | VA::Fill => rect[1], VA::Center => rect[1] + (rect[3] - h) * 0.5, VA::Bottom => rect[1] + rect[3] - h };
+                    self.arrange(k, [x, y, w, h]);
+                }
+            }
             "Image" | "FortSZAwareImage" | "CommonLazyImage" | "TextBlock" | "CommonTextBlock" | "CommonNumericTextBlock" | "Spacer" | "CommonActionWidget" => {}
             "SizeBox" | "SafeZone" | "BackgroundBlur" | "Overlay" | "NamedSlot" | "CommonWidgetStack" | "CommonLoadGuard" | "MenuAnchor" | "CommonVisibilityWidget" | _ => {
                 for k in self.visible_kids(id) { self.arrange_slot(k, rect); }
@@ -348,7 +376,8 @@ pub fn new_layout(n: usize, scale: f32) -> Layout { Layout { rect: vec![[0.0; 4]
 /// `pads` = extra root widgets (world-space player pad widgets): (root, projected component location in Slate units, `UWidgetComponent.Pivot`).
 /// Screen-space widget component rule (UE 4.16 `SWorldWidgetScreenLayer`): slot position = projected location, size = desired size (`bDrawAtDesiredSize`),
 /// alignment = Pivot, i.e. the widget's top-left is `anchor - desired * pivot`.
-pub fn run(ui: &mut Ui, uic: &mut UiContext, root: usize, size: [f32; 2], scale: f32, pads: &[(usize, [f32; 2], [f32; 2])]) -> Layout {
+pub fn run(ui: &mut Ui, uic: &mut UiContext, root: usize, size: [f32; 2], scale: f32, pads: &[(usize, [f32; 2], [f32; 2])]) -> Layout { run_with(ui, uic, root, size, scale, pads, &[]) }
+pub fn run_with(ui: &mut Ui, uic: &mut UiContext, root: usize, size: [f32; 2], scale: f32, pads: &[(usize, [f32; 2], [f32; 2])], overlays: &[usize]) -> Layout {
     let n = ui.w.len();
     let mut lay = new_layout(n, scale);
     for _ in 0..2 {
@@ -358,6 +387,7 @@ pub fn run(ui: &mut Ui, uic: &mut UiContext, root: usize, size: [f32; 2], scale:
         let mut c = Ctx { ui, uic, lay };
         c.arrange(root, [0.0, 0.0, size[0], size[1]]);
         for &(p, a, pv) in pads { let d = c.desired(p); c.arrange(p, [a[0] - d[0] * pv[0], a[1] - d[1] * pv[1], d[0], d[1]]); }
+        for &o in overlays { c.arrange(o, [0.0, 0.0, size[0], size[1]]); }
         lay = c.lay;
     }
     lay

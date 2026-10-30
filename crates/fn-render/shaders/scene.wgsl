@@ -153,7 +153,7 @@ fn shade_ground(uv: vec2<f32>, world_pos: vec3<f32>, cam_pos: vec3<f32>) -> vec3
     let spec_color = vec3<f32>(0.08 * landscape_specular(grass_tex.a, 1.0));
     let spec = light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, sun_dir, LANDSCAPE_ROUGHNESS, spec_color) * vis;
     reflection_inputs(n, v, world_pos, spec_color, LANDSCAPE_ROUGHNESS, 1.0);   // REFLECTION APPLY (lit_common.wgsl), GBufferAO 1
-    return diffuse + spec;
+    return diffuse + spec + local_lighting(world_pos, n, v, albedo, spec_color, LANDSCAPE_ROUGHNESS, SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
 }
 
 // FALLBACK only (docs/spec/smallfix_followups.md section 3): CharacterShader-owned sections run the original DXBC (`char_scene`), and with the original gun
@@ -194,6 +194,7 @@ fn shade_character(uv: vec2<f32>, world_normal: vec3<f32>, world_pos: vec3<f32>,
     // GGX with a colour F0: Schlick is linear in F0, spec(F0) = spec(0) + (spec(1) - spec(0)) * F0 (as shade_architect)
     // BRDF AUDIT: UE F_Schlick = saturate(50 * SpecularColor.g) * Fc + (1 - Fc) * SpecularColor (BRDF.usf:169), was Fc + (1 - Fc) * SpecularColor
     lit = lit + light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, sun_dir, roughness, spec_color) * vis;
+    lit = lit + local_lighting(world_pos, n, v, diffuse_color, spec_color, roughness, SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
     reflection_inputs(n, v, world_pos, spec_color, roughness, 1.0);   // SKY REFLECTION HOOK (lit_common.wgsl, applied by the deferred reflection pass), AO = 1 as above
     let nv = clamp(dot(n, v), 0.0, 1.0);
     // Skin Boost Color And Exponent (0.525,0.343875,0.367316, exp 2): fresnel-weighted subsurface-like lift.
@@ -229,7 +230,7 @@ fn shade_architect(uv: vec2<f32>, world_normal: vec3<f32>, world_pos: vec3<f32>,
     let spec = light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, sun_dir, roughness, spec_color) * vis;
     let emissive = max(to_linear(textureSample(t_mask, tex_samp, uv).rgb) * bitcast<f32>(material.kind.y), vec3<f32>(0.0));
     reflection_inputs(n, v, world_pos, spec_color, roughness, 1.0);   // SKY REFLECTION HOOK (lit_common.wgsl, applied by the deferred reflection pass)
-    return diffuse_color * light.sun_radiance.xyz * ndl * vis + amb_out + spec + emissive;
+    return diffuse_color * light.sun_radiance.xyz * ndl * vis + amb_out + spec + emissive + local_lighting(world_pos, n, v, diffuse_color, spec_color, roughness, SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
 }
 
 @fragment
@@ -286,6 +287,7 @@ fn fs_prop(in: VsOut) -> LitOut {
         let v = normalize(cam - in.world_pos);
         let spec_color = vec3<f32>(0.08 * DEFAULT_SPECULAR);
         lit = lit + light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, light.sun_dir.xyz, DEFAULT_ROUGHNESS, spec_color) * visibility;
+        lit = lit + local_lighting(in.world_pos, n, v, albedo, spec_color, DEFAULT_ROUGHNESS, SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
         reflection_inputs(n, v, in.world_pos, spec_color, DEFAULT_ROUGHNESS, 1.0);
     }
     return lit_out(output_hdr(lit, amb, in.world_pos, cam));

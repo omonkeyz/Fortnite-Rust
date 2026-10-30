@@ -127,6 +127,8 @@ pub struct GameSim {
     pub hull_map_cache: fn_props::HullMapCache,
     pub drop: Option<crate::drop_in::DropIn>,
     pub bus_jump_prev: bool,
+    pub dbno: bool,
+    pub ext_block_app: Option<&'static str>,
 }
 /// Movement mode of the F2 `fly` / `ghost` / `walk` cheats. PORT-ONLY dev tool: `Fly` keeps the pawn above the landscape, `Ghost` collides with nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,7 +142,7 @@ impl GameSim {
         let (x, y, z, yaw, pitch) = spawn();
         let mut g = GameSim { swing: Swing::default(), world: World::sandbox(), controller: Controller::default(), cam: Camera::default(), cam_view: View::default(), anim: AnimState::new(),
             x, y, z, yaw, pitch, crouch_camera: 0., anim_time: 0., locomotion_blend: 0., jump_stage: 0, state_time: 0.,
-            crouch_latch: ModeLatch::default(), sprint_latch: ModeLatch::default(), was_moving: false, melee_sprint: MeleeSprintGate::default(), reloading: false, sprint_cancels_reload: false, sprint_cancelled_reload: false, heal_anchor: None, heal_prev: (false, false), crouch_toggle: false, sprint_toggle: false, frame_dt: 0., frames: 0, frame_cam: None, tuning: Tuning::default(), arms: vec![], ads: Default::default(), cosmetics: Default::default(), speed_scale: 1., storm: Default::default(), building_hulls: vec![], door_hulls: vec![], terrain: None, fly: FlyMode::Walk, fall: Default::default(), prop_index: None, hull_map_cache: Default::default(), drop: None, bus_jump_prev: false };
+            crouch_latch: ModeLatch::default(), sprint_latch: ModeLatch::default(), was_moving: false, melee_sprint: MeleeSprintGate::default(), reloading: false, sprint_cancels_reload: false, sprint_cancelled_reload: false, heal_anchor: None, heal_prev: (false, false), crouch_toggle: false, sprint_toggle: false, frame_dt: 0., frames: 0, frame_cam: None, tuning: Tuning::default(), arms: vec![], ads: Default::default(), cosmetics: Default::default(), speed_scale: 1., storm: Default::default(), building_hulls: vec![], door_hulls: vec![], terrain: None, fly: FlyMode::Walk, fall: Default::default(), prop_index: None, hull_map_cache: Default::default(), drop: None, bus_jump_prev: false, dbno: false, ext_block_app: None };
         g.settle_anim(); // the pawn starts standing idle (old App::settle_anim, run once before the first frame of every path)
         g
     }
@@ -233,7 +235,7 @@ impl GameSim {
         let near = self.camera_prop_ids();
         let hulls = Self::camera_hulls(&self.building_hulls, &self.door_hulls); // DOORS: the pieces + the door leaves
         let world = Self::camera_world(&self.world.props, &near, &hulls, self.terrain());
-        let mode = self.drop_tick_mode().unwrap_or(self.ads.tick_mode());
+        let mode = self.drop_tick_mode().or(self.enhanced_camera().map(|c| c.0)).unwrap_or(self.ads.tick_mode());
         self.cam_view = self.cam.update(mode, camera::Input { feet, crouched: self.controller.crouched, yaw_deg: self.yaw, pitch_deg: self.pitch, dt }, world);
     }
     /// One animation-graph tick from the movement controller's state (the AnimBlueprint reads the pawn, never the keys): `input` is the
@@ -244,7 +246,60 @@ impl GameSim {
         let sample = PawnSample { velocity: (c.velocity.x, c.velocity.y), input: (input.x, input.y), facing_deg: self.yaw, camera_yaw_deg: self.yaw, camera_pitch_deg: self.pitch,
             height: c.air_height(), vertical_speed: c.vertical_speed, fall_time_left: c.fall_time_left(), crouched: c.crouched, running: c.running, melee_swinging: self.swing.stage > 0 };
         self.anim.step_sample(&sample, dt);
+        self.step_enhanced_anim(dt);
         self.controller.facing = self.anim.visual_yaw(self.yaw); // the visible body yaw is the graph's (Actor Yaw Offset), on every path that ticks the graph
+    }
+    fn step_enhanced_anim(&mut self, dt: f32) {
+        use fn_animgraph::enhanced_anim::{self as ea, EnhancedInput, MontageReq};
+        use fn_movement::enhanced::TacPhase;
+        if let Some(w) = self.controller.enhanced.as_mut().and_then(|e| e.hurdle.last_fail.take()) { eprintln!("[enhanced-anim] hurdle refused: {w}"); }
+        let Some(e) = self.controller.enhanced.as_ref().filter(|_| ea::clips_ready()) else { let i = EnhancedInput::default(); self.anim.enh.step(&i, dt, &ea::clip_length); return };
+        let c = self.controller.component();
+        let v = &self.anim.vars;
+        let mut montage_start = None;
+        if e.hurdle.count != self.anim.enh.seen.0 {
+            if let Some((_, t, _, _)) = e.hurdle.moving { montage_start = Some(MontageReq::Hurdle { montage: t.montage, far: t.far }); }
+        }
+        if e.clamber.count != self.anim.enh.seen.1 {
+            if let Some(m) = e.clamber.moving { montage_start = Some(MontageReq::Clamber { target_distance_z: m.height }); }
+        }
+        self.anim.enh.seen = (e.hurdle.count, e.clamber.count);
+        let jump_now = c.jumped != self.anim.enh.seen_jumps;
+        self.anim.enh.seen_jumps = c.jumped;
+        let (slope_pitch, slope_roll) = {
+            let n = if c.floor.blocking_hit { c.floor.hit.normal } else { glam::Vec3::Z };
+            let f = Vec3::new(c.facing.x, c.facing.y, 0.).normalize_or_zero();
+            let r = Vec3::new(-f.y, f.x, 0.);
+            (-n.dot(f).clamp(-1., 1.).asin().to_degrees(), n.dot(r).clamp(-1., 1.).asin().to_degrees())
+        };
+        let slide = c.slide.as_ref();
+        let slope = slide.map_or(0., |_| { let n = if c.floor.blocking_hit { c.floor.hit.normal } else { glam::Vec3::Z }; let vel = Vec2::new(c.velocity.x, c.velocity.y).normalize_or_zero(); let up = n.z.clamp(-1., 1.).acos().to_degrees(); if Vec2::new(n.x, n.y).dot(vel) > 0. { up } else { -up } });
+        let i = EnhancedInput {
+            enabled: true,
+            female: v.female,
+            tactical: ea::fullbody_tactical(e.tac.phase != TacPhase::Off, self.controller.running, slide.is_some(), v.is_accelerating_2d, !c.is_falling(), c.velocity.z > 0. && c.is_falling(), c.is_falling()),
+            in_air: c.is_falling(),
+            jumped: c.velocity.z > 0.,
+            sliding: slide.is_some(),
+            slide_slope_angle: slope,
+            slide_velocity_angle: v.local_velocity_yaw_angle.abs(),
+            slide_velocity_yaw: v.local_velocity_yaw_angle,
+            sprint_yaw: v.sprint_yaw_angle,
+            montage_start,
+            jump_now,
+            yaw_rate: if dt > 1e-6 { v.yaw_delta_current_tick / dt } else { 0. },
+            yaw_delta: v.yaw_delta_smoothed,
+            speed2d: v.speed2d,
+            lean_alpha: v.lean_additive_alpha,
+            weapon: v.weapon_core_anim,
+            slope_pitch,
+            slope_roll,
+            moving: v.is_moving_2d,
+            lateral_accel: v.local_acceleration[1],
+        };
+        let before = self.anim.enh.state_key();
+        self.anim.enh.step(&i, dt, &ea::clip_length);
+        if self.anim.enh.state_key() != before { eprintln!("[enhanced-anim] {}", self.anim.enh.describe()); }
     }
     /// Montages by slot: Melee_Equip on UpperBody; the pickaxe swing on both of its slot tracks (standing-still clip on FullBodyInPlace,
     /// in-motion clip on UpperBody; the graph's ShouldBypassFullbodyInPlace blend picks between them).
@@ -296,6 +351,8 @@ impl GameSim {
     /// One fixed simulation tick of `h` seconds (the old `App::sim_tick`, minus the pose evaluation the renderer side adds): swing montage + its TriggerAbility hit
     /// trace, the movement controller (the CMC port), jump/fall stage, animation graph variables, camera smoothing + collision. Reads `self.yaw` / `self.pitch`.
     pub fn tick(&mut self, t: &TickInput, h: f32) {
+        let knocked = TickInput { crouch: false, run: false, jump: false, attack: false, ..*t };
+        let t = if self.dbno { &knocked } else { t };
         if self.drop_tick_aircraft(t, h) { self.cam_view.hide_pawn = true; return; }
         let swing_idle = self.swing.stage == 0;
         if let Some(Notify::TriggerAbility { .. }) = self.swing.step(t.attack, h) {
@@ -319,6 +376,7 @@ impl GameSim {
         self.sync_terrain(); // TERRAIN
         self.refresh_blockers();
         let sprint_blocked = self.ads.apply_speed(&mut self.controller); // ADS HOOK: targeting limits the speed stats to SpeedWalk and cancels sprint
+        if self.dbno { let p = &mut self.controller.component_mut().p; let s = fn_movement::params::SPEED_DBNO; p.speed_run = s; p.speed_sprint = s; p.speed_crouched_run = s; p.speed_crouched_sprint = s; }
         if self.speed_scale != 1. { let p = &mut self.controller.component_mut().p; p.speed_run *= self.speed_scale; p.speed_sprint *= self.speed_scale; p.speed_crouched_run *= self.speed_scale; p.speed_crouched_sprint *= self.speed_scale; } // F2 CONSOLE `speed`
         self.controller.actor_yaw = fn_movement::params::fixes_1p8().then_some(self.yaw);
         self.fall.before_step(self.controller.height, self.controller.airborne()); // FALL DAMAGE
@@ -326,7 +384,14 @@ impl GameSim {
         let (run, cancel_reload) = self.melee_sprint.step(t, gate, &mut self.sprint_latch, h);
         self.sprint_cancelled_reload |= cancel_reload;
         self.drop_before_step(t);
+        self.sync_enhanced(sprint_blocked);
+        let ext_before = self.controller.enhanced.as_ref().map(|e| (e.tac.phase, e.clamber.count, e.clamber.is_moving(), e.slider.count, self.controller.component().is_sliding(), e.hurdle.count, e.hurdle.is_moving()));
         self.controller.step(Vec2::new(dx, dz), t.jump, run && !sprint_blocked, h);
+        if let Some(e) = self.controller.enhanced.as_ref() {
+            let c = self.controller.component();
+            let now = (e.tac.phase, e.clamber.count, e.clamber.is_moving(), e.slider.count, c.is_sliding(), e.hurdle.count, e.hurdle.is_moving());
+            if ext_before != Some(now) { eprintln!("[enhanced] tac {:?} speed x{:.3} energy {:.1} end {:?} | clamber #{} moving {} | slide #{} active {} state {:?} end {:?} | hurdle #{} moving {} | v {:.0} cm/s feet {:.2} m", e.tac.phase, e.tac.speed_mult, e.tac.energy, e.tac.last_end, e.clamber.count, e.clamber.is_moving(), e.slider.count, c.is_sliding(), c.slide.map(|s| s.state), e.slider.last_end, e.hurdle.count, e.hurdle.is_moving(), Vec2::new(c.velocity.x, c.velocity.y).length(), self.controller.height); }
+        }
         self.drop_after_step();
         self.fall.after_step(self.controller.height, self.controller.airborne(), self.controller.landings()); // FALL DAMAGE
         self.crouch_camera = smooth_toward(self.crouch_camera, if self.controller.crouched { 0.5 } else { 0. }, 12., h);
@@ -402,7 +467,7 @@ impl GameSim {
         let near = self.camera_prop_ids();
         let hulls = Self::camera_hulls(&self.building_hulls, &self.door_hulls); // DOORS: the pieces + the door leaves
         let world = Self::camera_world(&self.world.props, &near, &hulls, self.terrain());
-        let mode = self.drop_tick_mode().unwrap_or(self.ads.tick_mode());
+        let mode = self.drop_tick_mode().or(self.enhanced_camera().map(|c| c.0)).unwrap_or(self.ads.tick_mode());
         self.cam.advance(mode, camera::Input { feet, crouched: self.controller.crouched, yaw_deg: self.yaw, pitch_deg: self.pitch, dt }, world);
     }
     /// What the renderer needs from the state after the last tick (position, floor height, visible facing, camera smoothing state); the driver adds poses.
@@ -419,11 +484,47 @@ impl GameSim {
         self.sync_prop_index();
         let near = self.camera_prop_ids();
         let hulls = Self::camera_hulls(&self.building_hulls, &self.door_hulls); // DOORS
-        let follow_mode = self.drop_tick_mode().unwrap_or(self.ads.tick_mode());
+        let follow_mode = self.drop_tick_mode().or(self.enhanced_camera().map(|c| c.0)).unwrap_or(self.ads.tick_mode());
         let st = if camera::frame_follow_on() { let f = camera::CamState::follow(follow_mode, self.frame_cam, &s.cam, feet, self.yaw, self.pitch, self.frame_dt); self.frame_cam = Some(f); f } else { s.cam };
         let world = Self::camera_world(&self.world.props, &near, &hulls, self.terrain());
         let dropped = if self.drop.is_some() { self.drop_compose_ref(&st, feet, &world) } else { None };
-        self.cam_view = match dropped { Some((v, fov)) => { self.ads.fov = fov; v } None => self.ads.compose(&st, feet, self.yaw, self.pitch, world) }; // ADS HOOK: hold view mixed with the ADS view (weight 0 = Camera::compose(MELEE))
+        let held_view = dropped.is_none();
+        self.cam_view = match dropped { Some((v, fov)) => { self.ads.fov = fov; v } None => self.ads.compose(&st, feet, self.yaw, self.pitch, &world) };
+        drop(world);
+        if held_view { self.apply_enhanced_view(&st, feet); } // ADS HOOK: hold view mixed with the ADS view (weight 0 = Camera::compose(MELEE))
+    }
+    fn enhanced_camera(&self) -> Option<(&'static camera::Mode, f32)> {
+        if self.drop.is_some() || self.ads.active { return None; }
+        let e = self.controller.enhanced.as_ref()?;
+        if e.slider.camera_blend > 0. { return Some((&ENHANCED_SLIDING_CAMERA, e.slider.camera_blend)); }
+        if e.tac.camera_blend > 0. { return Some((&ENHANCED_TAC_SPRINT_CAMERA, e.tac.camera_blend)); }
+        None
+    }
+    fn apply_enhanced_view(&mut self, st: &camera::CamState, feet: Vec3) {
+        let Some(e) = self.controller.enhanced.as_ref() else { return };
+        let (slide_t, tac_shake) = (e.slider.shake_time, e.tac_shake);
+        if let Some((mode, w)) = self.enhanced_camera() {
+            self.sync_prop_index();
+            let near = self.camera_prop_ids();
+            let hulls = Self::camera_hulls(&self.building_hulls, &self.door_hulls);
+            let world = Self::camera_world(&self.world.props, &near, &hulls, self.terrain());
+            let v = camera::Camera::compose(mode, st, feet, self.yaw, self.pitch, world);
+            self.cam_view.eye = self.cam_view.eye.lerp(v.eye, w); self.cam_view.safe = self.cam_view.safe.lerp(v.safe, w); self.cam_view.desired = self.cam_view.desired.lerp(v.desired, w);
+            if w >= 0.5 { self.cam_view.hide_pawn = v.hide_pawn; }
+            self.ads.fov += (mode.fov - self.ads.fov) * w;
+        }
+        let mut loc = tac_shake.tac_loop_offset_cm();
+        if let Some(t) = slide_t { let (x, fov) = fn_movement::enhanced::slide_shake(t); loc.x += x; self.ads.fov += fov; }
+        let v = &mut self.cam_view;
+        v.eye += (v.forward * loc.x + v.right * loc.y + v.up * loc.z) * camera::CM;
+    }
+    fn sync_enhanced(&mut self, sprint_blocked: bool) {
+        static ENV_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = fn_movement::enhanced::enabled() || *ENV_ON.get_or_init(|| fn_live::var("FN_ENHANCED_MODE").is_ok_and(|v| v == "1"));
+        if on && self.controller.enhanced.is_none() { self.controller.enhanced = Some(Default::default()); }
+        if !on { self.controller.enhanced = None; return; }
+        if let Some(e) = self.controller.enhanced.as_mut() { e.sprint_toggle = self.sprint_toggle; }
+        self.controller.ext_block = if self.dbno { Some("DBNO or dead") } else if self.on_bus() || self.controller.component().is_skydiving() || self.controller.component().in_aerial_mode() { Some("on pawn aircraft") } else if sprint_blocked { Some("ability blocked") } else { self.ext_block_app };
     }
     /// The R key / a scripted reset: back to the spawn with a fresh controller.
     pub fn respawn(&mut self) { self.drop = None; self.to_spawn(); self.controller = self.new_controller(); self.sync_terrain(); self.stand_on_floor(); }
@@ -533,6 +634,19 @@ mod tests {
         let f = |i: u32| FrameInput { forward: if (30..200).contains(&i) { 1. } else { 0. }, side: if (100..140).contains(&i) { 1. } else { 0. }, jump: i == 80 || i == 150, sprint_key: (60..180).contains(&i), yaw_delta: if i < 90 { 1.5 } else { 0. }, ..Default::default() };
         let (a, b) = (run(300, f), run(300, f));
         assert_eq!((a.x.to_bits(), a.y.to_bits(), a.z.to_bits()), (b.x.to_bits(), b.y.to_bits(), b.z.to_bits())); assert_eq!(a.anim.describe(), b.anim.describe()); assert_eq!(format!("{:?}", a.cam_view), format!("{:?}", b.cam_view));
+    }
+    #[test] fn enhanced_camera_modes_blend_the_view_and_fov() {
+        let mut g = GameSim::new(); g.world.props.clear();
+        for _ in 0..30 { g.step(&FrameInput::default(), 1. / 60.); }
+        let s = g.snapshot(); g.apply_view(&s); let (eye0, fov0) = (g.cam_view.eye, g.ads.fov);
+        let mut e = fn_movement::enhanced::Enhanced::default(); e.tac.camera_blend = 1.;
+        g.controller.enhanced = Some(e); g.apply_view(&s);
+        assert!((g.ads.fov - ENHANCED_TAC_SPRINT_CAMERA.fov).abs() < 1e-4 && fov0 == 80., "{} {}", g.ads.fov, fov0);
+        assert!((g.cam_view.eye - eye0).length() > 0.05);
+        let mut e = fn_movement::enhanced::Enhanced::default(); e.slider.camera_blend = 1.; e.slider.shake_time = Some(0.6);
+        g.controller.enhanced = Some(e); g.apply_view(&s);
+        let (_, fov_shake) = fn_movement::enhanced::slide_shake(0.6);
+        assert!((g.ads.fov - (ENHANCED_SLIDING_CAMERA.fov + fov_shake)).abs() < 1e-3, "{}", g.ads.fov);
     }
     #[test] fn reset_returns_to_the_spawn() { let mut g = run(60, |_| FrameInput { forward: 1., ..Default::default() }); g.step(&FrameInput { reset: true, ..Default::default() }, 1. / 60.); assert_eq!((g.x, g.z, g.yaw), (0., 12., 0.)); assert_eq!(g.controller.position, Vec2::ZERO); }
     /// The edge of the world stops the pawn (the plate here: no landscape in a unit-test binary; `the_landscape_is_the_ground_*` covers the landscape edge).
@@ -644,3 +758,25 @@ mod tests {
         assert!(!g.controller.running && !g.sprint_latch.active(), "a swing ends a toggled sprint");
     }
 }
+
+pub const ENHANCED_TAC_SPRINT_CAMERA: camera::Mode = camera::Mode {
+    name: "Athena_PlayerCameraMode_TacticalSprint", fov: 95., forward_distance: -250.,
+    origin_interp: [14., 60., 60.],
+    vt_offset: &[camera::Sample { pitch: 0., offset: [86., 52., 55.] }],
+    vt_offset_crouch: &[camera::Sample { pitch: 0., offset: [38., 31., 30.] }],
+    vt_interp: [12., 12., 12.],
+    cs_offset: &[camera::Sample { pitch: 0., offset: [0., 0., 0.] }, camera::Sample { pitch: 90., offset: [0., 0., 150.] }, camera::Sample { pitch: -90., offset: [25., 0., -85.] }, camera::Sample { pitch: 45., offset: [-45., 0., 65.] }, camera::Sample { pitch: -45., offset: [15., 0., -30.] }],
+    hide_pawn_pct: 0.15, transition_time: 0.8,
+    ..camera::BASE
+};
+
+pub const ENHANCED_SLIDING_CAMERA: camera::Mode = camera::Mode {
+    name: "Athena_PlayerCameraMode_Sliding", fov: 90.,
+    origin_interp: [60., 1.0e9, 60.],
+    vt_offset: &[camera::Sample { pitch: 0., offset: [38., 65., -5.] }],
+    vt_offset_crouch: &[camera::Sample { pitch: 0., offset: [38., 45., 10.] }],
+    vt_interp: [8., 8., 8.],
+    cs_offset: &[camera::Sample { pitch: 0., offset: [0., 0., 0.] }, camera::Sample { pitch: 90., offset: [30., 0., 100.] }, camera::Sample { pitch: -90., offset: [50., 0., -20.] }],
+    hide_pawn_pct: 0.31,
+    ..camera::BASE
+};

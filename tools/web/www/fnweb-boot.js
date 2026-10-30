@@ -2,8 +2,8 @@
 // created later only starts once the main thread yields, and std::thread::spawn + join on the main thread would deadlock), the console drain.
 import init, * as wasm from './pkg/__FNWEB_LIB__.js';
 
-// bytes per pool thread: Rust gives spawned threads 2 MiB natively; wasm frames run a little larger and there is no guard page, so 4 MiB
-export const WORKER_STACK = 4 << 20;
+// bytes per pool thread: the 2 MiB Rust gives spawned threads natively
+export const WORKER_STACK = 2 << 20;
 
 export async function boot({ workers, onStatus = () => {}, onFatal = () => {} } = {}) {
     if (!crossOriginIsolated) throw new Error('the page is not cross-origin isolated (COOP/COEP headers missing): open it through fortnite-web.exe');
@@ -15,8 +15,8 @@ export async function boot({ workers, onStatus = () => {}, onFatal = () => {} } 
             P[m] = function (d) { const t = performance.now(); const r = orig.call(this, d); console.log('[pipe] ' + m + ' ' + (d && d.label || '?') + ' at ' + (t / 1000).toFixed(2) + ' s, ' + (performance.now() - t).toFixed(1) + ' ms'); return r; };
         }
     }
-    // initial 256 MiB, may grow to the full 4 GiB wasm32 address space
-    const memory = new WebAssembly.Memory({ initial: 4096, maximum: 65536, shared: true });
+    // initial 1 GiB, may grow to the full 4 GiB wasm32 address space
+    const memory = new WebAssembly.Memory({ initial: 16384, maximum: 65536, shared: true });
     onStatus('compiling the game module');
     const t0 = performance.now();
     // compile once; the same WebAssembly.Module instantiates the main thread and every worker
@@ -24,6 +24,10 @@ export async function boot({ workers, onStatus = () => {}, onFatal = () => {} } 
     const compileMs = performance.now() - t0;
     await init({ module_or_path: module, memory });
 
+    const io = new Worker(new URL('./worker.js', import.meta.url), { type: 'module', name: 'fnweb-io' });
+    io.onmessage = (e) => { const d = e.data || {}; if (d.fnweb === 'error') onFatal(d.text); };
+    io.onerror = (e) => { e.preventDefault?.(); onFatal('I/O worker crashed: ' + (e.message || e)); };
+    io.postMessage({ fnweb: 'io', module, memory, stack: WORKER_STACK });
     const pool = [];
     let started = 0;
     const spawn = () => new Promise((resolve, reject) => {
@@ -40,7 +44,9 @@ export async function boot({ workers, onStatus = () => {}, onFatal = () => {} } 
             else if (d.fnweb === 'error') { onFatal('worker ' + index + ': ' + d.text); reject(new Error(d.text)); }
         };
         w.onerror = (e) => { e.preventDefault?.(); try { wasm.fnweb_drain_log(); } catch (_) {} onFatal('worker ' + index + ' crashed: ' + (e.message || e)); };
-        w.postMessage({ fnweb: 'start', module, memory, index, stack: WORKER_STACK });
+        const ch = new MessageChannel();
+        io.postMessage({ fnweb: 'io-port', port: ch.port1 }, [ch.port1]);
+        w.postMessage({ fnweb: 'start', module, memory, index, stack: WORKER_STACK, io: ch.port2 }, [ch.port2]);
     });
     const grow = (n) => { for (let i = 0; i < n; i++) spawn().catch(() => {}); console.log('[fnweb] pool: +' + n + ' workers (now ' + pool.length + ')'); };
     globalThis.__fnweb_grow_pool = grow;
@@ -50,5 +56,5 @@ export async function boot({ workers, onStatus = () => {}, onFatal = () => {} } 
     await Promise.all(Array.from({ length: n }, spawn));
     setInterval(() => { try { wasm.fnweb_drain_log(); } catch (_) {} }, 50);
     console.log('[fnweb] module compiled in ' + compileMs.toFixed(0) + ' ms, ' + started + ' pool workers ready');
-    return { wasm, memory, module, pool };
+    return { wasm, memory, module, pool, io };
 }

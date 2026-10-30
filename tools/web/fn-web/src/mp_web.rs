@@ -19,3 +19,23 @@ pub fn send(bytes: &[u8]) {
 pub fn feed(text: &str) {
     if let Some(f) = page_fn("__fnweb_mp_feed") { let _ = f.call1(&JsValue::NULL, &text.into()); }
 }
+
+pub fn send_text(json: &str) -> bool {
+    page_fn("__fnweb_mp_text_send").and_then(|f| f.call1(&JsValue::NULL, &json.into()).ok()).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+pub fn create(name: &str) -> bool {
+    page_fn("__fnweb_mp_create").map(|f| f.call1(&JsValue::NULL, &name.into()).is_ok()).unwrap_or(false)
+}
+
+pub fn join(code: &str, name: &str) -> bool {
+    page_fn("__fnweb_mp_join").map(|f| f.call2(&JsValue::NULL, &code.into(), &name.into()).is_ok()).unwrap_or(false)
+}
+
+pub fn peek(code: &str) -> bool {
+    page_fn("__fnweb_mp_peek").map(|f| f.call1(&JsValue::NULL, &code.into()).is_ok()).unwrap_or(false)
+}
+
+pub fn leave() {
+    if let Some(f) = page_fn("__fnweb_mp_leave") { let _ = f.call0(&JsValue::NULL); }
+}

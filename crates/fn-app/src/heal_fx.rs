@@ -47,6 +47,7 @@ struct State {
     head: Option<(Vec3, f32)>, eye: Vec3, serial: u64, errors: std::collections::HashSet<String>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Loads `<root>/particles-healfx` (or `FN_HEALFX_DIR`); `install` = the 1.8 install whose paks hold the cooked materials.
 pub fn init(install: Option<PathBuf>, roots: &[PathBuf]) {
@@ -61,6 +62,7 @@ pub fn init(install: Option<PathBuf>, roots: &[PathBuf]) {
         None => { eprintln!("[healfx] no `particles-healfx` folder in the asset roots (fn-particles-export --out <assets>/particles-healfx /Game/Effects/Fort_Effects/Gameplay/P_Consume_Item): no heal FX"); None }
     };
     if install.is_none() { eprintln!("[healfx] no install (paks): the heal FX materials cannot be built, nothing drawn"); }
+    WARMED.store(false, std::sync::atomic::Ordering::Relaxed);
     *STATE.lock().unwrap() = Some(State { catalog, install, dxbc: None, live: vec![], pending: vec![], head: None, eye: Vec3::ZERO, serial: 0, errors: Default::default() });
 }
 
@@ -121,6 +123,7 @@ pub fn on_head_pose(head_ue: Vec3, yaw_deg: f32, eye_ue: Vec3) {
 
 /// FIRST USE: opens the paks and builds the materials of `P_Consume_Item` under the loading screen (one throw-away frame).
 pub fn prebuild(fx: &mut FxRenderer) {
+    if WARMED.load(std::sync::atomic::Ordering::Relaxed) { return; }
     let Ok(mut g) = STATE.lock() else { return };
     let Some(st) = g.as_mut() else { return };
     let Some(cat) = st.catalog.clone() else { return };
@@ -134,6 +137,7 @@ pub fn prebuild(fx: &mut FxRenderer) {
         draw(dx, fx, &cat, &i, [0., 2., 3.], 1. / 60., &mut st.errors);
     }
     let _ = dx.take_frame();
+    WARMED.store(true, std::sync::atomic::Ordering::Relaxed);
     eprintln!("[healfx] warm-up: P_Consume_Item materials built in {:.0} ms", t.elapsed().as_secs_f32() * 1000.);
 }
 

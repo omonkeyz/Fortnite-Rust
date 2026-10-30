@@ -15,17 +15,29 @@ use std::sync::Arc;
 
 pub const NEAR_CM: f32 = 10.0;
 pub const FAR_CM: f32 = 6_000_000.0;
-const MAX_LIGHTS: usize = 64;
+const MAX_LIGHTS: usize = 128;
+const MAX_SCENE_LIGHTS: usize = 256;
 const PRIM_STRIDE: u64 = 512;
 const SHADOW_SIZE: u32 = 4096;
 const PT_SHADOW_SIZE: u32 = 1024;
 const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const GRID_CAM_BACK_CM: f32 = 130.0;
+const GRID_CAM_UP_CM: f32 = 110.0;
+const GRID_CAM_AIM_CM: f32 = 580.0;
+const GRID_CAM_AIM_PER_ROW_CM: f32 = 150.0;
+const GRID_CAM_RATE: f32 = 3.0;
+const GRID_CAM_AIM_DROP_CM: f32 = 20.0;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub const HDR_FORMAT: wgpu::TextureFormat = HDR;
 const PI_F: f32 = std::f32::consts::PI;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = DEPTH;
 
+#[derive(Clone, Debug)]
+pub struct VolSprite { pub material: String, pub pos_cm: Vec3, pub size_cm: [f32; 2], pub rotation: f32, pub pivot: [f32; 2], pub camera_facing: bool }
+
 pub trait LobbyTranslucent {
+    fn advance(&mut self, _time: f32) {}
+    fn volume_sprites(&self, _eye_cm: Vec3) -> Vec<VolSprite> { vec![] }
     fn prepare(&mut self, cam: &CameraFrame, time: f32, depth_only: &wgpu::TextureView, depth_gen: u64, light: &[[f32; 4]; 10]);
     fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>);
     fn draw_opaque<'a>(&'a self, _pass: &mut wgpu::RenderPass<'a>) {}
@@ -70,7 +82,9 @@ impl CameraFrame {
 // ---------------------------------------------------------------------------------------------------------------------------------
 // CPU assets
 // ---------------------------------------------------------------------------------------------------------------------------------
-pub struct TexAsset { pub levels: Vec<(u32, u32, Vec<u8>)>, pub srgb: bool, pub filter: String, pub address: String }
+pub struct TexAsset { pub levels: Vec<(u32, u32, Vec<u8>)>, pub srgb: bool, pub filter: String, pub address: String, pub bc: Option<(BcFormat, Vec<Vec<u8>>)> }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BcFormat { Bc1, Bc3, Bc4, Bc5 }
 
 pub struct MeshAsset {
     pub path: String,
@@ -80,7 +94,10 @@ pub struct MeshAsset {
     pub radius: f32,
     /// Cooked `UStaticMesh` bounds (render-data `Bounds`, UE cm): the Primitive buffer's bounds.
     pub bounds: fn_render::primitive_ub::BoxSphereBounds,
+    pub df: Option<Arc<fn_render::distance_field::MeshDistanceField>>,
 }
+
+pub struct VolumeAsset { pub material_path: String, pub material: Arc<fn_fx::material::Material>, pub textures: Vec<Option<(TexAsset, i32)>> }
 
 /// 9 real SH coefficients (RGB) of the sky light cubemap radiance, times the light's intensity.
 #[derive(Clone, Debug, Default)]
@@ -130,6 +147,7 @@ pub struct LobbyAssets {
     pub sky: SkySh,
     pub lut: Option<TexAsset>,
     pub character: Option<CharAsset>,
+    pub volumes: Vec<VolumeAsset>,
     pub report: SceneReport,
 }
 
@@ -145,17 +163,38 @@ fn load_texture(set: &fn_pak::PakSet, path: &str) -> Result<TexAsset, String> {
     let mut levels = vec![];
     let mips = t.available_mips();
     let first = *mips.first().ok_or_else(|| format!("{long}: no mip"))?;
-    let mut expect: Option<(u32, u32)> = None;
-    for i in mips {
-        if i < first { continue; }
-        let img = t.decode(i, fn_texture::DecodeOptions::default()).map_err(|e| format!("{long}: mip {i}: {e}"))?;
-        let (w, h) = (img.width as u32, img.height as u32);
-        if let Some((pw, ph)) = expect { if w != (pw / 2).max(1) || h != (ph / 2).max(1) { break; } }
-        expect = Some((w, h));
-        levels.push((w, h, img.to_rgba8()));
-    }
     let filter = t.props.text("Filter").map(|s| s.rsplit("::").next().unwrap_or(s).to_owned()).unwrap_or_else(|| "TF_Default".into());
-    Ok(TexAsset { levels, srgb: t.srgb, filter, address: t.address_x.clone() })
+    let mut expect: Option<(u32, u32)> = None;
+    let chain: Vec<usize> = mips.iter().copied().filter(|&i| i >= first).take_while(|&i| {
+        let (w, h) = (t.mips[i].width as u32, t.mips[i].height as u32);
+        let ok = expect.map_or(true, |(pw, ph)| w == (pw / 2).max(1) && h == (ph / 2).max(1));
+        if ok { expect = Some((w, h)); }
+        ok
+    }).collect();
+    if let Some(bc) = native_blocks(&t, first, chain.len()).filter(|_| chain.first() == Some(&first) && chain.windows(2).all(|w| w[1] == w[0] + 1)) {
+        let levels = chain.iter().map(|&i| (t.mips[i].width as u32, t.mips[i].height as u32, Vec::new())).collect();
+        return Ok(TexAsset { levels, srgb: t.srgb, filter, address: t.address_x.clone(), bc: Some(bc) });
+    }
+    for i in chain {
+        let img = t.decode(i, fn_texture::DecodeOptions::default()).map_err(|e| format!("{long}: mip {i}: {e}"))?;
+        levels.push((img.width as u32, img.height as u32, img.to_rgba8()));
+    }
+    Ok(TexAsset { levels, srgb: t.srgb, filter, address: t.address_x.clone(), bc: None })
+}
+
+fn native_blocks(t: &fn_texture::Texture2D, first: usize, count: usize) -> Option<(BcFormat, Vec<Vec<u8>>)> {
+    let (fmt, block) = match t.format { fn_texture::PixelFormat::Dxt1 => (BcFormat::Bc1, 8), fn_texture::PixelFormat::Dxt5 => (BcFormat::Bc3, 16), fn_texture::PixelFormat::Bc4 => (BcFormat::Bc4, 8), fn_texture::PixelFormat::Bc5 => (BcFormat::Bc5, 16), _ => return None };
+    if t.num_slices != 1 { return None; }
+    let base = t.mips.get(first)?;
+    if base.width % 4 != 0 || base.height % 4 != 0 { return None; }
+    let mut out = Vec::with_capacity(count);
+    for m in t.mips.iter().skip(first).take(count) {
+        let need = m.width.div_ceil(4) * m.height.div_ceil(4) * block;
+        let d = m.data()?;
+        if d.len() < need { return None; }
+        out.push(d[..need].to_vec());
+    }
+    Some((fmt, out))
 }
 
 /// Real SH (order 2) of a cube map's radiance (UE cube face convention = the D3D one applied to UE world axes), lower hemisphere black.
@@ -205,7 +244,17 @@ fn mesh_asset(set: &fn_pak::PakSet, path: &str) -> Result<MeshAsset, String> {
     let lod = m.lods.first().ok_or("no LOD")?.clone();
     let (mn, mx) = m.position_bounds(0).unwrap_or(([0.; 3], [0.; 3]));
     let (mn, mx) = (Vec3::from(mn), Vec3::from(mx));
-    Ok(MeshAsset { path: path.to_owned(), lod, default_materials: m.materials.iter().map(|x| x.material.clone()).collect(), center: (mn + mx) * 0.5, radius: ((mx - mn) * 0.5).length(), bounds: fn_render::primitive_ub::BoxSphereBounds { origin: m.bounds.origin, extent: m.bounds.extent, radius: m.bounds.radius } })
+    let df = m.distance_fields.first().cloned().flatten().and_then(|d| {
+        let (raw, fmt) = d.texels()?;
+        if !matches!(fmt, fn_mesh::static_mesh::DistanceFieldFormat::G8) { return None; }
+        let f = fn_render::distance_field::MeshDistanceField {
+            size: [d.size[0].max(0) as u32, d.size[1].max(0) as u32, d.size[2].max(0) as u32], texels: raw, box_min: d.local_box_min, box_max: d.local_box_max,
+            distance_min_max: d.distance_min_max, built_as_if_two_sided: d.built_as_if_two_sided, mesh_was_plane: d.mesh_was_plane,
+            self_shadow_bias: fn_render::distance_field::ue::DEFAULT_SELF_SHADOW_BIAS, affects_distance_field_lighting: true,
+        };
+        f.is_valid().then(|| Arc::new(f))
+    });
+    Ok(MeshAsset { path: path.to_owned(), lod, default_materials: m.materials.iter().map(|x| x.material.clone()).collect(), center: (mn + mx) * 0.5, radius: ((mx - mn) * 0.5).length(), bounds: fn_render::primitive_ub::BoxSphereBounds { origin: m.bounds.origin, extent: m.bounds.extent, radius: m.bounds.radius }, df })
 }
 
 impl LobbyAssets {
@@ -214,7 +263,7 @@ impl LobbyAssets {
         // the hero (parts + every AnimBP clip) decodes on its own thread while the scene's static assets decode on the others
         let t0 = std::time::Instant::now();
         let (character, built) = std::thread::scope(|s| {
-            let h = s.spawn(|| { let t = std::time::Instant::now(); let r = load_character(&set, hero); eprintln!("[scene-load] hero + AnimBP clips {:.2} s", t.elapsed().as_secs_f32()); r });
+            let h = s.spawn(|| { let t = std::time::Instant::now(); let r = load_character(&set, hero); if let Ok(c) = &r { premips_char(&c.parts); } eprintln!("[scene-load] hero + AnimBP clips {:.2} s", t.elapsed().as_secs_f32()); r });
             let built = (|| { let data = world::read_lobby_scene_from(&set)?; eprintln!("[scene-load] map data {:.2} s", t0.elapsed().as_secs_f32()); Self::from_data(&set, data, None, SceneReport::default()) })();
             (h.join().unwrap_or_else(|_| Err("character loader panicked".into())), built)
         });
@@ -294,7 +343,27 @@ impl LobbyAssets {
         for (tp, r) in tex_paths.iter().zip(tex_res) { match r { Ok(t) => { textures.insert(tp.clone(), t); } Err(e) => report.lines.push(format!("texture {tp}: {e}")) } }
         if let Some(r) = sky_res { match r { Ok(Ok(s)) => sky = s, Ok(Err(e)) => report.lines.push(format!("sky light cubemap: {e}")), Err(_) => report.lines.push("sky light cubemap: panicked".into()) } }
         let lut = match lut_res { Some(Ok(Ok(t))) => Some(t), Some(Ok(Err(e))) => { report.lines.push(format!("LUT {}: {e}", lut_path.unwrap_or(""))); None } _ => None };
-        eprintln!("[scene-load]   textures ({}) + sky + LUT {:.2} s", tex_paths.len(), t.elapsed().as_secs_f32());        Ok(LobbyAssets { data, meshes, materials, textures, sky, lut, character, report })
+        eprintln!("[scene-load]   textures ({}) + sky + LUT {:.2} s", tex_paths.len(), t.elapsed().as_secs_f32());
+        let mut volumes: Vec<VolumeAsset> = vec![];
+        let mut systems: Vec<String> = vec![];
+        for p in data.particles.iter().filter(|p| p.visible && p.auto_activate) {
+            let Some(tp) = p.template.as_deref() else { continue };
+            let pkg = tp.split('.').next().unwrap_or(tp).to_owned();
+            if systems.contains(&pkg) { continue; }
+            systems.push(pkg.clone());
+            let Ok(sys) = fn_particles::import::import_system(set, &pkg) else { continue };
+            for e in &sys.emitters {
+                let Some(lod) = e.lods.first() else { continue };
+                let mp = lod.required.material.clone();
+                if mp.is_empty() || volumes.iter().any(|v| v.material_path == mp) { continue; }
+                let Ok(mat) = fn_fx::material::Material::load(set, &mp) else { continue };
+                if mat.flags.domain != "MD_Volume" { continue; }
+                let textures = (0..mat.uniform.textures2d.len()).map(|k| mat.texture_slot(k).and_then(|(tp, src)| match load_texture(set, &tp) { Ok(t) => Some((t, src)), Err(e) => { report.lines.push(format!("volume texture {tp}: {e}")); None } })).collect();
+                report.lines.push(format!("volume-domain material {mp} (emitter {} of {pkg}): voxelized into the volumetric fog", e.name));
+                volumes.push(VolumeAsset { material_path: mp, material: Arc::new(mat), textures });
+            }
+        }
+        Ok(LobbyAssets { data, meshes, materials, textures, sky, lut, character, volumes, report })
     }
 }
 
@@ -327,7 +396,56 @@ pub struct HeroParts { pub hero: String, pub parts: Vec<fn_pose::br_character::B
 pub fn load_hero_parts(set: &fn_pak::PakSet, hero: &str) -> Result<HeroParts, String> {
     let ch = fn_pose::br_character::BrCharacter::load(&fn_pose::ClipSourceDir::Pak(set), hero)?;
     let female_clips = if ch.female { Some(lobby_female_clips(set)?) } else { None };
+    clear_hero_mips();
+    for bp in ch.parts.iter().take(2) {
+        for sec in &bp.sections {
+            if sec.hidden.is_some() { continue; }
+            if let (Some(ue), Some(d), Some(n), Some(sp), Some(m)) = (&sec.ue, &sec.diffuse, &sec.normal, &sec.spec, &sec.mask) {
+                let _ = (mips_for(d, true), mips_for(n, false), mips_for(sp, false), mips_for(m, false), mips_for(&ue.noise.tex, ue.noise.srgb));
+            }
+        }
+    }
     Ok(HeroParts { hero: ch.hero.clone(), notes: ch.notes.clone(), parts: ch.parts, female_clips })
+}
+
+pub fn clear_hero_mips() { if let Ok(mut g) = MIP_CACHE.lock() { *g = None; } }
+pub fn clear_hero_views() { VIEW_CACHE.with(|c| c.borrow_mut().clear()); }
+thread_local! { static VIEW_CACHE: std::cell::RefCell<HashMap<(u64, usize, bool), wgpu::TextureView>> = std::cell::RefCell::new(HashMap::new()); }
+fn tex_key(t: &fn_pose::br_character::RgbaTexture, srgb: bool) -> (u64, usize, bool) {
+    let b = &t.rgba;
+    let mut h: u64 = 0xcbf29ce484222325 ^ (t.width as u64) << 32 ^ t.height as u64;
+    let n = b.len();
+    for k in 0..256usize { let i = if n == 0 { 0 } else { (k * 2654435761usize) % n }; h = (h ^ b.get(i).copied().unwrap_or(0) as u64).wrapping_mul(0x100000001b3); }
+    (h, n, srgb)
+}
+static MIP_CACHE: std::sync::Mutex<Option<HashMap<(u64, usize, bool), Arc<Vec<image::RgbaImage>>>>> = std::sync::Mutex::new(None);
+fn premips_char(bparts: &[fn_pose::br_character::BrPart]) {
+    for bp in bparts.iter().take(2) {
+        for sec in &bp.sections {
+            if let (Some(ue), Some(d), Some(n), Some(s), Some(m)) = (&sec.ue, &sec.diffuse, &sec.normal, &sec.spec, &sec.mask) {
+                let _ = (mips_for(d, true), mips_for(n, false), mips_for(s, false), mips_for(m, false), mips_for(&ue.noise.tex, ue.noise.srgb));
+            }
+        }
+    }
+}
+fn mips_for(t: &fn_pose::br_character::RgbaTexture, srgb: bool) -> Option<Arc<Vec<image::RgbaImage>>> {
+    let key = tex_key(t, srgb);
+    if let Some(v) = MIP_CACHE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).cloned())) { return Some(v); }
+    let img = image::RgbaImage::from_raw(t.width as u32, t.height as u32, t.rgba.clone())?;
+    let levels = Arc::new(if srgb { fn_render::static_mesh::build_mips_srgb(&img, None) } else { fn_render::texture::build_mips(&img, fn_render::texture::MipFilter::Triangle) });
+    if let Ok(mut g) = MIP_CACHE.lock() { g.get_or_insert_with(HashMap::new).insert(key, levels.clone()); }
+    Some(levels)
+}
+fn upload_levels(device: &wgpu::Device, queue: &wgpu::Queue, levels: &[image::RgbaImage], srgb: bool, label: &str) -> wgpu::TextureView {
+    let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
+    let texture = device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: wgpu::Extent3d { width: levels[0].width(), height: levels[0].height(), depth_or_array_layers: 1 }, mip_level_count: levels.len() as u32, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2, format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[] });
+    for (i, level) in levels.iter().enumerate() {
+        if DEFER_UPLOADS.with(|d| d.get()) { write_level(queue, &texture, i as u32, level.as_raw(), 4 * level.width(), level.height(), wgpu::Extent3d { width: level.width(), height: level.height(), depth_or_array_layers: 1 }); continue; }
+        queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, level.as_raw(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * level.width()), rows_per_image: Some(level.height()) }, wgpu::Extent3d { width: level.width(), height: level.height(), depth_or_array_layers: 1 });
+    }
+    texture.create_view(&Default::default())
 }
 
 /// What a worker thread needs to upload a hero to the GPU (`LobbyScene::hero_builder`): cheap handles of the scene's device / queue / character bind layouts. The upload
@@ -359,6 +477,7 @@ pub fn load_character_asset(set: &fn_pak::PakSet, hero: &str) -> Result<CharAsse
     // `Fortnite_M_Avg_Player_AnimBlueprint`; the lobby pawn plays that AnimBP's idle (the port's `fn_animgraph::AnimState`, the same graph the game runs). All clips the graph can
     // ask for are loaded.
     let mut names = fn_animgraph::required_clips();
+    names.extend(lobby_core_clips());
     names.sort();
     names.dedup();
     let clips = fn_pose::ClipStore::load(&src, &names, &skel, fn_pose::SampleMode::Ue)?;
@@ -431,12 +550,31 @@ enum GroupEntry { Prim { binding: u32, size: u64, buf: wgpu::Buffer }, Buf { bin
 
 struct MeshGpu { vb: wgpu::Buffer, ib: wgpu::Buffer, pairs: usize, sections: Vec<(usize, u32, u32)>, shadow_ok: bool }
 
-struct DrawItem { mesh: usize, material_key: usize, first: u32, count: u32, prim: u64, pos: Vec3, sort_priority: i32, shadow: bool, translucent: bool }
+struct DrawItem { mesh: usize, material_key: usize, first: u32, count: u32, prim: u64, pos: Vec3, sort_priority: i32, shadow: bool, pt_shadow: bool, translucent: bool, pad: Option<(i32, usize, usize)>, grid: u16, clear: u16 }
 
 struct CharGpu { parts: Vec<CharPartGpu>, cam_bg: wgpu::BindGroup, shadow_bg: wgpu::BindGroup, empty_bg: wgpu::BindGroup, orig_pipe: wgpu::RenderPipeline,
     /// kept so `LobbyScene::set_character` can rebuild the part buffers without recompiling the pipelines
     char_layout: wgpu::BindGroupLayout, orig_layout: wgpu::BindGroupLayout, samp: wgpu::Sampler, model: Mat4 }
 struct CharPartGpu { prims: Vec<CharPrimGpu>, bones: wgpu::Buffer }
+
+const JOIN_LIGHTS: [&str; 2] = ["TopSpotLight", "RimSpotLight"];
+const PAD_LIGHTS: [&str; 6] = ["TopSpotLight", "RimSpotLight", "UnderlightBluePoint01", "UnderlightBluePoint02", "UnderlightBlue01", "UnderlightBlue02"];
+
+struct PartyPawn { player_id: i32, hero: String, rig: fn_pose::CharacterRig, gpu: Vec<CharPartGpu>, female_clips: Option<Arc<fn_pose::ClipStore>>, pose: fn_pose::CharacterPose, anim: Option<(fn_animgraph::AnimState, f32)>, t0: f32 }
+
+fn pose_pawn(queue: &wgpu::Queue, rig: &fn_pose::CharacterRig, clips: &fn_pose::ClipStore, female: Option<&fn_pose::ClipStore>, anim: &mut Option<(fn_animgraph::AnimState, f32)>, ct: f32, pose: &mut fn_pose::CharacterPose, gpu: &[CharPartGpu]) {
+    if anim.as_ref().is_some_and(|(_, t)| *t > ct + 1e-4) { *anim = None; }
+    let (st, st_t) = anim.get_or_insert_with(|| (fn_animgraph::AnimState::new(), 0.0));
+    let input = fn_animgraph::PawnInput { weapon: lobby_weapon(), ..fn_animgraph::PawnInput::default() };
+    st.set_female(female.is_some());
+    while *st_t + 1.0 / 60.0 <= ct { st.step(&input, 1.0 / 60.0); *st_t += 1.0 / 60.0; }
+    if fn_live::var("FN_LOBBY_NOIK").is_ok() { st.vars.right_hand_ik_alpha = 0.0; st.vars.left_hand_ik_alpha = 0.0; }
+    let tree = st.plan(&[]);
+    rig.evaluate_into(&tree, &FemaleLayer(clips, female), pose);
+    for (pi, part) in gpu.iter().enumerate() {
+        if let Some(pr) = pose.parts.get(pi) { queue.write_buffer(&part.bones, 0, &pr.gpu_bytes()); }
+    }
+}
 /// `bind` = diffuse-only group (shadow pass + fallback shading); `orig` = the original character material's resources (group 0 of `CharGpu::orig_pipe`).
 struct CharPrimGpu { vb: wgpu::Buffer, ib: wgpu::Buffer, count: u32, bind: wgpu::BindGroup, orig: Option<wgpu::BindGroup> }
 
@@ -469,6 +607,10 @@ pub struct LobbyScene {
     // statics
     meshes: Vec<MeshGpu>,
     mat_pipes: Vec<MatPipe>,
+    shadow_mat_pipes: Vec<Option<MatPipe>>,
+    prepass_pipes: Vec<Option<MatPipe>>,
+    shadow_view_buf: wgpu::Buffer,
+    group3_shadow: wgpu::BindGroup,
     mat_bufs: Vec<wgpu::Buffer>,
     textures: Vec<(wgpu::Texture, wgpu::TextureView)>,
     samplers: Vec<wgpu::Sampler>,
@@ -477,6 +619,7 @@ pub struct LobbyScene {
     char_pipe: Option<wgpu::RenderPipeline>,
     char_shadow_pipe: Option<wgpu::RenderPipeline>,
     char_asset: Option<CharAsset>,
+    char_parts_pending: bool,
     char_gpu: Option<CharGpu>,
     char_xf: Option<Xf>,
     char_pose: fn_pose::CharacterPose,
@@ -496,15 +639,99 @@ pub struct LobbyScene {
     targets: Option<Targets>,
     camera: Xf,
     fov: f32,
+    base_camera: Xf,
+    grid_mask: u16,
+    grid_rows_cur: f32,
+    grid_rows_target: f32,
     sun: Option<(Vec3, [f32; 3])>,
     sh: SkySh,
     fog: Option<world::FogInst>,
     lights: Vec<GpuLight>,
+    pad_lights: Vec<(i32, usize, [f32; 4], bool)>,
+    occupied: Vec<i32>,
+    party: Vec<PartyPawn>,
     /// LOBBY VOLFOG: the volumetric fog of `ExponentialHeightFog_1` (None when off), its frame counter and the generation of the scene depth target it samples.
     vfog: Option<fn_render::volfog::ExtVolFog>,
     vfog_frame: u64,
     targets_gen: u64,
+    vox: Option<VoxState>,
+    pub hide_character: bool,
+    dof: Option<LobbyDof>,
     pub report: SceneReport,
+}
+
+struct VoxState {
+    material: Arc<fn_fx::material::Material>,
+    material_path: String,
+    gdf: fn_render::static_gdf::StaticGdf,
+    _textures: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    _samplers: Vec<wgpu::Sampler>,
+}
+
+fn build_voxelizer(device: &wgpu::Device, queue: &wgpu::Queue, va: &VolumeAsset, data: &LobbySceneData, meshes: &HashMap<String, MeshAsset>, eye: Vec3) -> Result<(fn_render::volfog::ExtVoxelizer, VoxState), String> {
+    use fn_render::volfog::VoxRes;
+    let prog = va.material.cooked.find("FParticleSpriteVertexFactory", "FVoxelizeVolumePS").ok_or("no FVoxelizeVolumePS for FParticleSpriteVertexFactory in the shader map")?;
+    let ubs = prog.uniform_buffer_names.clone().unwrap_or_default();
+    let wgsl = fn_fx::cooked::translated_function_wgsl(&prog.full().shader, "vox_ps")?;
+    let mut paths: Vec<String> = vec![];
+    let mut dfs: Vec<Arc<fn_render::distance_field::MeshDistanceField>> = vec![];
+    let mut instances = vec![];
+    for st in data.statics.iter().filter(|st| st.visible && st.cast_shadow && st.affects_distance_field && !st.actor.contains("#grid")) {
+        let Some(df) = meshes.get(&st.mesh).and_then(|m| m.df.clone()) else { continue };
+        let k = match paths.iter().position(|p| p == &st.mesh) { Some(k) => k, None => { paths.push(st.mesh.clone()); dfs.push(df); paths.len() - 1 } };
+        instances.push(fn_render::static_gdf::StaticGdfInstance { mesh: k, local_to_world: st.xf.matrix() });
+    }
+    let occ = data.lights.iter().find(|l| l.kind == LightKind::Sky && l.visible).map(|l| l.occlusion_max_distance).unwrap_or(world::ExeDefaults::get().class1("USkyLightComponent", "OcclusionMaxDistance"));
+    let gdf = fn_render::static_gdf::StaticGdf::build(device, queue, &dfs, &instances, eye, occ, 2);
+    let mut textures: Vec<(wgpu::Texture, wgpu::TextureView)> = vec![];
+    let mut samplers: Vec<wgpu::Sampler> = vec![];
+    for (k, t) in va.textures.iter().enumerate() {
+        let (tex, src) = t.as_ref().ok_or_else(|| format!("material texture {k} not loaded"))?;
+        textures.push(upload_texture(device, queue, &format!("volume material texture {k}"), tex, tex.srgb));
+        samplers.push(sampler_for(device, &tex.filter, &tex.address, *src));
+    }
+    let mut views: Vec<&wgpu::TextureView> = gdf.views.iter().collect();
+    views.extend(textures.iter().map(|t| &t.1));
+    let mut samps: Vec<&wgpu::Sampler> = vec![&gdf.sampler];
+    samps.extend(samplers.iter());
+    let binding_of = |kind: fn_dxbc::unreal_packet::ResourceKind, reg: u32| prog.bindings.iter().find(|b| b.kind == kind && b.binding.register as u32 == reg).map(|b| (b.buffer_name.clone(), b.binding.member as usize));
+    let roles = |name: &str| -> Option<VoxRes> {
+        let (head, num) = name.split_at(name.find(|c: char| c.is_ascii_digit())?);
+        let n: u32 = num.parse().ok()?;
+        match head {
+            "cb" => match ubs.get(n as usize)?.as_str() { "View" => Some(VoxRes::ViewCb), "VolumetricFog" => Some(VoxRes::VolumetricFogCb), "Material" => Some(VoxRes::MaterialCb), _ => None },
+            "t" => match binding_of(fn_dxbc::unreal_packet::ResourceKind::Texture, n)? {
+                (b, m) if b == "View" && m % 2 == 0 && m < 8 => Some(VoxRes::Texture(m / 2)),
+                (b, m) if b == "Material" && m % 2 == 0 => Some(VoxRes::Texture(4 + m / 2)),
+                _ => None,
+            },
+            "s" => match binding_of(fn_dxbc::unreal_packet::ResourceKind::Sampler, n)? {
+                (b, m) if b == "View" && m % 2 == 1 && m < 8 => Some(VoxRes::Sampler(0)),
+                (b, m) if b == "Material" && m % 2 == 1 => Some(VoxRes::Sampler(1 + m / 2)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let vx = fn_render::volfog::ExtVoxelizer::new(device, &wgsl, "vox_ps", &roles, &views, &samps)?;
+    Ok((vx, VoxState { material: va.material.clone(), material_path: va.material_path.clone(), gdf, _textures: textures, _samplers: samplers }))
+}
+
+fn vol_particles(sprites: &[VolSprite], material: &str, cam: &CameraFrame) -> Vec<fn_render::volfog::ExtVolParticle> {
+    let view = |w: Vec3| { let r = w - cam.eye; Vec3::new(r.dot(cam.right), r.dot(cam.up), r.dot(cam.fwd)) };
+    sprites.iter().filter(|s| s.material == material).map(|s| {
+        let (sn, cs) = s.rotation.sin_cos();
+        let (rs, us) = (cam.right, -cam.up);
+        let (r, u) = (us * sn + rs * cs, us * cs - rs * sn);
+        let corner = |a: f32, b: f32| view(s.pos_cm + r * (s.size_cm[0] * (a + s.pivot[0])) + u * (s.size_cm[1] * (b + s.pivot[1])));
+        let c = [corner(0., 0.), corner(0., 1.), corner(1., 1.), corner(1., 0.)];
+        let o = view(s.pos_cm);
+        let (zmin, zmax) = c.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v.z), b.max(v.z)));
+        fn_render::volfog::ExtVolParticle {
+            c01: [c[0].x, c[0].y, c[1].x, c[1].y], c23: [c[2].x, c[2].y, c[3].x, c[3].y],
+            origin_radius: [o.x, o.y, o.z, 0.5 * s.size_cm[0].min(s.size_cm[1])], depth: [zmin, zmax, 0., 0.],
+        }
+    }).collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -515,7 +742,7 @@ struct LLight { pos: vec4<f32>, color: vec4<f32>, dir: vec4<f32>, cone: vec4<f32
 struct LFrame {
     inv_vp: mat4x4<f32>, shadow_vp: mat4x4<f32>, cam: vec4<f32>, viewport: vec4<f32>,
     sun_dir: vec4<f32>, sun_color: vec4<f32>, sh: array<vec4<f32>, 9>,
-    fog_a: vec4<f32>, fog_b: vec4<f32>, counts: vec4<u32>, lights: array<LLight, 64>,
+    fog_a: vec4<f32>, fog_b: vec4<f32>, counts: vec4<u32>, lights: array<LLight, 128>,
     pt_vp: array<mat4x4<f32>, 6>, pt_idx: vec4<u32>,
     fog_c: vec4<f32>, fog_d: vec4<f32>, fog_e: vec4<f32>,
 }
@@ -547,7 +774,7 @@ fn sun_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let texel = 1.0 / 4096.0;
     var s = 0.0;
     for (var y = -1; y <= 1; y = y + 1) { for (var x = -1; x <= 1; x = x + 1) {
-        s = s + textureSampleCompareLevel(shadow_map, shadow_cmp, uv + vec2<f32>(f32(x), f32(y)) * texel, p.z - 0.0004);
+        s = s + textureSampleCompareLevel(shadow_map, shadow_cmp, uv + vec2<f32>(f32(x), f32(y)) * texel, p.z - 0.0000453);
     } }
     return s / 9.0;
 }
@@ -575,6 +802,7 @@ fn ggx(nh: f32, r: f32) -> f32 { let a = max(r * r, 0.01); let a2 = a * a; let d
 fn light_term(l: LLight, world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, diff: vec3<f32>, f0: vec3<f32>, rough: f32) -> vec3<f32> {
     let d = l.pos.xyz - world;
     let d2 = dot(d, d);
+    if (d2 * l.pos.w * l.pos.w >= 1.0 || dot(l.color.xyz, l.color.xyz) == 0.0) { return vec3<f32>(0.0); }
     let L = d * inverseSqrt(max(d2, 1e-4));
     var att = 1.0 / (d2 + 1.0);
     let rm = clamp(1.0 - (d2 * l.pos.w * l.pos.w) * (d2 * l.pos.w * l.pos.w), 0.0, 1.0);
@@ -612,7 +840,7 @@ fn lobby_shade(world: vec3<f32>, n_in: vec3<f32>, base: vec3<f32>, metallic: f32
     let sf = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0);
     let sun = (diff / PI + ggx(max(dot(n, h), 0.0), rough) * 0.25 * sf) * LF.sun_color.xyz * nl * sun_shadow(world, n);
     col = col + sun;
-    let cnt = min(LF.counts.x, 64u);
+    let cnt = min(LF.counts.x, 128u);
     for (var i = 0u; i < cnt; i = i + 1u) {
         var t = light_term(LF.lights[i], world, n, v, diff, f0, rough);
         if (i == LF.pt_idx.x) { t = t * pt_shadow(world, n, LF.lights[i].pos.xyz); }
@@ -808,6 +1036,184 @@ fn lobby_weapon() -> &'static str {
     match fn_live::var("FN_LOBBY_WEAPON") { Ok(w) => Box::leak(w.into_boxed_str()), Err(_) => "PaperBlueprint" }
 }
 
+fn lobby_core_clips() -> Vec<String> {
+    let Some(c) = fn_animgraph::core_anims(lobby_weapon()) else { return vec![] };
+    let mut v = vec![];
+    for n in [c.targeting_pose, c.nontargeting_pose, c.relaxed_pose, c.relaxed_pose2, c.sprint, c.crouch_targeting_pose, c.crouch_nontargeting_pose, c.crouch_relaxed_pose, c.crouch_sprint, c.targeting_ao, c.nontargeting_ao, c.relaxed_ao] {
+        if n.is_empty() { continue; }
+        match fn_animgraph::blendspace(n) { Some(d) => v.extend(d.samples.iter().map(|s| s.anim.to_owned())), None => v.push(n.to_owned()) }
+    }
+    v
+}
+
+const DOF_WGSL: &str = r#"
+struct DU { full: vec4<f32>, half: vec4<f32>, focal: vec4<f32>, depth: vec4<f32>, uvlim: vec4<f32>, taps: array<vec4<f32>, 32> }
+@group(0) @binding(0) var<uniform> du: DU;
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var dep: texture_depth_2d;
+@group(0) @binding(3) var lin: sampler;
+@group(0) @binding(4) var far_tex: texture_2d<f32>;
+struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+    let x = f32(i32(i & 1u) * 4 - 1); let y = f32(i32((i >> 1u) & 1u) * 4 - 1);
+    var o: V; o.p = vec4<f32>(x, y, 0.0, 1.0); o.uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5); return o;
+}
+fn scene_depth(px: vec2<i32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(dep));
+    let z = textureLoad(dep, clamp(px, vec2<i32>(0), dims - 1), 0);
+    let n = du.depth.x; let f = du.depth.y;
+    return n * f / (f - z * (f - n));
+}
+fn far_mask(d: f32) -> f32 { return clamp((d - (du.focal.x + du.focal.y)) / du.focal.z, 0.0, 1.0); }
+fn near_mask(d: f32) -> f32 { return clamp((du.focal.x - d) / du.focal.w, 0.0, 1.0); }
+@fragment fn fs_setup(v: V) -> @location(0) vec4<f32> {
+    let base = vec2<i32>(floor(v.p.xy)) * 2;
+    var acc = vec4<f32>(0.0);
+    for (var k = 0; k < 4; k = k + 1) {
+        let px = base + vec2<i32>(k & 1, k >> 1);
+        let uv = (vec2<f32>(px) + 0.5) * du.full.zw;
+        let c = textureSampleLevel(src, lin, uv, 0.0);
+        acc = acc + vec4<f32>(c.rgb, 1.0) * far_mask(scene_depth(px));
+    }
+    return acc * 0.25;
+}
+@fragment fn fs_blur(v: V) -> @location(0) vec4<f32> {
+    let n = u32(du.depth.z);
+    let dir = select(vec2<f32>(0.0, du.half.w), vec2<f32>(du.half.z, 0.0), du.depth.w < 0.5);
+    let uv = v.p.xy * du.half.zw;
+    var acc = vec4<f32>(0.0);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let t = du.taps[i];
+        acc = acc + textureSampleLevel(src, lin, uv + dir * t.x, 0.0) * t.y;
+    }
+    return acc;
+}
+@fragment fn fs_recombine(v: V) -> @location(0) vec4<f32> {
+    let px = vec2<i32>(floor(v.p.xy));
+    let full_uv = v.p.xy * du.full.zw;
+    let vuv = clamp(full_uv, du.uvlim.xy, du.uvlim.zw);
+    let scene = textureSampleLevel(src, lin, full_uv, 0.0);
+    let d = scene_depth(px);
+    let unfocused = scene.rgb;
+    let l1 = textureSampleLevel(far_tex, lin, vuv, 0.0);
+    var l2 = 1.0 - far_mask(d);
+    let bias = 0.0001;
+    var merged = (unfocused * bias + l1.rgb) / (l1.a + bias);
+    var blend = sqrt(sqrt(l1.a));
+    blend = blend * blend * (3.0 - 2.0 * blend);
+    merged = mix(unfocused, merged, blend);
+    let smash = 0.25;
+    l2 = clamp((l2 - (1.0 - smash)) / smash, 0.0, 1.0);
+    l2 = l2 * l2;
+    merged = mix(merged, scene.rgb, l2);
+    return vec4<f32>(merged, scene.a);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DofU { full: [f32; 4], half: [f32; 4], focal: [f32; 4], depth: [f32; 4], uvlim: [f32; 4], taps: [[f32; 4]; 32] }
+
+struct DofTargets { w: u32, h: u32, setup: wgpu::Texture, tmp: wgpu::Texture, far: wgpu::Texture, out: wgpu::Texture, bg_setup: wgpu::BindGroup, bg_bx: wgpu::BindGroup, bg_by: wgpu::BindGroup, bg_rec: wgpu::BindGroup }
+
+pub struct LobbyDof {
+    setup: wgpu::RenderPipeline,
+    blur: wgpu::RenderPipeline,
+    recombine: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    u_setup: wgpu::Buffer,
+    u_bx: wgpu::Buffer,
+    u_by: wgpu::Buffer,
+    lin: wgpu::Sampler,
+    focal: [f32; 4],
+    base_focal: [f32; 4],
+    far_size: f32,
+    targets: Option<DofTargets>,
+}
+
+impl LobbyDof {
+    pub fn from_post(device: &wgpu::Device, post: &world::PostSettings) -> Option<LobbyDof> {
+        if post.dof_method != "DOFM_Gaussian" { return None; }
+        let far_size = post.f1("DepthOfFieldFarBlurSize").min(100.0);
+        if far_size < 0.01 { return None; }
+        let focal = [post.f1("DepthOfFieldFocalDistance"), post.f1("DepthOfFieldFocalRegion"), post.f1("DepthOfFieldFarTransitionRegion").max(1e-4), post.f1("DepthOfFieldNearTransitionRegion").max(1e-4)];
+        let sm = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("lobby gaussian dof"), source: wgpu::ShaderSource::Wgsl(DOF_WGSL.into()) });
+        let tex = |b: u32, depth: bool| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::FRAGMENT, count: None, ty: wgpu::BindingType::Texture { sample_type: if depth { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: true } }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false } };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("lobby dof bgl"), entries: &[
+            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, count: None, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None } },
+            tex(1, false), tex(2, true),
+            wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, count: None, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering) },
+            tex(4, false),
+        ] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("lobby dof"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+        let mk = |entry: &str| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry), layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &sm, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &sm, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            multiview_mask: None, cache: None,
+        });
+        let ub = |l: &str| buffer(device, l, std::mem::size_of::<DofU>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let lin = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("lobby dof"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() });
+        Some(LobbyDof { setup: mk("fs_setup"), blur: mk("fs_blur"), recombine: mk("fs_recombine"), bgl, u_setup: ub("lobby dof u"), u_bx: ub("lobby dof u x"), u_by: ub("lobby dof u y"), lin, focal, base_focal: focal, far_size, targets: None })
+    }
+
+    pub fn set_focus_extra(&mut self, extra_cm: f32) {
+        let f = [self.base_focal[0] + extra_cm * 0.5, self.base_focal[1] + extra_cm * 0.5, self.base_focal[2], self.base_focal[3]];
+        if f != self.focal { self.focal = f; self.targets = None; }
+    }
+    fn ensure(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, scene: &wgpu::TextureView, depth: &wgpu::TextureView) {
+        if self.targets.as_ref().is_some_and(|t| t.w == w && t.h == h) { return; }
+        let (hw, hh) = (w.div_ceil(2), h.div_ceil(2));
+        let mk = |l: &str, tw: u32, th: u32, extra: wgpu::TextureUsages| device.create_texture(&wgpu::TextureDescriptor { label: Some(l), size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, format: HDR, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | extra, view_formats: &[] });
+        let (setup, tmp, far, out) = (mk("lobby dof setup", hw, hh, wgpu::TextureUsages::empty()), mk("lobby dof blur x", hw, hh, wgpu::TextureUsages::empty()), mk("lobby dof far", hw, hh, wgpu::TextureUsages::empty()), mk("lobby dof out", w, h, wgpu::TextureUsages::COPY_SRC));
+        let v = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let bg = |u: &wgpu::Buffer, s: &wgpu::TextureView, f: &wgpu::TextureView| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("lobby dof bg"), layout: &self.bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(s) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) }, wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.lin) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(f) },
+        ] });
+        let (vs, vt, vf) = (v(&setup), v(&tmp), v(&far));
+        let bg_setup = bg(&self.u_setup, scene, &vf);
+        let bg_bx = bg(&self.u_bx, &vs, &vf);
+        let bg_by = bg(&self.u_by, &vt, &vs);
+        let bg_rec = bg(&self.u_setup, scene, &vf);
+        let view_w = w as f32;
+        let src_axis = view_w / w.div_ceil(hw) as f32;
+        let r = self.far_size * src_axis * 0.005;
+        let taps = fn_postfx::bloom::ue_gaussian_taps(r);
+        let fill = |dir: f32| {
+            let mut u = DofU { full: [w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32], half: [hw as f32, hh as f32, 1.0 / hw as f32, 1.0 / hh as f32], focal: self.focal, depth: [NEAR_CM, FAR_CM, taps.len().min(32) as f32, dir],
+                uvlim: [0.5 / hw as f32, 0.5 / hh as f32, (w as f32 / 2.0 - 0.5) / hw as f32, (h as f32 / 2.0 - 0.5) / hh as f32], taps: [[0.0; 4]; 32] };
+            for (i, t) in taps.iter().take(32).enumerate() { u.taps[i] = [t[0], t[1], 0.0, 0.0]; }
+            u
+        };
+        queue.write_buffer(&self.u_setup, 0, bytemuck::bytes_of(&fill(0.0)));
+        queue.write_buffer(&self.u_bx, 0, bytemuck::bytes_of(&fill(0.0)));
+        queue.write_buffer(&self.u_by, 0, bytemuck::bytes_of(&fill(1.0)));
+        self.targets = Some(DofTargets { w, h, setup, tmp, far, out, bg_setup, bg_bx, bg_by, bg_rec });
+    }
+
+    pub fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, hdr: &wgpu::Texture, scene: &wgpu::TextureView, depth: &wgpu::TextureView, w: u32, h: u32) {
+        self.ensure(device, queue, w, h, scene, depth);
+        let t = self.targets.as_ref().unwrap();
+        let v = |x: &wgpu::Texture| x.create_view(&Default::default());
+        for (target, pipe, bg) in [(v(&t.setup), &self.setup, &t.bg_setup), (v(&t.tmp), &self.blur, &t.bg_bx), (v(&t.far), &self.blur, &t.bg_by), (v(&t.out), &self.recombine, &t.bg_rec)] {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("lobby dof"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &t.out, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: hdr, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+    }
+}
+
 const DOWN_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
@@ -949,6 +1355,8 @@ fn lut_lookup(c: vec3<f32>) -> vec3<f32> {
 "#;
 
 fn patch_wgsl(raw: &str, lit: bool, fogged: bool, translucent_lit: bool) -> String {
+    let fs_head = "@fragment fn fs_main(in: FsIn) -> @location(0) vec4<f32> {\n";
+    let shadow_body = raw.find(fs_head).and_then(|p| { let b = p + fs_head.len(); raw[b..].find("    let o = ps_fx(v);\n").map(|q| raw[b..b + q].to_owned()) });
     let mut s = raw.to_owned();
     if lit {
         if let Some(p) = s.find("struct FxLight") {
@@ -970,6 +1378,12 @@ fn patch_wgsl(raw: &str, lit: bool, fogged: bool, translucent_lit: bool) -> Stri
             s.push_str("    return o[0];\n}\n");
         }
     }
+    if let Some(b) = shadow_body {
+        s.push_str("@fragment fn fs_shadow(in: FsIn) {\n");
+        s.push_str(&b);
+        if !b.contains("dps_fx") { s.push_str("    _ = ps_fx(v);\n"); }
+        s.push_str("}\n");
+    }
     s
 }
 
@@ -980,17 +1394,52 @@ fn buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsag
     device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size.max(16).div_ceil(16) * 16, usage, mapped_at_creation: false })
 }
 
+thread_local! {
+    static DEFER_UPLOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DEFERRED: std::cell::RefCell<std::collections::VecDeque<(wgpu::Texture, u32, Vec<u8>, u32, u32, wgpu::Extent3d)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+pub fn with_deferred_uploads<R>(f: impl FnOnce() -> R) -> R { DEFER_UPLOADS.with(|d| d.set(true)); let r = f(); DEFER_UPLOADS.with(|d| d.set(false)); r }
+pub fn uploads_pending() -> usize { DEFERRED.with(|q| q.borrow().len()) }
+pub fn drain_uploads(queue: &wgpu::Queue, budget: usize) -> bool {
+    DEFERRED.with(|q| {
+        let mut q = q.borrow_mut();
+        let mut sent = 0;
+        while sent < budget { let Some((tex, mip, data, bpr, rows, ext)) = q.pop_front() else { break }; sent += data.len(); queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, &data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows) }, ext); }
+        q.is_empty()
+    })
+}
+fn write_level(queue: &wgpu::Queue, tex: &wgpu::Texture, mip: u32, data: &[u8], bpr: u32, rows: u32, ext: wgpu::Extent3d) {
+    if DEFER_UPLOADS.with(|d| d.get()) { DEFERRED.with(|q| q.borrow_mut().push_back((tex.clone(), mip, data.to_vec(), bpr, rows, ext))); return; }
+    queue.write_texture(wgpu::TexelCopyTextureInfo { texture: tex, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows) }, ext);
+}
 fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, t: &TexAsset, srgb: bool) -> (wgpu::Texture, wgpu::TextureView) {
     let (w, h, _) = &t.levels[0];
+    static BC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if t.bc.is_some() && !*BC.get_or_init(|| device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC)) {
+        eprintln!("[lobby scene] {label}: the device has no BC texture support: drawn grey");
+        return upload_texture(device, queue, label, &TexAsset { levels: vec![(1, 1, vec![128, 128, 128, 255])], srgb, filter: String::new(), address: String::new(), bc: None }, srgb);
+    }
+    if let Some((fmt, raw)) = t.bc.as_ref() {
+        use wgpu::TextureFormat as F;
+        let (format, block) = match (fmt, srgb) { (BcFormat::Bc1, true) => (F::Bc1RgbaUnormSrgb, 8), (BcFormat::Bc1, false) => (F::Bc1RgbaUnorm, 8), (BcFormat::Bc3, true) => (F::Bc3RgbaUnormSrgb, 16), (BcFormat::Bc3, false) => (F::Bc3RgbaUnorm, 16), (BcFormat::Bc4, _) => (F::Bc4RUnorm, 8), (BcFormat::Bc5, _) => (F::Bc5RgUnorm, 16) };
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label), size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 }, mip_level_count: raw.len() as u32, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        for (i, ((lw, lh, _), data)) in t.levels.iter().zip(raw).enumerate() {
+            let (bw, bh) = (lw.div_ceil(4), lh.div_ceil(4));
+            write_level(queue, &tex, i as u32, data, bw * block, bh, wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 });
+        }
+        let view = tex.create_view(&Default::default());
+        return (tex, view);
+    }
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label), size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 }, mip_level_count: t.levels.len() as u32, sample_count: 1,
         dimension: wgpu::TextureDimension::D2, format: if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
     });
     for (i, (lw, lh, px)) in t.levels.iter().enumerate() {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            px, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * lw), rows_per_image: Some(*lh) }, wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 });
+        write_level(queue, &tex, i as u32, px, 4 * lw, *lh, wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 });
     }
     let view = tex.create_view(&Default::default());
     (tex, view)
@@ -1046,13 +1495,12 @@ fn blend_of(flags: &fn_fx::material::MaterialFlags) -> Result<Blend, String> {
 }
 
 fn prepare_material(mat: &Arc<fn_fx::material::Material>) -> Result<(fn_fx::program::Assembled, String, Blend, bool), String> {
-    use fn_dxbc::Opcode;
     const VF: &str = "FLocalVertexFactory";
     let lit = mat.flags.uses_gbuffer(); // GBuffer outputs only for opaque / masked lit materials (UE4.16 BasePassCommon.usf:20); a translucent lit one writes SV_Target0 only
     let vs = mat.cooked.find(VF, "TBasePassVSFNoLightMapPolicy").ok_or("no FLocalVertexFactory / TBasePassVSFNoLightMapPolicy program")?;
     let ps = mat.cooked.find(VF, "TBasePassPSFNoLightMapPolicy").or_else(|| mat.cooked.find(VF, "TBasePassPSFNoLightMapPolicySkylight")).ok_or("no TBasePassPSFNoLightMapPolicy program")?;
     // MIRRORFIX: no FDepthOnlyPS = a WritesEveryPixel map: UE's depth pass uses the position-only path without a pixel shader (DepthRendering.cpp:652), nothing clips (fn_fx::gpu)
-    let clip = if mat.flags.blend == "BLEND_Masked" && !ps.shader.body().any(|i| i.op == Opcode::Discard) { mat.cooked.find(VF, "FDepthOnlyPS") } else { None };
+    let clip = if mat.flags.blend == "BLEND_Masked" && !ps.discards { mat.cooked.find(VF, "FDepthOnlyPS") } else { None };
     let asm = fn_fx::program::assemble(vs, ps, lit, clip)?;
     let blend = blend_of(&mat.flags)?;
     let opaque = blend == Blend::Opaque;
@@ -1063,12 +1511,24 @@ fn prepare_material(mat: &Arc<fn_fx::material::Material>) -> Result<(fn_fx::prog
 
 impl LobbyScene {
     /// Loads everything from the install (CPU + GPU). `output_format` must be a NON-sRGB colour format (the post pass writes sRGB-encoded values).
+    pub fn release_gpu(&mut self) {
+        if let Some(v) = self.vfog.as_mut() { v.destroy_volumes(); }
+        if let Some(t) = self.targets.take() { t.hdr.destroy(); t.depth.destroy(); }
+        self.shadow_view.texture().destroy();
+        if let Some(v) = self.pt_face_views.first() { v.texture().destroy(); }
+    }
     pub fn load(install: &Path, device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Result<LobbyScene, String> {
         let assets = LobbyAssets::load(install, None)?;
         Self::from_assets(assets, device, queue, output_format)
     }
 
     pub fn from_assets(assets: LobbyAssets, device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Result<LobbyScene, String> {
+        let mut scene = Self::from_assets_deferred(assets, device, queue, output_format)?;
+        scene.step_deferred();
+        Ok(scene)
+    }
+
+    pub fn from_assets_deferred(assets: LobbyAssets, device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Result<LobbyScene, String> {
         let (device, queue) = (device.clone(), queue.clone());
         let mut report = assets.report.clone();
         let data = assets.data;
@@ -1138,10 +1598,16 @@ impl LobbyScene {
         let mut mesh_pairs: Vec<usize> = vec![];
         let visible: Vec<&world::StaticInst> = data.statics.iter().filter(|s| s.visible && assets.meshes.contains_key(&s.mesh)).collect();
         let occupied: Vec<String> = data.placements.iter().filter(|p| p.player_on_pad).map(|p| p.actor.clone()).collect();
+        let pad_ids: HashMap<String, i32> = data.placements.iter().map(|p| (p.actor.clone(), p.player_id)).collect();
         let mat_of = |s: &world::StaticInst, slot: usize| -> Option<String> {
             let m = &assets.meshes[&s.mesh];
             let p = s.material_overrides.get(slot).cloned().flatten().or_else(|| m.default_materials.get(slot).cloned().flatten());
             p.map(|p| if p.ends_with("M_Lobby_Pad.M_Lobby_Pad") && occupied.contains(&s.actor) { format!("{p}#occupied") } else { p })
+        };
+        let pad_alt = |s: &world::StaticInst, path: &str| -> Option<(i32, String, String)> {
+            let id = *pad_ids.get(&s.actor)?;
+            let base = path.strip_suffix("#occupied").unwrap_or(path);
+            base.ends_with("M_Lobby_Pad.M_Lobby_Pad").then(|| (id, base.to_owned(), format!("{base}#occupied")))
         };
         for s in &visible {
             let idx = *mesh_index.entry(s.mesh.clone()).or_insert_with(|| { mesh_paths.push(s.mesh.clone()); mesh_pairs.push(1); mesh_paths.len() - 1 });
@@ -1183,10 +1649,19 @@ impl LobbyScene {
                 // debug knob: FN_LOBBY_HIDE=token,token hides draws whose mesh or material path contains a token
                 if fn_live::var("FN_LOBBY_HIDE").is_ok_and(|v| v.split(',').any(|t| !t.is_empty() && (path.contains(t) || s.mesh.contains(t)))) { continue; }
                 let key = (path.clone(), meshes[mi].pairs, data.selection.is_none() && l2w.determinant() < 0.0); // non-lobby views only (the Lobby render stays untouched): a mirrored instance (negative scale) flips the winding, as in UE
-                let pk = *pipe_key.entry(key.clone()).or_insert_with(|| { pipe_defs.push(key); pipe_defs.len() - 1 });
+                let pk = *pipe_key.entry(key.clone()).or_insert_with(|| { pipe_defs.push(key.clone()); pipe_defs.len() - 1 });
                 let translucent = pm.blend != Blend::Opaque;
                 let foliage = pm.mat.flags.shading == "MSM_Subsurface";
-                draws.push(DrawItem { mesh: mi, material_key: pk, first, count, prim: offset, pos: world_center, sort_priority: s.translucency_sort_priority, shadow: s.cast_shadow && !translucent && !foliage, translucent });
+                let pad = pad_alt(s, &path).filter(|(_, e, o)| pre.contains_key(e) && pre.contains_key(o)).map(|(id, e, o)| {
+                    let mut k = |p: String| { let key = (p, key.1, key.2); *pipe_key.entry(key.clone()).or_insert_with(|| { pipe_defs.push(key); pipe_defs.len() - 1 }) };
+                    (id, k(e), k(o))
+                });
+                let grid = pad_ids.get(&s.actor).filter(|id| world::is_grid_slot(**id)).map_or(0u16, |id| 1u16 << (id - world::GRID_FIRST_ID));
+                let clear = if pad_ids.contains_key(&s.actor) || s.mesh.contains("Terrain") || s.mesh.contains("Grass") { 0u16 } else {
+                    data.placements.iter().filter(|p| world::is_grid_slot(p.player_id)).filter(|p| (p.root.t.truncate() - s.xf.t.truncate()).length() < world::GRID_CLEAR_CM && s.xf.t.z < p.root.t.z + 250.0)
+                        .fold(0u16, |m, p| m | (1u16 << (p.player_id - world::GRID_FIRST_ID)))
+                };
+                draws.push(DrawItem { mesh: mi, material_key: pk, first, count, prim: offset, pos: world_center, sort_priority: s.translucency_sort_priority, shadow: s.cast_shadow && !translucent && pm.lit, pt_shadow: s.cast_shadow && !translucent && !foliage, translucent, pad, grid, clear });
             }
         }
         let prim_buf = buffer(&device, "lobby primitives", prims.len().max(PRIM_STRIDE as usize) as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
@@ -1198,12 +1673,45 @@ impl LobbyScene {
         let mut pipe_ok: Vec<Option<usize>> = vec![None; pipe_defs.len()];
         for (pk, (path, pairs, mirror)) in pipe_defs.iter().enumerate() {
             let pm = &pre[path];
-            match build_mat_pipe(&device, pm, *pairs, *mirror, coll_buf_opt, &group3_layout, &tex_index, &textures, &mut samplers, &mut sampler_index, &assets.textures, &view_buf, &fade_buf, &zero_buf, &prim_buf, &mat_bufs) {
+            match build_mat_pipe(&device, pm, *pairs, *mirror, coll_buf_opt, &group3_layout, &tex_index, &textures, &mut samplers, &mut sampler_index, &assets.textures, &view_buf, &fade_buf, &zero_buf, &prim_buf, &mat_bufs, false) {
                 Ok(mp) => { pipe_ok[pk] = Some(mat_pipes.len()); mat_pipes.push(mp); }
                 Err(e) => { pipes_failed.insert(path.clone(), e); }
             }
         }
-        for d in draws.iter_mut() { d.material_key = pipe_ok[d.material_key].map(|v| v + 1).unwrap_or(0); }
+        let shadow_view_buf = buffer(&device, "lobby shadow view", 178 * 16, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let mut shadow_mat_pipes: Vec<Option<MatPipe>> = (0..mat_pipes.len()).map(|_| None).collect();
+        for (pk, (path, pairs, mirror)) in pipe_defs.iter().enumerate() {
+            let Some(i) = pipe_ok[pk] else { continue };
+            if !draws.iter().any(|d| d.shadow && (d.material_key == pk || d.pad.is_some_and(|(_, e, o)| e == pk || o == pk))) { continue; }
+            let pm = &pre[path];
+            match build_mat_pipe(&device, pm, *pairs, *mirror, coll_buf_opt, &group3_layout, &tex_index, &textures, &mut samplers, &mut sampler_index, &assets.textures, &shadow_view_buf, &fade_buf, &zero_buf, &prim_buf, &mat_bufs, true) {
+                Ok(mp) => shadow_mat_pipes[i] = Some(mp),
+                Err(e) => report.lines.push(format!("shadow pipeline {path}: {e} (position-only shadow)")),
+            }
+        }
+        let mut prepass_pipes: Vec<Option<MatPipe>> = (0..mat_pipes.len()).map(|_| None).collect();
+        for (pk, (path, pairs, mirror)) in pipe_defs.iter().enumerate() {
+            let Some(i) = pipe_ok[pk] else { continue };
+            if !draws.iter().any(|d| !d.translucent && (d.material_key == pk || d.pad.is_some_and(|(_, e, o)| e == pk || o == pk))) { continue; }
+            let pm = &pre[path];
+            if pm.blend != Blend::Opaque { continue; }
+            match build_mat_pipe(&device, pm, *pairs, *mirror, coll_buf_opt, &group3_layout, &tex_index, &textures, &mut samplers, &mut sampler_index, &assets.textures, &view_buf, &fade_buf, &zero_buf, &prim_buf, &mat_bufs, true) {
+                Ok(mp) => prepass_pipes[i] = Some(mp),
+                Err(e) => report.lines.push(format!("depth pre-pass pipeline {path}: {e}")),
+            }
+        }
+        let dummy_depth = device.create_texture(&wgpu::TextureDescriptor { label: Some("lobby shadow pass dummy depth"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        let dummy_depth_arr = device.create_texture(&wgpu::TextureDescriptor { label: Some("lobby shadow pass dummy depth array"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+        let group3_shadow = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("lobby g3 (shadow pass)"), layout: &group3_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&dummy_depth.create_view(&Default::default())) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&shadow_cmp) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dummy_depth_arr.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })) },
+        ] });
+        for d in draws.iter_mut() {
+            d.material_key = pipe_ok[d.material_key].map(|v| v + 1).unwrap_or(0);
+            d.pad = d.pad.and_then(|(id, e, o)| Some((id, pipe_ok[e]?, pipe_ok[o]?)));
+        }
         draws.retain(|d| d.material_key != 0);
         for d in draws.iter_mut() { d.material_key -= 1; }
         for (p, e) in &pipes_failed { report.substituted.push((p.clone(), format!("pipeline: {e}"))); }
@@ -1266,8 +1774,8 @@ impl LobbyScene {
         let down_pipe = fs_pipeline("lobby downsample", DOWN_WGSL, &down_layout, HDR);
         let post_buf = buffer(&device, "lobby post u", std::mem::size_of::<PostU>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let lut_view = match &assets.lut {
-            Some(t) => upload_texture(&device, &queue, "lobby LUT", &TexAsset { levels: vec![t.levels[0].clone()], srgb: false, filter: String::new(), address: String::new() }, false).1,
-            None => upload_texture(&device, &queue, "lobby LUT none", &TexAsset { levels: vec![(1, 1, vec![128, 128, 128, 255])], srgb: false, filter: String::new(), address: String::new() }, false).1,
+            Some(t) => upload_texture(&device, &queue, "lobby LUT", &TexAsset { levels: vec![t.levels[0].clone()], srgb: false, filter: String::new(), address: String::new(), bc: None }, false).1,
+            None => upload_texture(&device, &queue, "lobby LUT none", &TexAsset { levels: vec![(1, 1, vec![128, 128, 128, 255])], srgb: false, filter: String::new(), address: String::new(), bc: None }, false).1,
         };
 
         // ---- lights ----
@@ -1276,14 +1784,19 @@ impl LobbyScene {
         let (mut sun_vsi, mut sky_vsi) = (0f32, 0f32); // VolumetricScatteringIntensity of the directional and the sky light (LOBBY VOLFOG)
         let mut pt_best: Option<(usize, f32, Vec3, f32)> = None; // the strongest shadow-casting inverse-squared point light (one cube shadow map)
         let off = fn_live::var("FN_LOBBY_NOLIGHT").unwrap_or_default(); // debug: comma separated actor / component name fragments to leave out
-        for l in data.lights.iter().filter(|l| l.visible && l.affects_world && !off.split(',').any(|t| !t.is_empty() && (l.actor.contains(t) || l.component.contains(t)))) {
+        let mut pad_lights: Vec<(i32, usize, [f32; 4], bool)> = vec![];
+        let pad_light = |l: &world::LightInst| -> Option<(i32, bool)> {
+            if !PAD_LIGHTS.contains(&l.component.as_str()) { return None; }
+            data.placements.iter().find(|p| p.actor == l.actor && !p.hidden).map(|p| (p.player_id, p.player_on_pad))
+        };
+        for l in data.lights.iter().filter(|l| (l.visible || pad_light(l).is_some()) && l.affects_world && !off.split(',').any(|t| !t.is_empty() && (l.actor.contains(t) || l.component.contains(t)))) {
             let c = l.linear_color();
             match l.kind {
                 LightKind::Directional => {
                     if sun.is_none() { let k = l.intensity; sun = Some((-l.xf.forward(), [c[0] * k, c[1] * k, c[2] * k])); sun_vsi = l.volumetric_scattering; }
                 }
                 LightKind::Point | LightKind::Spot => {
-                    if lights.len() >= MAX_LIGHTS { continue; }
+                    if lights.len() >= MAX_SCENE_LIGHTS { continue; }
                     // Inverse-squared lights: colour x Intensity x 16 (exe: every consumer of the proxy's parameters multiplies the colour by 16.0 when the proxy is inverse
                     // squared, e.g. RVA 0x181e2bf / 0x19989f5 / 0x18274ce / 0x19dbad5; see SCENE.md); legacy lights (`bUseInverseSquaredFalloff` false): x1, pow falloff.
                     let k = if l.inverse_squared { l.intensity * 16.0 } else { l.intensity };
@@ -1292,11 +1805,13 @@ impl LobbyScene {
                         (co, 1.0 / (ci - co).max(1e-4))
                     } else { (0., 0.) };
                     let dir = l.xf.forward();
-                    if l.kind == LightKind::Point && l.cast_shadows && l.inverse_squared {
+                    if l.kind == LightKind::Point && l.cast_shadows && l.inverse_squared && pad_light(l).is_none() {
                         let w = k * c[0].max(c[1]).max(c[2]) * l.attenuation_radius * l.attenuation_radius;
                         if pt_best.map_or(true, |b| w > b.1) { pt_best = Some((lights.len(), w, l.xf.t, l.attenuation_radius)); }
                     }
-                    lights.push(GpuLight { pos: [l.xf.t.x, l.xf.t.y, l.xf.t.z, 1.0 / l.attenuation_radius.max(1.0)], color: [c[0] * k, c[1] * k, c[2] * k, if l.kind == LightKind::Spot { 2.0 } else { 1.0 }], dir: [dir.x, dir.y, dir.z, cos_outer], cone: [inv_range, if l.inverse_squared { 0. } else { 1. }, l.falloff_exponent, l.volumetric_scattering] });
+                    let color = [c[0] * k, c[1] * k, c[2] * k, if l.kind == LightKind::Spot { 2.0 } else { 1.0 }];
+                    let on = match pad_light(l) { Some((id, on)) => { let join = JOIN_LIGHTS.contains(&l.component.as_str()) || l.visible; pad_lights.push((id, lights.len(), color, join)); on && l.visible } None => true };
+                    lights.push(GpuLight { pos: [l.xf.t.x, l.xf.t.y, l.xf.t.z, 1.0 / l.attenuation_radius.max(1.0)], color: if on { color } else { [0., 0., 0., color[3]] }, dir: [dir.x, dir.y, dir.z, cos_outer], cone: [inv_range, if l.inverse_squared { 0. } else { 1. }, l.falloff_exponent, l.volumetric_scattering] });
                 }
                 LightKind::Sky => { sky_vsi = l.volumetric_scattering; }
             }
@@ -1322,6 +1837,16 @@ impl LobbyScene {
             report.lines.push(format!("volumetric fog: {:?}; light VolumetricScatteringIntensity: {}", v.params,
                 data.lights.iter().filter(|l| l.visible && l.affects_world).map(|l| format!("{}.{}={}", l.actor, l.component, l.volumetric_scattering)).collect::<Vec<_>>().join(" ")));
         }
+        let mut vfog = vfog;
+        let dof = if fn_live::var_os("FN_LOBBY_NODOF").is_none() { LobbyDof::from_post(&device, &data.post) } else { None };
+        let mut vox: Option<VoxState> = None;
+        if let (Some(vf), Some(va)) = (vfog.as_mut(), assets.volumes.first()) {
+            match build_voxelizer(&device, &queue, va, &data, &assets.meshes, camera.t) {
+                Ok((vx, st)) => { report.lines.extend(vx.notes.iter().cloned()); report.lines.extend(st.gdf.notes.iter().cloned()); vf.set_voxelizer(vx); vox = Some(st); }
+                Err(e) => report.lines.push(format!("volume voxelization not built: {e}")),
+            }
+        }
+        for l in &report.lines { if l.starts_with("volume") || l.starts_with("clipmap") || l.contains("distance-field objects") || l.starts_with("voxelize") { eprintln!("[lobby scene] {l}"); } }
         // cube shadow matrices of that light (UE left handed, 90 degree faces +X -X +Y -Y +Z -Z)
         let mut pt_vps = [Mat4::IDENTITY; 6];
         let pt_idx = pt_best.map_or(u32::MAX, |b| b.0 as u32);
@@ -1343,14 +1868,17 @@ impl LobbyScene {
         let sh = assets.sky;
         let _ = meshes.iter().map(|m| m.shadow_ok).count();
         let shadow_store = shadow_pipes;
+        let data_occupied: Vec<i32> = data.placements.iter().filter(|p| p.player_on_pad).map(|p| p.player_id).collect();
         let mut scene = LobbyScene {
             assets_report: report.clone(), data, device, queue, out_format: output_format,
             frame_buf, view_buf, prim_buf, fade_buf, zero_buf, group3_layout, group3, shadow_view, shadow_pipes: shadow_store, cview_buf, shadow_bg, shadow_vp_buf, pt_face_views, pt_bgs, pt_vps, pt_idx,
-            meshes, mat_pipes, mat_bufs, textures, samplers, draws,
-            char_pipe, char_shadow_pipe, char_asset, char_gpu, char_xf, char_pose: fn_pose::CharacterPose::default(), char_t0: 0.0, last_time: 0.0, anim: None,
-            post_pipe, down_pipe, post_buf, lut_view, post_samp, post_layout, down_layout, targets: None, camera, fov, sun, sh, fog, lights, report, vfog, vfog_frame: 0, targets_gen: 0,
+            meshes, mat_pipes, mat_bufs, textures, samplers, draws, shadow_mat_pipes, prepass_pipes, shadow_view_buf, group3_shadow,
+            char_parts_pending: char_gpu.is_some(), char_pipe, char_shadow_pipe, char_asset, char_gpu, char_xf, char_pose: fn_pose::CharacterPose::default(), char_t0: 0.0, last_time: 0.0, anim: None,
+            post_pipe, down_pipe, post_buf, lut_view, post_samp, post_layout, down_layout, targets: None, camera, fov, sun, sh, fog, lights, report, vfog, vfog_frame: 0, targets_gen: 0, vox, hide_character: false, dof,
+            occupied: data_occupied, pad_lights, party: vec![], base_camera: camera, grid_mask: 0, grid_rows_cur: 0.0, grid_rows_target: 0.0,
         };
         scene.post_uniform_dirty();
+        if !scene.char_parts_pending { clear_hero_mips(); }
         Ok(scene)
     }
 }
@@ -1360,7 +1888,7 @@ fn bgl_entry(binding: u32, vis: wgpu::ShaderStages, ty: wgpu::BindingType) -> wg
 #[allow(clippy::too_many_arguments)]
 fn build_mat_pipe(device: &wgpu::Device, pm: &PreMat, pairs: usize, mirror: bool, coll_buf: Option<&wgpu::Buffer>, group3: &wgpu::BindGroupLayout, tex_index: &HashMap<String, usize>, textures_gpu: &[(wgpu::Texture, wgpu::TextureView)],
     samplers: &mut Vec<wgpu::Sampler>, sampler_index: &mut HashMap<(String, String, i32), usize>, textures: &HashMap<String, TexAsset>,
-    view_buf: &wgpu::Buffer, fade_buf: &wgpu::Buffer, zero_buf: &wgpu::Buffer, prim_buf: &wgpu::Buffer, mat_bufs: &[wgpu::Buffer]) -> Result<MatPipe, String> {
+    view_buf: &wgpu::Buffer, fade_buf: &wgpu::Buffer, zero_buf: &wgpu::Buffer, prim_buf: &wgpu::Buffer, mat_bufs: &[wgpu::Buffer], shadow: bool) -> Result<MatPipe, String> {
     use fn_fx::program::{ResKind, Stage};
     const VF: &str = "FLocalVertexFactory";
     let mat = &pm.mat;
@@ -1468,7 +1996,18 @@ fn build_mat_pipe(device: &wgpu::Device, pm: &PreMat, pairs: usize, mirror: bool
         Blend::Modulate => Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Dst, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } }),
     };
     let opaque = pm.blend == Blend::Opaque;
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let pipeline = if shadow {
+        let masked = mat.flags.blend == "BLEND_Masked";
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lobby material shadow depth"), layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: (24 + 16 * pairs) as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs })] },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: if pm.two_sided { None } else { Some(wgpu::Face::Back) }, front_face: if mirror { wgpu::FrontFace::Cw } else { wgpu::FrontFace::Ccw }, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            fragment: masked.then(|| wgpu::FragmentState { module: &module, entry_point: Some("fs_shadow"), compilation_options: Default::default(), targets: &[] }),
+            multiview_mask: None, cache: None,
+        })
+    } else { device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("lobby original material"), layout: Some(&pl),
         vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(wgpu::VertexBufferLayout { array_stride: (24 + 16 * pairs) as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &attrs })] },
         primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: if pm.two_sided { None } else { Some(wgpu::Face::Back) }, front_face: if mirror { wgpu::FrontFace::Cw } else { wgpu::FrontFace::Ccw }, ..Default::default() },
@@ -1476,7 +2015,7 @@ fn build_mat_pipe(device: &wgpu::Device, pm: &PreMat, pairs: usize, mirror: bool
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR, blend, write_mask: wgpu::ColorWrites::ALL })] }),
         multiview_mask: None, cache: None,
-    });
+    }) };
     if let Some(e) = fn_render::gpu::pop_error_scope(scope) { return Err(e.to_string()); } // BROWSER PORT: on wasm the scope result is a promise the main thread cannot wait for (reported asynchronously)
     Ok(MatPipe { pipeline, layouts, group_entries, groups: vec![], dyn_count, blend: pm.blend, uses_depth })
 }
@@ -1571,7 +2110,7 @@ fn build_character(device: &wgpu::Device, queue: &wgpu::Queue, asset: Option<Cha
     // glTF mesh space (m, Y up, +Z forward) -> UE (cm): (x, y, z) -> (x, z, y) * 100, then the placement
     let swap = Mat4::from_cols(Vec4::new(100., 0., 0., 0.), Vec4::new(0., 0., 100., 0.), Vec4::new(0., 100., 0., 0.), Vec4::W);
     let model = xf.matrix() * swap;
-    let parts = build_char_parts(device, queue, &a, &model, &char_layout, &orig_layout, &samp);
+    let parts = Vec::new();
     Ok((pipe, spipe, CharGpu { parts, cam_bg, shadow_bg, empty_bg, orig_pipe, char_layout, orig_layout, samp, model }, xf, a))
 }
 
@@ -1599,8 +2138,8 @@ fn build_char_parts_of(device: &wgpu::Device, queue: &wgpu::Queue, bparts: &[fn_
             let ib = buffer(device, "lobby char ib", (prim.indices.len() * 4) as u64, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST);
             queue.write_buffer(&ib, 0, bytemuck::cast_slice(&prim.indices));
             let tex = match &sec.diffuse {
-                Some(t) => upload_texture(device, queue, "char diffuse", &TexAsset { levels: vec![(t.width as u32, t.height as u32, t.rgba.clone())], srgb: true, filter: String::new(), address: String::new() }, true).1,
-                None => upload_texture(device, queue, "char grey", &TexAsset { levels: vec![(1, 1, vec![128, 128, 128, 255])], srgb: true, filter: String::new(), address: String::new() }, true).1,
+                Some(t) => upload_texture(device, queue, "char diffuse", &TexAsset { levels: vec![(t.width as u32, t.height as u32, t.rgba.clone())], srgb: true, filter: String::new(), address: String::new(), bc: None }, true).1,
+                None => upload_texture(device, queue, "char grey", &TexAsset { levels: vec![(1, 1, vec![128, 128, 128, 255])], srgb: true, filter: String::new(), address: String::new(), bc: None }, true).1,
             };
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("lobby char bg"), layout: &char_layout, entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: obj.as_entire_binding() },
@@ -1612,11 +2151,15 @@ fn build_char_parts_of(device: &wgpu::Device, queue: &wgpu::Queue, bparts: &[fn_
                 (Some(ue), Some(d), Some(n), Some(s), Some(m)) => {
                     // the renderer hands the translated shader the RAW texel values (the shader decodes what it needs): all four are uploaded linear
                     let up = |label: &str, srgb: bool, t: &fn_pose::br_character::RgbaTexture| -> Option<wgpu::TextureView> {
-                        let img = image::RgbaImage::from_raw(t.width as u32, t.height as u32, t.rgba.clone())?;
-                        Some(fn_render::texture::upload_rgba8(device, queue, &img, srgb, fn_render::texture::MipFilter::Triangle, label).create_view(&Default::default()))
+                        let key = tex_key(t, srgb);
+                        if let Some(v) = VIEW_CACHE.with(|c| c.borrow().get(&key).cloned()) { return Some(v); }
+                        let levels = mips_for(t, srgb)?;
+                        let v = upload_levels(device, queue, &levels, srgb, label);
+                        VIEW_CACHE.with(|c| { c.borrow_mut().insert(key, v.clone()); });
+                        Some(v)
                     };
                     let nz = &ue.noise;
-                    let noise = image::RgbaImage::from_raw(nz.tex.width as u32, nz.tex.height as u32, nz.tex.rgba.clone()).map(|img| fn_render::texture::upload_rgba8(device, queue, &img, nz.srgb, fn_render::texture::MipFilter::Triangle, "char noise").create_view(&Default::default()));
+                    let noise = up("char noise", nz.srgb, &nz.tex);
                     match (up("char diffuse", true, d), up("char normal", false, n), up("char spec", false, s), up("char mask", false, m), noise) {
                         (Some(vd), Some(vn), Some(vs), Some(vm), Some(vnoise)) => {
                             let mut cm = [[0f32; 4]; 33];
@@ -1658,8 +2201,8 @@ fn build_char_parts_of(device: &wgpu::Device, queue: &wgpu::Queue, bparts: &[fn_
 impl LobbyScene {
     /// The party slots of the lobby (UE world centimetres) for the UI half: name plate / "+" marker anchors and the hero's feet.
     pub fn party_slots(&self) -> Vec<PartySlot> {
-        self.data.placements.iter().map(|p| PartySlot {
-            player_id: p.player_id, hidden: p.hidden, occupied: p.player_on_pad, pawn_world_cm: p.character.t, pad_world_cm: p.root.t,
+        self.data.placements.iter().filter(|p| !world::is_grid_slot(p.player_id) || self.grid_mask & (1u16 << (p.player_id - world::GRID_FIRST_ID)) != 0).map(|p| PartySlot {
+            player_id: p.player_id, hidden: p.hidden, occupied: self.occupied.contains(&p.player_id), pawn_world_cm: p.character.t, pad_world_cm: p.root.t,
             top_widget_cm: p.top_widget.t, add_widget_cm: p.add_widget.t, top_pivot: p.top_info.pivot, add_pivot: p.add_info.pivot,
         }).collect()
     }
@@ -1685,6 +2228,15 @@ impl LobbyScene {
         o[9] = [0.25 * 0.546274 * l[8][0], 0.25 * 0.546274 * l[8][1], 0.25 * 0.546274 * l[8][2], 1.0];
         o
     }
+    pub fn deferred_pending(&self) -> bool { self.char_parts_pending }
+    pub fn step_deferred(&mut self) {
+        if !std::mem::replace(&mut self.char_parts_pending, false) { return; }
+        if let (Some(g), Some(a)) = (self.char_gpu.as_mut(), self.char_asset.as_ref()) {
+            let parts = build_char_parts(&self.device, &self.queue, a, &g.model, &g.char_layout, &g.orig_layout, &g.samp);
+            g.parts = parts;
+        }
+        clear_hero_mips();
+    }
     pub fn share_character(&self) -> Option<CharAsset> { self.char_asset.as_ref().map(|a| a.share()) }
     pub fn output_format(&self) -> wgpu::TextureFormat { self.out_format }
     pub fn fov_deg(&self) -> f32 { self.fov }
@@ -1706,6 +2258,41 @@ impl LobbyScene {
         let g = self.char_gpu.as_ref()?;
         Some(HeroBuilder { device: self.device.clone(), queue: self.queue.clone(), char_layout: g.char_layout.clone(), orig_layout: g.orig_layout.clone(), samp: g.samp.clone(), model: g.model })
     }
+
+    pub fn set_pad_occupied(&mut self, player_id: i32, on: bool) {
+        if on { if !self.occupied.contains(&player_id) { self.occupied.push(player_id); } } else { self.occupied.retain(|&i| i != player_id); }
+        for (id, i, c, join) in &self.pad_lights { if *id == player_id { self.lights[*i].color = if on && *join { *c } else { [0., 0., 0., c[3]] }; } }
+    }
+    pub fn pad_occupied(&self, player_id: i32) -> bool { self.occupied.contains(&player_id) }
+    fn draw_on(&self, d: &DrawItem) -> bool { (d.grid == 0 || d.grid & self.grid_mask != 0) && d.clear & self.grid_mask == 0 }
+    pub fn set_grid_shown(&mut self, extra: usize) {
+        let n = extra.min(world::GRID_SLOTS);
+        self.grid_mask = if n == 0 { 0 } else { ((1u32 << n) - 1) as u16 };
+        self.grid_rows_target = n.div_ceil(world::GRID_COLUMNS) as f32;
+    }
+    pub fn grid_rows(&self) -> f32 { self.grid_rows_cur }
+    fn grid_camera(&self, rows: f32) -> Xf {
+        let base = self.base_camera;
+        if rows <= 1e-4 { return base; }
+        let eye = base.t + Vec3::new(0.0, GRID_CAM_BACK_CM * rows, GRID_CAM_UP_CM * rows);
+        let fwd0 = base.forward();
+        let target = base.t + fwd0 * (GRID_CAM_AIM_CM + GRID_CAM_AIM_PER_ROW_CM * rows) - Vec3::Z * (GRID_CAM_AIM_DROP_CM * rows);
+        let fwd = (target - eye).normalize();
+        Xf { t: eye, q: glam::Quat::from_rotation_arc(fwd0, fwd) * base.q, s: base.s }
+    }
+    pub fn hero_builder_for(&self, player_id: i32) -> Option<HeroBuilder> {
+        let g = self.char_gpu.as_ref()?;
+        let place = self.data.placements.iter().find(|p| p.player_id == player_id)?;
+        let xf = Xf { t: place.character.t, q: place.character.q, s: Vec3::ONE };
+        let swap = Mat4::from_cols(Vec4::new(100., 0., 0., 0.), Vec4::new(0., 0., 100., 0.), Vec4::new(0., 100., 0., 0.), Vec4::W);
+        Some(HeroBuilder { device: self.device.clone(), queue: self.queue.clone(), char_layout: g.char_layout.clone(), orig_layout: g.orig_layout.clone(), samp: g.samp.clone(), model: xf.matrix() * swap })
+    }
+    pub fn set_party_pawn(&mut self, player_id: i32, r: HeroReady) {
+        self.party.retain(|p| p.player_id != player_id);
+        self.party.push(PartyPawn { player_id, hero: r.hero, rig: r.rig, gpu: r.gpu, female_clips: r.female_clips, pose: fn_pose::CharacterPose::default(), anim: None, t0: self.last_time });
+    }
+    pub fn remove_party_pawn(&mut self, player_id: i32) { self.party.retain(|p| p.player_id != player_id); }
+    pub fn party_pawn_hero(&self, player_id: i32) -> Option<&str> { self.party.iter().find(|p| p.player_id == player_id).map(|p| p.hero.as_str()) }
 
     /// Swaps an uploaded hero in (cheap): keeps the animation clips, restarts the AnimBP state.
     pub fn set_hero_ready(&mut self, r: HeroReady) -> bool {
@@ -1735,7 +2322,7 @@ impl LobbyScene {
         if self.targets.as_ref().is_some_and(|t| t.w == w && t.h == h) { return; }
         let d = &self.device;
         let mips = w.max(h).max(1).ilog2() + 1;
-        let hdr = d.create_texture(&wgpu::TextureDescriptor { label: Some("lobby hdr"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: mips, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
+        let hdr = d.create_texture(&wgpu::TextureDescriptor { label: Some("lobby hdr"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: mips, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST, view_formats: &[] });
         let hdr_mips: Vec<wgpu::TextureView> = (0..mips).map(|m| hdr.create_view(&wgpu::TextureViewDescriptor { base_mip_level: m, mip_level_count: Some(1), ..Default::default() })).collect();
         let hdr_full = hdr.create_view(&Default::default());
         let depth = d.create_texture(&wgpu::TextureDescriptor { label: Some("lobby depth"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: DEPTH, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
@@ -1752,6 +2339,8 @@ impl LobbyScene {
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_samp) },
         ] })).collect();
         for mp in self.mat_pipes.iter_mut() { mp.groups = build_groups(d, mp, &depth_only); }
+        for mp in self.shadow_mat_pipes.iter_mut().flatten() { mp.groups = build_groups(d, mp, &depth_only); }
+        for mp in self.prepass_pipes.iter_mut().flatten() { mp.groups = build_groups(d, mp, &depth_only); }
         self.targets = Some(Targets { w, h, hdr, hdr_mips, hdr_full, depth, depth_view, depth_only, post_bg, down_bgs });
         self.targets_gen += 1;
     }
@@ -1781,7 +2370,15 @@ impl LobbyScene {
     pub fn render(&mut self, target: &wgpu::TextureView, width: u32, height: u32, time: f32) { self.render_ext(target, width, height, time, None) }
 
     pub fn render_ext(&mut self, target: &wgpu::TextureView, width: u32, height: u32, time: f32, mut ext: Option<&mut dyn LobbyTranslucent>) {
+        let dt = (time - self.last_time).clamp(0.0, 0.1);
         self.last_time = time;
+        if (self.grid_rows_cur - self.grid_rows_target).abs() > 1e-4 || self.grid_rows_cur > 0.0 {
+            let k = 1.0 - (-dt * GRID_CAM_RATE).exp();
+            self.grid_rows_cur += (self.grid_rows_target - self.grid_rows_cur) * k;
+            if (self.grid_rows_cur - self.grid_rows_target).abs() < 1e-3 { self.grid_rows_cur = self.grid_rows_target; }
+            self.camera = self.grid_camera(self.grid_rows_cur);
+            if let Some(d) = self.dof.as_mut() { d.set_focus_extra(self.grid_rows_target * (GRID_CAM_BACK_CM + 145.0)); }
+        }
         self.ensure_targets(width, height);
         let cam = CameraFrame::new(&self.camera, self.fov, width, height);
         let vp = cam.view_proj();
@@ -1798,9 +2395,9 @@ impl LobbyScene {
             let center = cam.eye + cam.fwd * 1200.0;
             let half = 2600.0;
             let up = if to_light.z.abs() > 0.95 { Vec3::X } else { Vec3::Z };
-            let eye = center + to_light * 6000.0;
+            let eye = center + to_light * 100000.0;
             let view = Mat4::look_to_lh(eye, -to_light, up);
-            let proj = Mat4::orthographic_lh(-half, half, -half, half, 0.0, 12000.0);
+            let proj = Mat4::orthographic_lh(-half, half, -half, half, 0.0, 106000.0);
             // snap to texels
             let texel = 2.0 * half / SHADOW_SIZE as f32;
             let mut m = proj * view;
@@ -1826,42 +2423,47 @@ impl LobbyScene {
             fu.fog_d = [dc[0] * k, dc[1] * k, dc[2] * k, f.directional_exponent];
             fu.fog_e = [f.directional_start_distance, 0., 0., 0.];
         }
-        fu.counts = [self.lights.len() as u32, 0, 0, 0];
         for i in 0..6 { fu.pt_vp[i] = self.pt_vps[i].to_cols_array_2d(); }
-        fu.pt_idx = [self.pt_idx, 0, 0, 0];
-        for (i, l) in self.lights.iter().enumerate().take(MAX_LIGHTS) { fu.lights[i] = *l; }
+        let mut n_lights = 0usize;
+        let mut pt_gpu = u32::MAX;
+        for (i, l) in self.lights.iter().enumerate() {
+            if n_lights >= MAX_LIGHTS { break; }
+            if l.color[0] == 0.0 && l.color[1] == 0.0 && l.color[2] == 0.0 && i as u32 != self.pt_idx { continue; }
+            if i as u32 == self.pt_idx { pt_gpu = n_lights as u32; }
+            fu.lights[n_lights] = *l;
+            n_lights += 1;
+        }
+        fu.counts = [n_lights as u32, 0, 0, 0];
+        fu.pt_idx = [pt_gpu, 0, 0, 0];
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&fu));
         self.queue.write_buffer(&self.shadow_vp_buf, 0, bytemuck::cast_slice(&shadow_vp.to_cols_array()));
         self.queue.write_buffer(&self.cview_buf, 0, bytemuck::cast_slice(&vp.to_cols_array()));
-        let vb: Vec<f32> = cam.view_buffer(time).iter().flatten().copied().collect();
+        let vbv = cam.view_buffer(time);
+        let vb: Vec<f32> = vbv.iter().flatten().copied().collect();
         self.queue.write_buffer(&self.view_buf, 0, bytemuck::cast_slice(&vb));
+        let mut svb = vbv.clone();
+        let stw = shadow_vp * Mat4::from_translation(cam.eye);
+        for i in 0..4 { svb[i] = stw.col(i).to_array(); }
+        self.queue.write_buffer(&self.shadow_view_buf, 0, bytemuck::cast_slice(&svb.iter().flatten().copied().collect::<Vec<f32>>()));
         let pu = self.post_u(width, height);
         self.queue.write_buffer(&self.post_buf, 0, bytemuck::bytes_of(&pu));
         // ---- character pose ----
         if let (Some(a), Some(g)) = (&self.char_asset, &self.char_gpu) {
             // BR player AnimBP, idle: no velocity, on ground, nothing held. Stepped at 60 Hz from the lobby start (a time that goes backwards restarts it).
             let ct = (time - self.char_t0).max(0.0);
-            if self.anim.as_ref().is_some_and(|(_, t)| *t > ct + 1e-4) { self.anim = None; }
-            let (st, st_t) = self.anim.get_or_insert_with(|| (fn_animgraph::AnimState::new(), 0.0));
-            let weapon: &'static str = lobby_weapon();
-            let input = fn_animgraph::PawnInput { weapon, ..fn_animgraph::PawnInput::default() };
-            st.set_female(a.female_clips.is_some());
-            while *st_t + 1.0 / 60.0 <= ct { st.step(&input, 1.0 / 60.0); *st_t += 1.0 / 60.0; }
-            if fn_live::var("FN_LOBBY_NOIK").is_ok() { st.vars.right_hand_ik_alpha = 0.0; st.vars.left_hand_ik_alpha = 0.0; }
-            let tree = st.plan(&[]);
-            a.rig.evaluate_into(&tree, &FemaleLayer(&a.clips, a.female_clips.as_deref()), &mut self.char_pose);
-            // the body's pose drives the head part's bones too (the head clip's face bones are not applied)
-            for (pi, part) in g.parts.iter().enumerate() {
-                if let Some(pr) = self.char_pose.parts.get(pi) { self.queue.write_buffer(&part.bones, 0, &pr.gpu_bytes()); }
+            pose_pawn(&self.queue, &a.rig, &a.clips, a.female_clips.as_deref(), &mut self.anim, ct, &mut self.char_pose, &g.parts);
+            for pp in self.party.iter_mut() {
+                let ct = (time - pp.t0).max(0.0);
+                pose_pawn(&self.queue, &pp.rig, &a.clips, pp.female_clips.as_deref(), &mut pp.anim, ct, &mut pp.pose, &pp.gpu);
             }
         }
         let t = self.targets.as_ref().unwrap();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lobby frame") });
         // ---- point light cube shadow ----
-        if self.pt_idx != u32::MAX {
+        if self.pt_idx != u32::MAX && fn_live::var_os("FN_LOBBY_NOPTSHADOW").is_none() {
             for f in 0..6 {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("lobby point shadow"), color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.pt_face_views[f], depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
-                for d in self.draws.iter().filter(|d| d.shadow) {
+                for d in self.draws.iter().filter(|d| d.pt_shadow && self.draw_on(d)) {
                     let m = &self.meshes[d.mesh];
                     pass.set_pipeline(&self.shadow_pipes[m.pairs.clamp(1, 4) - 1]);
                     pass.set_bind_group(0, &self.pt_bgs[f], &[d.prim as u32]);
@@ -1872,20 +2474,30 @@ impl LobbyScene {
             }
         }
         // ---- shadow ----
-        if self.sun.is_some() {
+        if self.sun.is_some() && fn_live::var_os("FN_LOBBY_NOSHADOW").is_none() {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("lobby shadow"), color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.shadow_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
-            for d in self.draws.iter().filter(|d| d.shadow) {
+            for d in self.draws.iter().filter(|d| d.shadow && self.draw_on(d)) {
                 let m = &self.meshes[d.mesh];
+                if let Some(sp) = self.shadow_mat_pipes.get(self.draw_key(d)).and_then(|x| x.as_ref()) {
+                    pass.set_pipeline(&sp.pipeline);
+                    let offs: Vec<u32> = vec![d.prim as u32; sp.dyn_count];
+                    for (g, bg) in sp.groups.iter().enumerate() { if g == 0 { pass.set_bind_group(0, bg, &offs); } else { pass.set_bind_group(g as u32, bg, &[]); } }
+                    pass.set_bind_group(3, &self.group3_shadow, &[]);
+                    pass.set_vertex_buffer(0, m.vb.slice(..));
+                    pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
+                    continue;
+                }
                 pass.set_pipeline(&self.shadow_pipes[m.pairs.clamp(1, 4) - 1]);
                 pass.set_bind_group(0, &self.shadow_bg, &[d.prim as u32]);
                 pass.set_vertex_buffer(0, m.vb.slice(..));
                 pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
             }
-            if let (Some(sp), Some(g)) = (&self.char_shadow_pipe, &self.char_gpu) {
+            if let (Some(sp), Some(g), false) = (&self.char_shadow_pipe, &self.char_gpu, self.hide_character) {
                 pass.set_pipeline(sp);
                 pass.set_bind_group(1, &g.shadow_bg, &[]);
-                for part in &g.parts { for p in &part.prims {
+                for part in g.parts.iter().chain(self.party.iter().flat_map(|p| p.gpu.iter())) { for p in &part.prims {
                     pass.set_bind_group(0, &p.bind, &[]);
                     pass.set_vertex_buffer(0, p.vb.slice(..));
                     pass.set_index_buffer(p.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1893,6 +2505,8 @@ impl LobbyScene {
                 } }
             }
         }
+        if let Some(e) = ext.as_deref_mut() { e.advance(time); }
+        let vol_sprites: Vec<VolSprite> = ext.as_deref().map(|e| e.volume_sprites(cam.eye)).unwrap_or_default();
         // ---- LOBBY VOLFOG: volume passes (lit with this frame's sun shadow map: the shadow passes are submitted first) ----
         if let Some(vf) = self.vfog.as_mut() {
             self.queue.submit([std::mem::replace(&mut enc, self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lobby frame") })).finish()]);
@@ -1903,6 +2517,19 @@ impl LobbyScene {
                 forward: [l.dir[0], l.dir[1], l.dir[2], 0.], spot: [if l.color[3] > 1.5 { l.dir[3] } else { -2. }, l.cone[0], 0., l.cone[3]],
             }).collect();
             let q = fn_render::quality::ShadowScalability::level(3); // Epic (the reference capture's setting)
+            let vox_data = self.vox.as_ref().filter(|_| fn_live::var_os("FN_LOBBY_NOVOX").is_none()).map(|vs| {
+                let parts = vol_particles(&vol_sprites, &vs.material_path, &cam);
+                let grid = fn_render::fog::grid_size_for(width, height, q.volumetric_fog_grid_pixel_size, q.volumetric_fog_grid_size_z);
+                let sw = |v: Vec3| Vec3::new(v.x, v.z, v.y);
+                let vp = fn_fx::view::ViewParams { eye: sw(cam.eye) * 0.01, forward: sw(cam.fwd), up: Vec3::Y, tan_half: (cam.tan_x, cam.tan_y), near_m: NEAR_CM * 0.01, far_m: FAR_CM * 0.01,
+                    width: grid[0], height: grid[1], time, real_time: time, delta_world: 0.0 };
+                let mut vb = vp.view_buffer();
+                let base = fn_render::static_gdf::VIEW_GLOBAL_VOLUME_CENTER_AND_EXTENT;
+                if vb.len() < base + 9 { vb.resize(base + 9, [0.; 4]); }
+                vb[base..base + 9].copy_from_slice(&vs.gdf.view_constants);
+                let c = vp.clip();
+                (vb, vs.material.packed(time).cb, parts, [c.a as f32, c.b as f32])
+            });
             // CHOSEN: a still / first frame has no history; UE converges over frames (history weight 0.9, Halton jitter), so the first frame runs 24 jittered warm-up
             // iterations of the volume passes before the one that is composited.
             let warm = if vf.has_history(self.vfog_frame) { 0 } else { 24 };
@@ -1912,6 +2539,8 @@ impl LobbyScene {
                     view_proj: vp, frame_index: self.vfog_frame, depth_view: &t.depth_only, depth_gen: self.targets_gen,
                     shadow: self.sun.map(|_| (&self.shadow_view, shadow_vp, SHADOW_SIZE, 0.0)), lights: &ext, // CHOSEN: bias 0 (the lobby's single 4096 map is not UE's cascade setup)
                     grid_pixel_size: q.volumetric_fog_grid_pixel_size, grid_size_z: q.volumetric_fog_grid_size_z,
+                    voxel: vox_data.as_ref().map(|(vb, mc, parts, _)| fn_render::volfog::ExtVoxelFrame { view_cb: vb, material_cb: mc, particles: parts }),
+                    device_z: vox_data.as_ref().map_or([0.; 2], |d| d.3),
                 };
                 vf.prepare(&self.queue, &frame);
                 self.vfog_frame += 1;
@@ -1927,23 +2556,40 @@ impl LobbyScene {
         let light = self.fx_light_block();
         if let Some(e) = ext.as_deref_mut() { e.prepare(&cam, time, &t.depth_only, self.targets_gen, &light); }
         let ext_ref: Option<&dyn LobbyTranslucent> = ext.as_deref();
+        let prepass = fn_live::var_os("FN_LOBBY_NOPREPASS").is_none();
+        if prepass {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("lobby depth pre-pass"), color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
+            for d in self.draws.iter().filter(|d| !d.translucent && self.draw_on(d)) {
+                let Some(sp) = self.prepass_pipes.get(self.draw_key(d)).and_then(|x| x.as_ref()) else { continue };
+                pass.set_pipeline(&sp.pipeline);
+                let offs: Vec<u32> = vec![d.prim as u32; sp.dyn_count];
+                for (g, bg) in sp.groups.iter().enumerate() { if g == 0 { pass.set_bind_group(0, bg, &offs); } else { pass.set_bind_group(g as u32, bg, &[]); } }
+                pass.set_bind_group(3, &self.group3, &[]);
+                let m = &self.meshes[d.mesh];
+                pass.set_vertex_buffer(0, m.vb.slice(..));
+                pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(d.first..d.first + d.count, 0, 0..1);
+            }
+        }
         // ---- scene (opaque + masked) ----
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("lobby scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &t.hdr_mips[0], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth_view, depth_ops: Some(wgpu::Operations { load: if prepass { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(1.0) }, store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             pass.set_bind_group(3, &self.group3, &[]);
             let mut last = usize::MAX;
-            let mut order: Vec<&DrawItem> = self.draws.iter().filter(|d| !d.translucent).collect();
-            order.sort_by_key(|d| d.material_key);
+            let mut order: Vec<&DrawItem> = self.draws.iter().filter(|d| !d.translucent && self.draw_on(d)).collect();
+            order.sort_by_key(|d| self.draw_key(d));
             for d in order { self.draw_static(&mut pass, d, &mut last); }
-            if let (Some(p), Some(g)) = (&self.char_pipe, &self.char_gpu) {
+            if let (Some(p), Some(g), false) = (&self.char_pipe, &self.char_gpu, self.hide_character) {
                 pass.set_pipeline(p);
                 pass.set_bind_group(1, &g.cam_bg, &[]);
                 pass.set_bind_group(2, &g.empty_bg, &[]);
                 pass.set_bind_group(3, &self.group3, &[]);
-                for part in &g.parts { for pr in &part.prims {
+                for part in g.parts.iter().chain(self.party.iter().flat_map(|p| p.gpu.iter())) { for pr in &part.prims {
                     if let Some(ob) = &pr.orig {
                         pass.set_pipeline(&g.orig_pipe);
                         pass.set_bind_group(0, ob, &[]);
@@ -1978,12 +2624,13 @@ impl LobbyScene {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth_view, depth_ops: None, stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             pass.set_bind_group(3, &self.group3, &[]);
-            let mut order: Vec<&DrawItem> = self.draws.iter().filter(|d| d.translucent).collect();
+            let mut order: Vec<&DrawItem> = self.draws.iter().filter(|d| d.translucent && self.draw_on(d)).collect();
             order.sort_by(|a, b| a.sort_priority.cmp(&b.sort_priority).then((b.pos - cam.eye).length().partial_cmp(&(a.pos - cam.eye).length()).unwrap_or(std::cmp::Ordering::Equal)));
             let mut last = usize::MAX;
             for d in order { self.draw_static(&mut pass, d, &mut last); }
             if let Some(e) = ext_ref { e.draw(&mut pass); }
         }
+        if let Some(d) = self.dof.as_mut() { d.encode(&self.device, &self.queue, &mut enc, &t.hdr, &t.hdr_mips[0], &t.depth_only, t.w, t.h); }
         // ---- bloom mips ----
         for i in 1..t.hdr_mips.len() {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("lobby mip"),
@@ -2005,9 +2652,13 @@ impl LobbyScene {
         self.queue.submit([enc.finish()]);
     }
 
+    fn draw_key(&self, d: &DrawItem) -> usize {
+        match d.pad { Some((id, empty, occ)) => if self.occupied.contains(&id) { occ } else { empty }, None => d.material_key }
+    }
     fn draw_static<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, d: &DrawItem, last: &mut usize) {
-        let mp = &self.mat_pipes[d.material_key];
-        if *last != d.material_key { pass.set_pipeline(&mp.pipeline); *last = d.material_key; }
+        let key = self.draw_key(d);
+        let mp = &self.mat_pipes[key];
+        if *last != key { pass.set_pipeline(&mp.pipeline); *last = key; }
         let offs: Vec<u32> = vec![d.prim as u32; mp.dyn_count];
         for (g, bg) in mp.groups.iter().enumerate() {
             if g == 0 { pass.set_bind_group(0, bg, &offs); } else { pass.set_bind_group(g as u32, bg, &[]); }
@@ -2108,4 +2759,33 @@ fn lobby_female_clips(set: &fn_pak::PakSet) -> Result<Arc<fn_pose::ClipStore>, S
     let store = Arc::new(fn_pose::ClipStore::load(&src, &fn_animgraph::female_clips(), &skel, fn_pose::clip::SampleMode::Ue)?);
     *g = Some(store.clone());
     Ok(store)
+}
+
+#[cfg(test)]
+mod pawn_tests {
+    use super::*;
+    fn install() -> Option<std::path::PathBuf> {
+        let root = fn_live::var_os("FN_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Users\Brady\Downloads\1.8\Fortnite\Fortnite\FortniteGame".into());
+        root.exists().then_some(root)
+    }
+    #[test]
+    fn lobby_pawn_idle_leaves_the_bind_pose() {
+        let Some(dir) = install() else { return };
+        let set = fn_pak::PakSet::open_install(&dir).expect("paks");
+        let a = load_character_asset(&set, fn_pose::br_character::DEFAULT_HERO).expect("hero");
+        let mut st = fn_animgraph::AnimState::new();
+        let input = fn_animgraph::PawnInput { weapon: lobby_weapon(), ..fn_animgraph::PawnInput::default() };
+        st.set_female(a.female_clips.is_some());
+        for _ in 0..120 { st.step(&input, 1.0 / 60.0); }
+        let tree = st.plan(&[]);
+        let mut pose = fn_pose::CharacterPose::default();
+        a.rig.evaluate_into(&tree, &FemaleLayer(&a.clips, a.female_clips.as_deref()), &mut pose);
+        let part = &a.rig.parts[0];
+        let i = part.tree.bone_index("upperarm_l").expect("upperarm_l");
+        let bind = part.tree.local[i].1;
+        let now = pose.parts[0].bone_local[i];
+        eprintln!("missing {:?} tree {:?}", pose.missing_clips, format!("{tree:?}").chars().take(600).collect::<String>());
+        eprintln!("upperarm_l bind {bind:?} posed {now:?}");
+        assert!(pose.missing_clips.is_empty(), "missing clips {:?}", pose.missing_clips);
+    }
 }

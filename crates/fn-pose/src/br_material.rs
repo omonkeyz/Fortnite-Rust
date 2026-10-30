@@ -14,7 +14,7 @@
 //!   the head mesh.
 //! * `M_Athena_InvisibleGrenades` (plain `BLEND_Masked`): every coverage shader (depth pre-pass, shadow depth, hit proxy, velocity, lightmap density) discards unconditionally.
 //!
-//! Not recoverable / not done: the SubsurfaceProfile (`SS_HeroSkin_01`) screen-space pass and its atlas row (`__SubsurfaceProfile` is assigned at run time), runtime-driven
+//! `__SubsurfaceProfile` = the allocation id of the chain's profile ([`subsurface_profile_id`], fn-render subsurface.rs). Not recoverable / not done: runtime-driven
 //! parameters (`HitGlow`, `SuperChargedEffect`, `DissolveGradient*`, `AverageHandPosition`: defaults are used), the atmospheric-fog fade `TEXCOORD7.w` of the eyeshadow vertex
 //! shader (the fog start distance is a sky actor setting; 1.0 is used, exact inside the fog start distance), the per-vertex tangents (the renderer's derivative frame is used).
 use crate::br_character::{RgbaTexture, PartDef};
@@ -42,6 +42,7 @@ pub struct CharSection {
     pub noise: FixedTex,
     /// CHAR PREPASS (2026-10-06): fixed texture slots 8, 9, 10 of the depth-only coverage shader (`char_depth_gen.wgsl`): see [`RES_IN_TEXTURES`].
     pub res_in: [FixedTex; 3],
+    pub subsurface_profile: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -90,10 +91,50 @@ pub struct ChainParams {
     pub packages: Vec<String>,
     pub vectors: HashMap<String, [f32; 4]>,
     pub scalars: HashMap<String, f32>,
+    pub subsurface_profile: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubsurfaceProfileSettings { pub scatter_radius: f32, pub subsurface_color: [f32; 3], pub falloff_color: [f32; 3] }
+impl Default for SubsurfaceProfileSettings {
+    fn default() -> Self { SubsurfaceProfileSettings { scatter_radius: 1.2, subsurface_color: [0.48, 0.41, 0.28], falloff_color: [1.0, 0.37, 0.3] } }
+}
+static SSS_PROFILES: std::sync::Mutex<Vec<(String, SubsurfaceProfileSettings)>> = std::sync::Mutex::new(Vec::new());
+pub fn subsurface_profiles() -> Vec<(String, SubsurfaceProfileSettings)> {
+    let mut g = SSS_PROFILES.lock().unwrap_or_else(|p| p.into_inner());
+    if g.is_empty() { g.push((String::new(), SubsurfaceProfileSettings::default())); }
+    g.clone()
+}
+pub fn read_subsurface_profile(src: &ClipSourceDir, path: &str) -> Result<SubsurfaceProfileSettings, String> {
+    let long = path.split_once('.').map_or(path, |s| s.0);
+    let pkg = loader::package(src, long)?;
+    let idx = (0..pkg.exports.len()).find(|&i| pkg.export_class(i) == "SubsurfaceProfile").ok_or_else(|| format!("{path}: no SubsurfaceProfile export"))?;
+    let props = export_props(&pkg, idx)?;
+    let mut out = SubsurfaceProfileSettings::default();
+    if let Some(f) = props.fields("Settings") {
+        if let Some(r) = f.float("ScatterRadius") { out.scatter_radius = r as f32; }
+        if let Some(PropValue::Vec4(c)) = f.get("SubsurfaceColor") { out.subsurface_color = [c[0], c[1], c[2]]; }
+        if let Some(PropValue::Vec4(c)) = f.get("FalloffColor") { out.falloff_color = [c[0], c[1], c[2]]; }
+    }
+    Ok(out)
+}
+pub fn subsurface_profile_id(src: &ClipSourceDir, path: Option<&str>) -> Result<u32, String> {
+    let Some(path) = path else { return Ok(0) };
+    {
+        let mut g = SSS_PROFILES.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_empty() { g.push((String::new(), SubsurfaceProfileSettings::default())); }
+        if let Some(i) = g.iter().position(|(p, _)| p == path) { return Ok(i as u32); }
+    }
+    let settings = read_subsurface_profile(src, path)?;
+    let mut g = SSS_PROFILES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(i) = g.iter().position(|(p, _)| p == path) { return Ok(i as u32); }
+    g.push((path.to_owned(), settings));
+    Ok(g.len() as u32 - 1)
 }
 
 pub fn chain_params(src: &ClipSourceDir, material: &str) -> Result<ChainParams, String> {
     let mut out = ChainParams::default();
+    let mut profile_decided = false;
     let mut cur = Some(material.to_owned());
     while let Some(path) = cur.take() {
         if out.packages.len() > 16 { return Err(format!("{material}: material parent chain too deep")); }
@@ -101,8 +142,12 @@ pub fn chain_params(src: &ClipSourceDir, material: &str) -> Result<ChainParams, 
         let pkg = loader::package(src, long)?;
         let idx = pkg.exports.iter().position(|e| e.object_name == object).ok_or_else(|| format!("{path}: missing material export"))?;
         out.packages.push(long.to_owned());
-        if pkg.export_class(idx) != "MaterialInstanceConstant" { break; }
         let props = export_props(&pkg, idx)?;
+        if pkg.export_class(idx) != "MaterialInstanceConstant" {
+            if !profile_decided { out.subsurface_profile = props.get("SubsurfaceProfile").and_then(|v| obj_path(&pkg, v)); }
+            break;
+        }
+        if !profile_decided && props.bool("bOverrideSubsurfaceProfile") == Some(true) { out.subsurface_profile = props.get("SubsurfaceProfile").and_then(|v| obj_path(&pkg, v)); profile_decided = true; }
         for v in props.array("ScalarParameterValues").map(|a| a.as_slice()).unwrap_or(&[]) {
             let Some(f) = v.as_fields() else { continue };
             if let (Some(n), Some(x)) = (param_name(f), f.float("ParameterValue")) { out.scalars.entry(n).or_insert(x as f32); }
@@ -132,6 +177,42 @@ pub fn read_swatch(src: &ClipSourceDir, swatch: &str) -> Result<Vec<(String, [f3
     Ok(out)
 }
 
+pub const DISSOLVE_PARAMS: [&str; 5] = ["DissolveGradientBaseLocation", "DissolveGradientDirectionalVector", "DissolveGradientDistance", "DissolveGradientPercentage", "FirstSpawnPassComplete"];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamPatch { pub reg: usize, pub comp: usize, pub param: usize, pub src: usize, pub scale: f32, pub default: f32 }
+
+fn recipe(perm: &str, p: &dyn Fn(&str, [f32; 4]) -> [f32; 4]) -> Option<Vec<[f32; 4]>> {
+    match perm { "head" => Some(genm::head_cb(p).to_vec()), "hair" => Some(genm::hair_cb(p).to_vec()), "body" => Some(genm::body_cb(p).to_vec()), _ => None }
+}
+
+pub fn param_patches(perm: &str, names: &[&str]) -> Vec<ParamPatch> {
+    let mut out = vec![];
+    let Some(c0) = recipe(perm, &|_, d| d) else { return out };
+    for (pi, name) in names.iter().enumerate() {
+        for src in 0..4 {
+            let def = std::cell::Cell::new(None);
+            let probe = |k: f32| recipe(perm, &|n: &str, d: [f32; 4]| if n == *name { def.set(Some(d[src])); let mut v = d; v[src] += k; v } else { d }).unwrap_or_default();
+            let (c1, c2) = (probe(1.), probe(2.));
+            let Some(d) = def.get() else { continue };
+            for reg in 0..c0.len() { for comp in 0..4 {
+                let s1 = c1[reg][comp] - c0[reg][comp];
+                if s1 == 0. { continue; }
+                let s2 = c2[reg][comp] - c0[reg][comp];
+                if (s2 - 2. * s1).abs() > 1e-4 * s1.abs().max(1.) { continue; }
+                out.push(ParamPatch { reg, comp, param: pi, src, scale: s1, default: d });
+            } }
+        }
+    }
+    out
+}
+
+pub fn apply_patches(base: &[[f32; 4]], patches: &[ParamPatch], values: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    let mut cb = base.to_vec();
+    for p in patches { if let (Some(r), Some(v)) = (cb.get_mut(p.reg), values.get(p.param)) { r[p.comp] = base[p.reg][p.comp] + p.scale * (v[p.src] - p.default); } }
+    cb
+}
+
 /// Parameter names the constant buffer recipe of a permutation looks up.
 pub fn recipe_param_names(perm: &str) -> Vec<String> {
     let names = std::cell::RefCell::new(vec![]);
@@ -154,8 +235,12 @@ fn load_fixed(src: &ClipSourceDir, path: &str, linear_sampler: bool) -> Result<F
     let t = loader::texture_export(src, path)?;
     if t.num_slices != 1 { return Err(format!("{path}: not a plain 2D texture")); }
     let mip = t.best_mip().ok_or_else(|| format!("{path}: no available mip"))?;
-    let img = t.decode(mip, fn_texture::DecodeOptions::default()).map_err(|e| format!("{path}: {e}"))?;
-    Ok(FixedTex { tex: RgbaTexture { width: img.width, height: img.height, rgba: img.to_rgba8(), cooked: crate::br_character::CookedChain::of(&t).map(std::sync::Arc::new) }, srgb: t.srgb && !linear_sampler, address: [t.address_x.clone(), t.address_y.clone()], path: path.to_owned() })
+    let cooked = crate::br_character::CookedChain::of(&t).map(std::sync::Arc::new);
+    let (width, height, rgba) = if cooked.is_some() && crate::br_character::cooked_only() { (t.mips[mip].width as usize, t.mips[mip].height as usize, Vec::new()) } else {
+        let img = t.decode(mip, fn_texture::DecodeOptions::default()).map_err(|e| format!("{path}: {e}"))?;
+        (img.width, img.height, img.to_rgba8())
+    };
+    Ok(FixedTex { tex: RgbaTexture { width, height, rgba, cooked }, srgb: t.srgb && !linear_sampler, address: [t.address_x.clone(), t.address_y.clone()], path: path.to_owned() })
 }
 
 /// The permutation that owns the shader map of `material`'s chain and the evaluated constant buffer. `overrides` (swatch colours) win over the instance chain, like the
@@ -163,8 +248,10 @@ fn load_fixed(src: &ClipSourceDir, path: &str, linear_sampler: bool) -> Result<F
 pub fn resolve_char_material(src: &ClipSourceDir, material: &str, overrides: &HashMap<String, [f32; 4]>) -> Result<Option<CharSection>, String> {
     let chain = chain_params(src, material)?;
     let Some((perm, owner)) = chain.packages.iter().find_map(|p| genm::PERMS.iter().find(|q| q.owner == p.as_str() && q.id != "eyeshadow").map(|q| (q.id, q.owner))) else { return Ok(None) };
+    let profile_id = subsurface_profile_id(src, chain.subsurface_profile.as_deref())?;
     let lookup = |name: &str, d: [f32; 4]| -> [f32; 4] {
-        if let Some(v) = overrides.get(name) { *v }
+        if name == "__SubsurfaceProfile" { [profile_id as f32 / 255.; 4] }
+        else if let Some(v) = overrides.get(name) { *v }
         else if let Some(v) = chain.vectors.get(name) { *v }
         else if let Some(s) = chain.scalars.get(name) { [*s; 4] }
         else { d }
@@ -172,7 +259,7 @@ pub fn resolve_char_material(src: &ClipSourceDir, material: &str, overrides: &Ha
     let cb: Vec<[f32; 4]> = match perm { "head" => genm::head_cb(&lookup).to_vec(), "hair" => genm::hair_cb(&lookup).to_vec(), "body" => genm::body_cb(&lookup).to_vec(), o => return Err(format!("unknown permutation {o}")) };
     let noise = load_fixed(src, NOISE_PATH, false)?;
     let r = |i: usize| load_fixed(src, RES_IN_TEXTURES[i].0, RES_IN_TEXTURES[i].1);
-    Ok(Some(CharSection { perm, owner: owner.to_owned(), cb, noise, res_in: [r(0)?, r(1)?, r(2)?] }))
+    Ok(Some(CharSection { perm, owner: owner.to_owned(), cb, noise, res_in: [r(0)?, r(1)?, r(2)?], subsurface_profile: profile_id }))
 }
 
 /// The Eyeshadow material's constants (cooked defaults: nothing sets its parameters for a standing character) and fixed textures.
@@ -197,4 +284,21 @@ pub fn swatch_overrides(src: &ClipSourceDir, defs: &[&PartDef], notes: &mut Vec<
         }
     }
     out
+}
+
+#[cfg(test)]
+mod dissolve_tests {
+    #[test] fn dissolve_parameters_patch_the_cooked_recipe_registers() {
+        let ps = super::param_patches("head", &super::DISSOLVE_PARAMS);
+        let at = |reg: usize, comp: usize| ps.iter().find(|p| p.reg == reg && p.comp == comp).copied();
+        assert_eq!(at(25, 1).map(|p| (p.param, p.scale)), Some((3, 1.)));
+        assert_eq!(at(25, 2).map(|p| (p.param, p.scale)), Some((3, 2.)));
+        assert_eq!(at(24, 3).map(|p| p.param), Some(2));
+        assert_eq!(at(18, 2).map(|p| (p.param, p.src)), Some((0, 2)));
+        let base = super::recipe("head", &|_, d| d).unwrap();
+        let mut v = [[0.; 4]; 5]; v[0] = [1., 2., 3., 1.]; v[1] = [0., 0., -1., 1.]; v[2] = [50.; 4]; v[3] = [0.25; 4]; v[4] = [1.; 4];
+        let cb = super::apply_patches(&base, &ps, &v);
+        assert_eq!((cb[25][1], cb[25][2], cb[24][3], cb[18][0]), (0.25, 0.5, 50., 1.));
+        for perm in ["hair", "body"] { assert!(super::param_patches(perm, &super::DISSOLVE_PARAMS).iter().any(|p| p.param == 3)); }
+    }
 }

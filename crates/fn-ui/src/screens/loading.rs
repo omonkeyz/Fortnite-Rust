@@ -105,7 +105,10 @@ pub fn wrap(text: &str, width: &dyn Fn(&str) -> f32, max_px: f32, max_lines: usi
 /// Single-line fit: ellipsizes `text` so its measured width never exceeds `max_px`.
 pub fn fit(text: &str, width: &dyn Fn(&str) -> f32, max_px: f32) -> String {
     if width(text) <= max_px { return text.to_owned(); }
-    let mut s = text.to_owned(); while !s.is_empty() && width(&format!("{s}...")) > max_px { s.pop(); } format!("{s}...")
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let (mut lo, mut hi) = (0usize, ends.len() - 1);
+    while lo < hi { let mid = (lo + hi + 1) / 2; if width(&format!("{}...", &text[..ends[mid]])) <= max_px { lo = mid; } else { hi = mid - 1; } }
+    format!("{}...", &text[..ends[lo]])
 }
 
 /// Width function over an integer per-character table (the old GDI `widths: [i32; 128]`), for callers/tests that still have one.
@@ -141,7 +144,7 @@ impl LoadingScreen {
     }
     fn ensure(&mut self, ctx: &mut UiContext) -> Tex {
         if !self.tips_loaded { self.tips = Self::load_tips(ctx); self.tips_loaded = true; }
-        if let Some(t) = self.tex { return t; }
+        if let Some(t) = self.tex { if [t.bg, t.logo, t.bar_back, t.bar_fill].iter().all(|i| i.id == TextureId::NONE || ctx.assets.store.get(i.id).is_some()) { return t; } }
         // Everything here is optional: a missing background/bar texture is skipped (TextureId::NONE) and missing tips mean no tip text.
         let t = Tex { bg: art(ctx, "FORT_Load_BattleRoyale.png"), logo: art(ctx, "T-Logo-Wordmark-1024.png"), bar_back: art(ctx, "ProgressBar_Background.png"), bar_fill: art(ctx, "ProgressBar_Fill.png") };
         self.tex = Some(t); t

@@ -126,12 +126,16 @@ pub struct HudWorld {
     /// CONTAINERS: the prompt is a hold interaction (`SetForcedHoldKeybindStatus(RequiredDuration > 0)`): `Some(Percentage)` of the running hold (0 = not
     /// started; `UFortKeybindWidget::StartHoldProgress` / tick: elapsed / duration), drawn as the KeybindWidget hold ring (`screens::hold_ring`).
     pub interaction_hold: Option<f32>,
+    pub team_indicators: Vec<crate::screens::team_indicator_cooked::TeamIndicator>,
     pub equip: Option<EquipProgress>,
     /// The held firearm's ammo counter (AthenaEquippedItemWidget); None = the pickaxe / nothing ranged (the widget's switcher is collapsed).
     pub ammo: Option<crate::screens::equipped_item::EquippedAmmo>,
     /// WIDGETS3: the running cooldown of the item in each primary quickbar slot (`QuickbarSlotCooldown`, see `screens::slot_cooldown`).
     pub slot_cooldowns: [Option<crate::screens::slot_cooldown::SlotCooldown>; 6],
     pub aerial: Option<crate::screens::aerial_feedback::AerialPrompt>,
+    pub radial: Option<crate::screens::radial_picker_cooked::RadialView>,
+    pub picked_up: Vec<crate::screens::pickup_stream::PickedUp>,
+    pub health_bars: Vec<crate::screens::health_bar::HealthBarView>,
 }
 impl HudWorld {
     /// Non-finite numbers repaired (a producer bug must never poison the draw list).

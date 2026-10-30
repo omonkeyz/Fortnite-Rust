@@ -102,6 +102,13 @@ pub const MELEE: Mode = Mode {
     push_out: 0.2, hide_pawn_pct: 0.15, transition_time: 0.45, feelers: &FEELERS,
 };
 
+pub const DBNO: Mode = Mode {
+    name: "Athena_PlayerCamera_DBNO",
+    vt_offset: &[Sample { pitch: 0., offset: [0., 10., 15.] }],
+    transition_time: 2.0,
+    ..BASE
+};
+
 pub fn clamp_pitch(pitch: f32) -> f32 { pitch.clamp(PITCH_MIN, PITCH_MAX) }
 
 /// FInterpTo-style step (ASSUMED shape): moves `speed*dt` of the remaining distance, never overshoots.

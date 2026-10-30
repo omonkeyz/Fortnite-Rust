@@ -105,7 +105,7 @@ impl InventoryUi {
 
 /// What an inventory item id refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Target { Stack(Loc), Ammo(usize), Resource(usize) }
+pub enum Target { Stack(Loc), Ammo(usize), Resource(usize), LooseAmmo(usize) }
 
 /// Item ids of the panel. 0 pickaxe, firearm g: `g + 1` for the three starters, `g + 5` after (the legacy ids, which are also the catalog indices of `set_catalog` / `add_catalog_item`),
 /// 5..=7 wood / stone / metal, healable stack: `100 + idx * 10 + ordinal` (ordinal among the stacks of that healable, bar first), ammo of the type first used by firearm g: `200 + g`.
@@ -113,6 +113,8 @@ pub fn item_id(item: Item, heal_ordinal: usize) -> u32 {
     match item { Item::Pickaxe => 0, Item::Gun(g) => if g < 3 { g as u32 + 1 } else { g as u32 + 5 }, Item::Heal { idx, .. } => 100 + idx as u32 * 10 + heal_ordinal.min(9) as u32 }
 }
 pub const AMMO_ID_BASE: u32 = 200;
+pub const LOOSE_AMMO_ID_BASE: u32 = 900;
+pub const BR_AMMO_ITEMS: [&str; 5] = ["/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight.AthenaAmmoDataBulletsLight", "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsMedium.AthenaAmmoDataBulletsMedium", "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsHeavy.AthenaAmmoDataBulletsHeavy", "/Game/Athena/Items/Ammo/AthenaAmmoDataShells.AthenaAmmoDataShells", "/Game/Athena/Items/Ammo/AmmoDataRockets.AmmoDataRockets"];
 /// Textures the inventory panel draws by name (object paths from the widget data: `AthenaInventoryFortItemTileButton`, `AthenaInventoryDropSlot`, `AthenaInventoryEquipSlot`).
 pub const INVENTORY_ART: [&str; 7] = [
     "/Game/Athena/HUD/Art/quickbar_s1.quickbar_s1", "/Game/Athena/HUD/Art/quickbar_s2.quickbar_s2", "/Game/Athena/HUD/Art/quickbar_s3.quickbar_s3",
@@ -135,6 +137,7 @@ pub fn enumerate(arms: &Arms, res: [u32; 3]) -> Vec<(u32, Target, u32)> {
         seen.push(&gun.def.ammo);
         if arms.reserve[g] > 0 { out.push((AMMO_ID_BASE + g as u32, Target::Ammo(g), arms.reserve[g])); }
     }
+    for (i, (_, n)) in arms.loose_ammo.iter().enumerate() { if *n > 0 { out.push((LOOSE_AMMO_ID_BASE + i as u32, Target::LooseAmmo(i), *n)); } }
     for (k, n) in res.iter().enumerate() { if *n > 0 { out.push((RESOURCE_ID_BASE + k as u32, Target::Resource(k), *n)); } }
     out
 }
@@ -171,9 +174,9 @@ impl InventoryUi {
             match fn_pose::loadout_quickbar::read_catalog_item(&src, p) { Ok(c) => { icon(&c, &mut notes); heal.push(Some(c)); } Err(e) => { notes.push(format!("[inventory] {p}: {e}")); heal.push(None); } }
         }
         let mut ammo: Vec<(String, CatalogItem)> = vec![];
-        for gun in &arms.data.guns {
-            if ammo.iter().any(|(a, _)| *a == gun.def.ammo) { continue; }
-            match fn_pose::loadout_quickbar::read_catalog_item(&src, &gun.def.ammo) { Ok(c) => { icon(&c, &mut notes); ammo.push((gun.def.ammo.clone(), c)); } Err(e) => notes.push(format!("[inventory] {}: {e}", gun.def.ammo)) }
+        for path in arms.data.guns.iter().map(|g| g.def.ammo.as_str()).chain(BR_AMMO_ITEMS) {
+            if ammo.iter().any(|(a, _)| crate::arms::inventory_ops::ammo_key(a) == crate::arms::inventory_ops::ammo_key(path)) { continue; }
+            match fn_pose::loadout_quickbar::read_catalog_item(&src, path) { Ok(c) => { icon(&c, &mut notes); ammo.push((path.to_owned(), c)); } Err(e) => notes.push(format!("[inventory] {path}: {e}")) }
         }
         // the panel's own art that the exported folder lacks: `EquipSlotOverlay` brushes of `AthenaInventoryFortItemTileButton` (`SetEquipSlotOverlay`: quickbar_s1..5), the drop
         // slot icon and the equip-slot drop highlight (straight from the paks; same decoder as the item icons)
@@ -192,10 +195,10 @@ impl InventoryUi {
             Item::Heal { idx, .. } => self.heal_cat.get(idx).and_then(|c| c.as_ref()).or_else(|| if idx == 0 { self.catalog.get(3) } else { None }).map(info_of),
         }
     }
-    fn ammo_info(&self, arms: &Arms, g: usize) -> Option<Info> {
-        let path = &arms.data.guns.get(g)?.def.ammo;
-        let p = path.split('.').next().unwrap_or(path);
-        self.ammo_cat.iter().find(|(a, _)| a.split('.').next().unwrap_or(a) == p).map(|(_, c)| info_of(c))
+    fn ammo_info(&self, arms: &Arms, g: usize) -> Option<Info> { self.ammo_info_of(&arms.data.guns.get(g)?.def.ammo) }
+    fn ammo_info_of(&self, path: &str) -> Option<Info> {
+        let p = crate::arms::inventory_ops::ammo_key(path);
+        self.ammo_cat.iter().find(|(a, _)| crate::arms::inventory_ops::ammo_key(a) == p).map(|(_, c)| info_of(c))
     }
 
     /// The HUD quickbar cards of the live bar: rarity / icon from each item definition, the stack count of a consumable. A slot whose item has no texts yet keeps its current card.
@@ -232,6 +235,10 @@ impl InventoryUi {
                     let i = self.ammo_info(arms, g).unwrap_or_default();
                     items.push(InvItem { id, name: i.name, description: i.description, rarity: i.rarity, icon: i.icon, count, item_type: if i.item_type == 0 { 1 } else { i.item_type }, equipable: false, is_resource: false, can_be_dropped: true, slot: None, def_path: i.path });
                 }
+                Target::LooseAmmo(i) => {
+                    let i = arms.loose_ammo.get(i).and_then(|(p, _)| self.ammo_info_of(p)).unwrap_or_default();
+                    items.push(InvItem { id, name: i.name, description: i.description, rarity: i.rarity, icon: i.icon, count, item_type: if i.item_type == 0 { 1 } else { i.item_type }, equipable: false, is_resource: false, can_be_dropped: true, slot: None, def_path: i.path });
+                }
                 Target::Resource(k) => {
                     let c = self.catalog.get(5 + k);
                     items.push(InvItem { id, name: c.map(|c| c.name.trim().to_owned()).unwrap_or_default(), description: c.map(|c| c.description.clone()).unwrap_or_default(), rarity: c.map_or(0, |c| c.rarity),
@@ -264,6 +271,7 @@ impl InventoryUi {
                         Err(e) => log.push(format!("[inventory] drop of item {item} refused: {e}")),
                     },
                     Some((Target::Ammo(g), _)) => match arms.drop_ammo(g, quantity) { Ok(d) => log.push(format!("[inventory] dropped {d} ammo")), Err(e) => log.push(format!("[inventory] ammo drop refused: {e}")) },
+                    Some((Target::LooseAmmo(i), _)) => match arms.drop_loose_ammo(i, quantity) { Ok(d) => log.push(format!("[inventory] dropped {d} ammo")), Err(e) => log.push(format!("[inventory] ammo drop refused: {e}")) },
                     Some((Target::Resource(k), c)) => { let d = quantity.min(c).min(res[k]); res[k] -= d; if d > 0 { arms.drops.push(Dropped::Resource { kind: k, count: d }); } log.push(format!("[inventory] dropped {d} of resource {k}")); }                    None => log.push(format!("[inventory] drop of item {item}: no such item")),
                 },
             }
@@ -338,13 +346,22 @@ mod tests {
 /// The pickup-item name and count of something the player lost to the world (`pickups_hook::queue_drop`); None for what cannot be dropped.
 pub fn drop_request(arms: &Arms, d: &Dropped) -> Option<(String, u32)> {
     use fn_pose::loadout_inventory::EXTRA_ITEMS;
-    match *d {
+    match d {
         Dropped::Stack(Item::Pickaxe) => None,
-        Dropped::Stack(Item::Gun(g)) => arms.data.guns.get(g).map(|x| (x.def.item.clone(), 1)),
-        Dropped::Stack(Item::Heal { idx, count }) => fn_pose::loadout_stats::HEALABLE_ITEMS.get(idx).map(|p| ((*p).to_owned(), count)),
-        Dropped::Ammo { gun, count } => arms.data.guns.get(gun).map(|x| (x.def.ammo.clone(), count)),
-        Dropped::Resource { kind, count } => EXTRA_ITEMS.get(1 + kind).map(|p| ((*p).to_owned(), count)),
+        Dropped::Stack(Item::Gun(g)) => arms.data.guns.get(*g).map(|x| (x.def.item.clone(), 1)),
+        Dropped::Stack(Item::Heal { idx, count }) => fn_pose::loadout_stats::HEALABLE_ITEMS.get(*idx).map(|p| ((*p).to_owned(), *count)),
+        Dropped::Ammo { gun, count } => arms.data.guns.get(*gun).map(|x| (x.def.ammo.clone(), *count)),
+        Dropped::Resource { kind, count } => EXTRA_ITEMS.get(1 + kind).map(|p| ((*p).to_owned(), *count)),
+        Dropped::LooseAmmo { item, count } => Some((item.clone(), *count)),
     }
+}
+pub fn death_drops(arms: &mut Arms, res: &mut [u32; 3]) -> Vec<(String, u32)> {
+    for (loc, item) in arms.all_stacks().into_iter().rev() { if !matches!(item, Item::Pickaxe) { let _ = arms.drop_stack(loc, item.count()); } }
+    let mut seen: Vec<String> = vec![];
+    for g in 0..arms.reserve.len().min(arms.data.guns.len()) { let a = arms.data.guns[g].def.ammo.clone(); let n = arms.reserve[g]; if n > 0 && !seen.contains(&a) { seen.push(a); let _ = arms.drop_ammo(g, n); } }
+    while let Some(n) = arms.loose_ammo.first().map(|e| e.1) { if arms.drop_loose_ammo(0, n.max(1)).is_err() { arms.loose_ammo.remove(0); } }
+    for (k, r) in res.iter_mut().enumerate() { if *r > 0 { arms.drops.push(Dropped::Resource { kind: k, count: *r }); *r = 0; } }
+    drain_drops(arms)
 }
 /// Takes everything the player dropped since the last call as (item, count) world-item requests.
 pub fn drain_drops(arms: &mut Arms) -> Vec<(String, u32)> {

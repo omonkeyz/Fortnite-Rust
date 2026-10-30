@@ -300,7 +300,7 @@ pub fn montage_curve(name: &str, pose_value: f32) -> f32 {
     with(|s| match s.curve(name) { Some((sum, w)) if w > 0. => pose_value * (1. - w.min(1.)) + sum, _ => pose_value })
 }
 /// `FRichCurve::Eval` of linear keys with constant pre / post extrapolation.
-fn curve_at(keys: &[(f32, f32)], t: f32) -> f32 {
+pub(crate) fn curve_at(keys: &[(f32, f32)], t: f32) -> f32 {
     match keys { [] => 0., [k] => k.1, _ => {
         if t <= keys[0].0 { return keys[0].1; }
         for w in keys.windows(2) { if t <= w[1].0 { let a = (t - w[0].0) / (w[1].0 - w[0].0).max(1e-6); return w[0].1 + (w[1].1 - w[0].1) * a; } }
@@ -455,6 +455,9 @@ pub fn frame(scene: &mut crate::scene::Scene, sim: &fn_game::GameSim) {
             let build = d.paper_build.iter().map(|p| scene.renderer.create_model(p, n)).collect();
             let edit = scene.renderer.create_model(&d.paper_edit, n);
             let pencil = scene.renderer.create_model(&d.pencil, 1);
+            d.paper_build = vec![];
+            d.paper_edit = vec![];
+            d.pencil = vec![];
             s.models = Some(Models { build, edit, pencil });
         }
         let dt = std::mem::take(&mut s.anim_dt);
@@ -598,10 +601,15 @@ fn material_textures(src: &ClipSourceDir, material: &str) -> Result<MatTextures,
     }
     Ok(out)
 }
-fn image(src: &ClipSourceDir, path: &str) -> Result<image::RgbaImage, String> {
+type Cooked = Option<std::sync::Arc<fn_render::mesh::CookedTexture>>;
+fn image(src: &ClipSourceDir, path: &str) -> Result<(image::RgbaImage, Cooked), String> {
     let t = fn_pose::loadout_material::load_texture(src, path)?;
-    image::RgbaImage::from_raw(t.image.width as u32, t.image.height as u32, t.image.to_rgba8()).ok_or_else(|| format!("{path}: bad decoded size"))
+    let cooked = crate::br_character::cooked_texture(&t.source);
+    if cooked.is_some() { return Ok((crate::br_character::stub_image(), cooked)); }
+    let img = image::RgbaImage::from_raw(t.image.width as u32, t.image.height as u32, t.image.to_rgba8()).ok_or_else(|| format!("{path}: bad decoded size"))?;
+    Ok((img, cooked))
 }
+fn split(t: Option<(image::RgbaImage, Cooked)>) -> (Option<image::RgbaImage>, Cooked) { match t { Some((i, c)) => (Some(i), c), None => (None, None) } }
 /// The root material whose compiled shading `MaterialKind::Architect` reproduces.
 const ARCHITECT_MATERIAL: &str = "/Game/Packages/Fortnite_UniqueMaterials_1/Character/M_BluePrintArchitect";
 /// LOD 0 of a skeletal / static mesh in the mesh's own space (UE cm -> metres, glTF axes, like every held mesh of the port). A skeletal mesh is skinned to its own
@@ -660,18 +668,18 @@ pub(crate) fn mesh_prims(src: &ClipSourceDir, mesh: &str, skeletal: bool, mid: O
                 let tex = material_textures(src, mat).unwrap_or_else(|e| { notes.push(format!("{mesh}: material {mat}: {e}")); MatTextures { params: vec![], fixed: vec![], root: String::new() } });
                 let find = |n: &str| tex.params.iter().find(|(k, _)| k == n).map(|(_, p)| p.clone());
                 let load = |p: Option<String>, what: &str, notes: &mut Vec<String>| p.and_then(|p| image(src, &p).map_err(|e| notes.push(format!("{mesh}: {what} {p}: {e}"))).ok());
-                let diffuse = load(mid.map(|m| m.1.to_owned()).or_else(|| find("Diffuse")), "Diffuse", notes);
-                let normal = load(find("Normal"), "Normal", notes);
+                let (diffuse, cd) = split(load(mid.map(|m| m.1.to_owned()).or_else(|| find("Diffuse")), "Diffuse", notes));
+                let (normal, cn) = split(load(find("Normal"), "Normal", notes));
                 // the material's TwoSided flag (a MID keeps its parent's): both faces in the shadow depth (UE4.16 ShadowDepthRendering.cpp:1059)
                 let two_sided = fn_pose::br_character::material_two_sided(src, mat).unwrap_or_else(|e| { notes.push(format!("{mesh}: material {mat}: TwoSided not resolved ({e}), one-sided assumed")); false });
                 if pkg_of(&tex.root) == ARCHITECT_MATERIAL {
                     let masks = tex.fixed.iter().find(|(st, _)| st.ends_with("SAMPLERTYPE_Masks")).map(|(_, p)| p.clone());
                     if masks.is_none() { notes.push(format!("{mesh}: {ARCHITECT_MATERIAL} has no fixed Masks sample")); }
-                    let spec = load(masks, "SpecularMasks", notes);
-                    let mask = load(mid.map(|m| m.2.to_owned()).or_else(|| find("EmissiveMask")), "EmissiveMask", notes);
-                    (MaterialImages { diffuse, normal, spec, mask, ue: None, two_sided, cooked: Default::default() }, MaterialKind::Architect)
+                    let (spec, cs) = split(load(masks, "SpecularMasks", notes));
+                    let (mask, cm) = split(load(mid.map(|m| m.2.to_owned()).or_else(|| find("EmissiveMask")), "EmissiveMask", notes));
+                    (MaterialImages { diffuse, normal, spec, mask, ue: None, two_sided, cooked: [cd, cn, cs, cm] }, MaterialKind::Architect)
                 } else {
-                    (MaterialImages { diffuse, normal, spec: None, mask: None, ue: None, two_sided, cooked: Default::default() }, MaterialKind::Prop)
+                    (MaterialImages { diffuse, normal, spec: None, mask: None, ue: None, two_sided, cooked: [cd, cn, None, None] }, MaterialKind::Prop)
                 }
             }).clone(),
             None => { notes.push(format!("{mesh}: a section has no material")); (MaterialImages::default(), MaterialKind::Prop) }

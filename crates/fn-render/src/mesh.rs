@@ -73,6 +73,18 @@ impl CookedTexture {
     pub fn bytes(&self) -> u64 { self.levels.iter().map(|(w, h, _)| self.format.level_bytes(*w, *h) as u64).sum() }
 }
 
+pub fn prepare_mip_chains(prims: &mut [SkinnedPrimitive]) {
+    for p in prims {
+        let m = &mut p.material;
+        for (img, c) in [&m.diffuse, &m.normal, &m.spec, &m.mask].into_iter().zip(m.cooked.iter_mut()) {
+            if let (Some(i), None) = (img, c.as_ref()) {
+                let levels = crate::texture::build_mips(i, crate::texture::MipFilter::Triangle).into_iter().map(|l| (l.width(), l.height(), l.into_raw())).collect();
+                *c = Some(std::sync::Arc::new(CookedTexture { format: crate::fx::FxTexFormat::Rgba8, levels }));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SkinnedPrimitive {
     pub vertices: Vec<SkinnedVertex>,

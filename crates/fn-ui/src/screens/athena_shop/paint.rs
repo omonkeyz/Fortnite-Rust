@@ -149,8 +149,10 @@ impl<'a> Painter<'a> {
         };
         let (lines, st, px, lh) = self.c.text_lines(id, ww);
         let m = crate::screens::athena_lobby::store::jmargin(self.c.ui.w[id].props.get("Margin"));
-        let ci = jvec::<4>(self.c.ui.w[id].props.get("ColorAndOpacity")).unwrap_or([1.0; 4]);
-        let base = self.dynm.text_color.get(&id).copied().unwrap_or(st.color); // SHOP: font material colour (`GetDynamicFontMaterial().SetVectorParameterValue(RGB_1, ..)`)
+        let cp = self.c.ui.w[id].props.get("ColorAndOpacity");
+        let ci = jvec::<4>(cp).or_else(|| jvec::<4>(cp.filter(|c| !c.get("ColorUseRule").and_then(|r| r.as_str()).map_or(false, |r| r.contains("Foreground"))).and_then(|c| c.get("SpecifiedColor")))).unwrap_or([1.0; 4]);
+        let style_col = if cp.is_some() && crate::screens::athena_lobby::umg::is_styled_common_text(&self.c.ui.w[id].class, &self.c.ui.w[id].props) { [1.0; 4] } else { st.color };
+        let base = self.dynm.text_color.get(&id).copied().unwrap_or(style_col); // SHOP: font material colour (`GetDynamicFontMaterial().SetVectorParameterValue(RGB_1, ..)`)
         let mut lin = mul4(mul4(base, ci), color);
         if self.disabled { lin = disabled_effect(lin); }
         let col = srgb4(lin);

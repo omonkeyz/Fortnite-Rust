@@ -31,6 +31,8 @@ fn lanes() -> usize { (fn_web_rt::js::fnweb_hardware_concurrency() as usize).sat
 const AHEAD: usize = 96;
 const LOOK_AHEAD_S: f32 = 6.;
 const URGENT_AHEAD: usize = 4 * AHEAD;
+const URGENT_TEX_BYTES: usize = 256 << 20;
+const AHEAD_TEX_BYTES: usize = 96 << 20;
 const KEEP: f32 = 1.5;
 
 #[derive(Default)]
@@ -49,11 +51,13 @@ struct State {
     queue: VecDeque<String>,
     /// slot materials already parsed by a lane (each handed out once through the preloaded map)
     mats: HashSet<String>,
+    parsing: HashSet<String>,
     meshes: HashSet<String>,
     /// kinds a lane is reading now, with when it started (diagnostics: `[poi prefetch] status`)
     reading: std::collections::HashMap<String, std::time::Instant>,
     queued: HashMap<String, u8>,
     claims: HashMap<String, Claim>,
+    mat_tex: HashMap<String, Vec<String>>,
 }
 
 #[derive(Default)]
@@ -88,8 +92,8 @@ fn lane() {
                 let st = g.get_or_insert_with(State::default);
                 if let Some(id) = st.now.pop_front() { if st.queued.get(&id) == Some(&0) { st.queued.remove(&id); break id; } continue; }
                 // read-ahead only while the main thread keeps up (the retained reads must stay in their LRU)
-                if UNBUILT.load(Ordering::Relaxed) < URGENT_AHEAD { if let Some(id) = st.urgent.pop_front() { if st.queued.get(&id) == Some(&1) { st.queued.remove(&id); break id; } continue; } }
-                if UNBUILT.load(Ordering::Relaxed) < AHEAD { if let Some(id) = st.queue.pop_front() { if st.queued.get(&id) == Some(&2) { st.queued.remove(&id); break id; } continue; } }
+                if UNBUILT.load(Ordering::Relaxed) < URGENT_AHEAD && fn_fx::gpu::predecoded_bytes() < URGENT_TEX_BYTES { if let Some(id) = st.urgent.pop_front() { if st.queued.get(&id) == Some(&1) { st.queued.remove(&id); break id; } continue; } }
+                if UNBUILT.load(Ordering::Relaxed) < AHEAD && fn_fx::gpu::predecoded_bytes() < AHEAD_TEX_BYTES { if let Some(id) = st.queue.pop_front() { if st.queued.get(&id) == Some(&2) { st.queued.remove(&id); break id; } continue; } }
                 g = WAKE.wait_timeout(g, std::time::Duration::from_millis(50)).map(|r| r.0).unwrap_or_else(|e| e.into_inner().0);
             }
         };
@@ -131,19 +135,30 @@ fn read_kind(set: &PakSet, id: &str) {
             let Some(path) = path else { continue };
             if claim.used_mats.contains(&path) { continue; }
             claim.used_mats.push(path.clone());
-            if !with(|st| st.mats.insert(path.clone())) { continue; }
+            if !with(|st| { let fresh = st.mats.insert(path.clone()); if fresh { st.parsing.insert(path.clone()); } fresh }) { continue; }
             claim.own_mats.push(path.clone());
             let r = fn_fx::material::Material::load(set, &path).map(Arc::new);
             if let Ok(mat) = &r {
                 let _ = fn_fx::data::package_files(set, &mat.shader_map_package);
                 if let Some(ps) = super::PS_TYPES.iter().find(|ps| mat.cooked.find(fn_fx::gpu::Vf::Local.type_name(), ps).is_some()) { fn_fx::gpu::preassemble(mat, fn_fx::gpu::Vf::Local, super::VS_TYPE, ps, super::instancing() && matches!(mat.flags.blend.as_str(), "BLEND_Opaque" | "BLEND_Masked")); }
-                for k in 0..mat.uniform.textures2d.len() {
-                    if let Some((t, _)) = mat.texture_slot(k) { want_tex(t, &mut claim); }
-                }
+                let tex: Vec<String> = (0..mat.uniform.textures2d.len()).filter_map(|k| mat.texture_slot(k).map(|x| x.0)).collect();
+                for t in &tex { want_tex(t.clone(), &mut claim); }
+                with(|st| { st.mat_tex.insert(path.clone(), tex); });
             }
-            if let Ok(mut g) = super::PRELOADED.lock() { g.get_or_insert_with(Default::default).entry(path).or_insert(r); }
+            if let Ok(mut g) = super::PRELOADED.lock() { g.get_or_insert_with(Default::default).entry(path.clone()).or_insert(r); }
+            with(|st| { st.parsing.remove(&path); });
+            WAKE.notify_all();
         }
     });
+    {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let st = g.get_or_insert_with(State::default);
+            if !claim.used_mats.iter().any(|m| st.parsing.contains(m)) { break; }
+            g = WAKE.wait_timeout(g, std::time::Duration::from_millis(20)).map(|r| r.0).unwrap_or_else(|e| e.into_inner().0);
+        }
+    }
+    with(|st| { for m in &claim.used_mats { if let Some(v) = st.mat_tex.get(m) { for t in v { if !claim.used_tex.contains(t) { claim.used_tex.push(t.clone()); } } } } });
     for t in &claim.used_tex {
         if fn_fx::gpu::is_uploaded(t) { continue; }
         fn_fx::gpu::predecode_texture(set, t);
@@ -152,27 +167,35 @@ fn read_kind(set: &PakSet, id: &str) {
     with(|st| { st.claims.insert(id.to_owned(), claim); });
 }
 
-fn release(s: &mut State, id: &str) {
-    let Some(c) = s.claims.remove(id) else { return };
-    let heir = |s: &mut State, f: &dyn Fn(&Claim) -> bool| -> Option<String> { s.claims.iter().find(|(_, v)| f(v)).map(|(k, _)| k.clone()) };
-    for m in c.own_mats {
-        match heir(s, &|v: &Claim| v.used_mats.contains(&m)) {
-            Some(h) => { if let Some(v) = s.claims.get_mut(&h) { v.own_mats.push(m); } }
-            None => { s.mats.remove(&m); if let Ok(mut g) = super::PRELOADED.lock() { if let Some(map) = g.as_mut() { map.remove(&m); } } }
+fn release_all<'a>(s: &mut State, ids: impl Iterator<Item = &'a str>) {
+    let gone: Vec<Claim> = ids.filter_map(|id| s.claims.remove(id)).collect();
+    if gone.is_empty() { return; }
+    let (mut mat_heir, mut mesh_heir, mut tex_used, mut base_used): (HashMap<String, String>, HashMap<String, String>, HashSet<String>, HashSet<String>) = Default::default();
+    for (k, v) in &s.claims {
+        for m in &v.used_mats { mat_heir.entry(m.clone()).or_insert_with(|| k.clone()); }
+        for m in &v.used_meshes { mesh_heir.entry(m.clone()).or_insert_with(|| k.clone()); base_used.insert(m.split('#').next().unwrap_or(m).to_owned()); }
+        for t in &v.used_tex { tex_used.insert(t.clone()); }
+    }
+    for c in gone {
+        for m in c.own_mats {
+            match mat_heir.get(&m) {
+                Some(h) => { if let Some(v) = s.claims.get_mut(h) { v.own_mats.push(m); } }
+                None => { s.mats.remove(&m); if let Ok(mut g) = super::PRELOADED.lock() { if let Some(map) = g.as_mut() { map.remove(&m); } } }
+            }
         }
-    }
-    for t in c.used_tex {
-        if heir(s, &|v: &Claim| v.used_tex.contains(&t)).is_none() { fn_fx::gpu::drop_predecoded(std::slice::from_ref(&t)); }
-    }
-    for k in c.own_meshes {
-        match heir(s, &|v: &Claim| v.used_meshes.contains(&k)) {
-            Some(h) => { if let Some(v) = s.claims.get_mut(&h) { v.own_meshes.push(k); } }
-            None => {
-                s.meshes.remove(&k);
-                if let Ok(mut g) = super::PREPPED.lock() { if let Some(map) = g.as_mut() { map.remove(&k); } }
-                let mesh = k.split('#').next().unwrap_or(&k).to_owned();
-                if heir(s, &|v: &Claim| v.used_meshes.iter().any(|u| u.split('#').next() == Some(mesh.as_str()))).is_none() {
-                    if let Ok(mut g) = super::PREPPED_DF.lock() { if let Some(map) = g.as_mut() { map.remove(&format!("{mesh}|true")); } }
+        for t in c.used_tex {
+            if !tex_used.contains(&t) { fn_fx::gpu::drop_predecoded(std::slice::from_ref(&t)); }
+        }
+        for k in c.own_meshes {
+            match mesh_heir.get(&k) {
+                Some(h) => { if let Some(v) = s.claims.get_mut(h) { v.own_meshes.push(k); } }
+                None => {
+                    s.meshes.remove(&k);
+                    if let Ok(mut g) = super::PREPPED.lock() { if let Some(map) = g.as_mut() { map.remove(&k); } }
+                    let mesh = k.split('#').next().unwrap_or(&k).to_owned();
+                    if !base_used.contains(&mesh) {
+                        if let Ok(mut g) = super::PREPPED_DF.lock() { if let Some(map) = g.as_mut() { map.remove(&format!("{mesh}|true")); } }
+                    }
                 }
             }
         }
@@ -202,6 +225,22 @@ fn queue_in(s: &mut State, id: &str, tier: u8) -> bool {
 }
 
 /// `poi_build` is about to build `id` on the main thread: true once its reads are done (then it counts as built), else it is asked for first.
+fn textures_ready(set: &Arc<PakSet>, id: &str) -> bool {
+    static FETCHING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let missing: Vec<String> = with(|s| s.claims.get(id).map(|c| c.used_tex.iter().filter(|t| !fn_fx::gpu::is_uploaded(t) && !fn_fx::gpu::is_predecoded(t)).cloned().collect()).unwrap_or_default());
+    if missing.is_empty() { return true; }
+    let start = FETCHING.lock().map(|mut g| g.get_or_insert_with(HashSet::new).insert(id.to_owned())).unwrap_or(false);
+    if start {
+        let (set, id) = (set.clone(), id.to_owned());
+        let spawned = std::thread::Builder::new().name("poi texture fetch".into()).spawn(move || {
+            for t in &missing { fn_fx::gpu::predecode_texture_urgent(&set, t); }
+            if let Ok(mut g) = FETCHING.lock() { if let Some(m) = g.as_mut() { m.remove(&id); } }
+        });
+        if spawned.is_err() { return true; }
+    }
+    false
+}
+
 pub(super) fn ready(set: &Arc<PakSet>, id: &str, promote: bool) -> bool {
     if !enabled() { return true; }
     let (done, first, known, queued) = with(|s| {
@@ -210,7 +249,7 @@ pub(super) fn ready(set: &Arc<PakSet>, id: &str, promote: bool) -> bool {
         (d, f, s.known.contains(id), s.queued.get(id).is_some_and(|&t| t > 0))
     });
     if first { let _ = UNBUILT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1))); fn_web_rt::POI_KINDS_BUILT.fetch_add(1, Ordering::Relaxed); }
-    if done { return true; }
+    if done { return textures_ready(set, id); }
     if promote { status_log(id); }
     if known && (!promote || !queued) { return false; }
     queue(set, id, 0);
@@ -220,7 +259,7 @@ pub(super) fn ready(set: &Arc<PakSet>, id: &str, promote: bool) -> bool {
 /// Queues the kinds of the groups around `eye` (FX space cm), nearest group first: the RESIDENT groups' kinds as urgent (`poi_build` asks only for
 /// its nearest incomplete group, which would leave the lanes idle on the rest), the ring's as capped read-ahead. Cheap when the view has not moved
 /// 10 m since the last call (and the resident set did not change).
-pub(super) fn request_ring(set: &Arc<PakSet>, poi: &crate::poi::PoiSet, eye: Vec3) {
+pub(super) fn request_ring(set: &Arc<PakSet>, poi: &crate::poi::PoiSet, eye: Vec3, landing: bool, built: &dyn Fn(&str) -> bool) {
     if !enabled() { return; }
     static LAST: Mutex<Option<(Vec3, std::time::Instant)>> = Mutex::new(None);
     static LAST_RESIDENT: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -244,13 +283,14 @@ pub(super) fn request_ring(set: &Arc<PakSet>, poi: &crate::poi::PoiSet, eye: Vec
             (d < ring || da < ring).then_some((d.min(da), i))
         }).collect();
     near.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let keep_ring = ring * KEEP;
+    let keep_ring = if landing { crate::poi::stream_cm() * 1.2 } else { ring * KEEP };
     let keep: HashSet<&str> = poi.groups.iter()
         .filter(|g| g.resident.load(Ordering::Relaxed) || (g.center - eye).length() - g.radius < keep_ring || (g.center - ahead).length() - g.radius < keep_ring)
         .flat_map(|g| g.kinds.iter().map(|&k| poi.kinds[k as usize].id.as_str())).collect();
     let evicted = with(|s| {
         let stale: Vec<(String, bool)> = s.done.iter().filter(|k| !keep.contains(k.as_str()) && (!s.consumed.contains(*k) || s.claims.contains_key(*k))).map(|k| (k.clone(), s.consumed.contains(k))).collect();
-        for (k, _) in &stale { s.done.remove(k); s.known.remove(k); s.consumed.remove(k); release(s, k); }
+        for (k, _) in &stale { s.done.remove(k); s.known.remove(k); s.consumed.remove(k); }
+        release_all(s, stale.iter().map(|x| x.0.as_str()));
         let unbuilt = stale.iter().filter(|x| !x.1).count();
         let drop: Vec<String> = s.queued.iter().filter(|(k, &t)| t > 0 && !keep.contains(k.as_str())).map(|(k, _)| k.clone()).collect();
         if !drop.is_empty() {
@@ -265,11 +305,13 @@ pub(super) fn request_ring(set: &Arc<PakSet>, poi: &crate::poi::PoiSet, eye: Vec
     start(set);
     let added = with(|s| {
         let mut n = 0usize;
-        for &(_, gi) in &near { let urgent = poi.groups[gi].resident.load(Ordering::Relaxed); for &k in &poi.groups[gi].kinds { n += queue_in(s, &poi.kinds[k as usize].id, if urgent { 1 } else { 2 }) as usize; } }
+        for &(d, gi) in &near { let urgent = poi.groups[gi].resident.load(Ordering::Relaxed) || (landing && d < crate::poi::stream_cm()); for &k in &poi.groups[gi].kinds { let id = &poi.kinds[k as usize].id; if built(id) { continue; } n += queue_in(s, id, if urgent { 1 } else { 2 }) as usize; } }
         n
     });
     if added > 0 { WAKE.notify_all(); }
 }
+
+pub(super) fn is_done(id: &str) -> bool { !enabled() || with(|s| s.done.contains(id)) }
 
 /// Every 10 s while the main thread is waiting for kinds: what the lanes are doing (a kind that never becomes ready holds its group back).
 fn status_log(waiting_for: &str) {

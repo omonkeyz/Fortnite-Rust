@@ -42,6 +42,7 @@ impl VideoHooks for RenderSettings {
     fn set_effects_quality(&mut self, l: Level) -> Result<(), String> {
         self.options.effects = fn_render::quality::EffectsScalability::level(l as u32);
         fn_render::translucent_lighting::VolumeSettings::set_current(fn_render::translucent_lighting::VolumeSettings::for_effects_quality(l as u32));
+        crate::local_lights_hook::set_effects_quality(l as u8);
         Ok(())
     }
     fn set_display_gamma(&mut self, g: f32) -> Result<(), String> { self.gamma = g; self.options.display_exponent = fn_settings::display_exponent(g); Ok(()) }

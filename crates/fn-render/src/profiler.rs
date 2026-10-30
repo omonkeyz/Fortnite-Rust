@@ -68,6 +68,7 @@ pub struct GpuProfiler {
     frame: u64,
     last: PassTimings,
     completed: Vec<PassTimings>,
+    map_pending: Option<(usize, u64)>,
 }
 
 impl GpuProfiler {
@@ -75,7 +76,7 @@ impl GpuProfiler {
         let supported = device.features().contains(wgpu::Features::TIMESTAMP_QUERY) && queue.get_timestamp_period() > 0.0;
         let inside_encoders = supported && device.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         if !supported {
-            return GpuProfiler { query_set: None, resolve: None, ring: vec![], period_ns: 0., inside_encoders: false, frame_names: Mutex::new(None), cursor: 0, frame: 0, last: PassTimings::default(), completed: vec![] };
+            return GpuProfiler { query_set: None, resolve: None, ring: vec![], period_ns: 0., inside_encoders: false, frame_names: Mutex::new(None), cursor: 0, frame: 0, last: PassTimings::default(), completed: vec![], map_pending: None };
         }
         let count = MAX_PASSES * 2;
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("pass timestamps"), ty: wgpu::QueryType::Timestamp, count });
@@ -85,7 +86,7 @@ impl GpuProfiler {
             buf: device.create_buffer(&wgpu::BufferDescriptor { label: Some("timestamp staging"), size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false }),
             ready: Arc::new(AtomicBool::new(false)), pending: false, frame: 0, names: vec![],
         }).collect();
-        GpuProfiler { query_set: Some(query_set), resolve: Some(resolve), ring, period_ns: queue.get_timestamp_period(), inside_encoders, frame_names: Mutex::new(None), cursor: 0, frame: 0, last: PassTimings { supported: true, ..Default::default() }, completed: vec![] }
+        GpuProfiler { query_set: Some(query_set), resolve: Some(resolve), ring, period_ns: queue.get_timestamp_period(), inside_encoders, frame_names: Mutex::new(None), cursor: 0, frame: 0, last: PassTimings { supported: true, ..Default::default() }, completed: vec![], map_pending: None }
     }
     pub fn supported(&self) -> bool { self.query_set.is_some() }
     /// True when overlay (UI) timing is available (needs TIMESTAMP_QUERY_INSIDE_ENCODERS).
@@ -130,21 +131,29 @@ impl GpuProfiler {
     }
     /// Resolves the frame's timestamps and starts the read-back (call after everything of the frame was submitted).
     pub fn end_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let names = match self.frame_names.lock().unwrap().take() { Some(n) if !n.is_empty() => n, _ => return };
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("timestamp resolve") });
+        if self.encode_end_frame(&mut enc) { queue.submit([enc.finish()]); self.start_map(); }
+    }
+    pub fn encode_end_frame(&mut self, enc: &mut wgpu::CommandEncoder) -> bool {
+        let names = match self.frame_names.lock().unwrap().take() { Some(n) if !n.is_empty() => n, _ => return false };
         let (qs, resolve) = (self.query_set.as_ref().unwrap(), self.resolve.as_ref().unwrap());
         let st = &mut self.ring[self.cursor];
         let bytes = names.len() as u64 * 16;
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("timestamp resolve") });
         enc.resolve_query_set(qs, 0..names.len() as u32 * 2, resolve, 0);
         enc.copy_buffer_to_buffer(resolve, 0, &st.buf, 0, bytes);
-        queue.submit([enc.finish()]);
         st.ready.store(false, Ordering::SeqCst);
-        let ready = st.ready.clone();
-        st.buf.slice(..bytes).map_async(wgpu::MapMode::Read, move |r| { if r.is_ok() { ready.store(true, Ordering::SeqCst); } });
         st.pending = true;
         st.frame = self.frame;
         st.names = names;
+        self.map_pending = Some((self.cursor, bytes));
         self.cursor = (self.cursor + 1) % RING;
+        true
+    }
+    pub fn start_map(&mut self) {
+        let Some((i, bytes)) = self.map_pending.take() else { return };
+        let st = &self.ring[i];
+        let ready = st.ready.clone();
+        st.buf.slice(..bytes).map_async(wgpu::MapMode::Read, move |r| { if r.is_ok() { ready.store(true, Ordering::SeqCst); } });
     }
     /// Collects every finished read-back (non-blocking after a `Poll`; `wait` blocks until all pending frames finished).
     pub fn collect(&mut self, device: &wgpu::Device, wait: bool) {

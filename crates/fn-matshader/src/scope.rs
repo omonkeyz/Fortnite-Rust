@@ -255,7 +255,7 @@ pub struct ScopeScene {
     camera_offset: f32,
 }
 
-fn bytes(v: &[[f32; 4]]) -> Vec<u8> { v.iter().flat_map(|r| r.iter().flat_map(|f| f.to_le_bytes())).collect() }
+fn bytes(v: &[[f32; 4]]) -> Vec<u8> { let mut b = Vec::with_capacity(v.len() * 16); for r in v { for f in r { b.extend_from_slice(&f.to_le_bytes()); } } b }
 
 /// Orthonormal view basis in UE axes (cm, Z up): right, up, forward (the same construction as `ViewInput::view_buffer`).
 fn basis(v: &ViewInput) -> ([f32; 3], [f32; 3], [f32; 3]) {

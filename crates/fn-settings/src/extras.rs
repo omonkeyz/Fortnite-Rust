@@ -2,9 +2,6 @@ use crate::Settings;
 
 pub type ExtraKey = (&'static str, &'static str);
 
-pub const CONFIRM_EDIT_ON_RELEASE: ExtraKey = ("Game", "ConfirmEditOnRelease");
-pub const RESET_EDIT_ON_RELEASE: ExtraKey = ("Game", "ResetEditOnRelease");
-pub const TURBO_BUILD: ExtraKey = ("Game", "TurboBuild");
 pub const CONTROLLER_CONFIGURATION: ExtraKey = ("Input", "ControllerConfiguration");
 pub const CONTROLLER_LEFT_DEADZONE: ExtraKey = ("Input", "ControllerLeftStickDeadzone");
 pub const CONTROLLER_RIGHT_DEADZONE: ExtraKey = ("Input", "ControllerRightStickDeadzone");
@@ -42,20 +39,18 @@ mod tests {
     use super::*;
     #[test] fn defaults_are_off_standard_and_the_1_8_cvars() {
         let s = Settings::default();
-        assert!(!flag(&s, CONFIRM_EDIT_ON_RELEASE) && !flag(&s, RESET_EDIT_ON_RELEASE) && !flag(&s, TURBO_BUILD));
         assert_eq!(configuration(&s), 0);
         assert_eq!(deadzones(&s), (0.24, 0.27));
     }
     #[test] fn values_round_trip_through_the_settings_file() {
         let mut s = Settings::default();
-        set_flag(&mut s, CONFIRM_EDIT_ON_RELEASE, true); set_flag(&mut s, TURBO_BUILD, true); set_configuration(&mut s, 2); set_deadzone(&mut s, CONTROLLER_LEFT_DEADZONE, 0.1); set_deadzone(&mut s, CONTROLLER_RIGHT_DEADZONE, 5.);
+        s.set_extra("Game", "TurboBuild", "On"); s.set_extra("Game", "ConfirmEditOnRelease", "On"); set_configuration(&mut s, 2); set_deadzone(&mut s, CONTROLLER_LEFT_DEADZONE, 0.1); set_deadzone(&mut s, CONTROLLER_RIGHT_DEADZONE, 5.);
         let dir = std::env::temp_dir().join(format!("fn-settings-extras-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("GameUserSettings.ini");
         s.save(&p).unwrap();
         let (t, _) = Settings::load(&p);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(flag(&t, CONFIRM_EDIT_ON_RELEASE) && !flag(&t, RESET_EDIT_ON_RELEASE) && flag(&t, TURBO_BUILD));
         assert_eq!(configuration(&t), 2);
         assert_eq!(deadzones(&t), (0.1, DEADZONE_MAX));
         let mut t = t; reset_controller(&mut t); assert_eq!((configuration(&t), deadzones(&t)), (0, (0.24, 0.27)));

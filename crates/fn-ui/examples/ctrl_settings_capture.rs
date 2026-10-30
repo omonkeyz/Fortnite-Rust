@@ -9,7 +9,6 @@ fn main() {
     let install = fn_ui::pak_assets::default_install();
     let mut ctx = fn_ui::scene::UiContext::from_install(&install, Some(&fn_ui::assets::DirAssets::default_root())).expect("ui context");
     let mut s = Settings::default();
-    extras::set_flag(&mut s, extras::CONFIRM_EDIT_ON_RELEASE, true);
     s.drain_changes();
     let mut platform = NullPlatform::static_16_9();
     let mut be = NullBackend::default();

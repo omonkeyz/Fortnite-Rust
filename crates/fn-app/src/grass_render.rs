@@ -156,6 +156,20 @@ impl GrassRender {
     pub fn active(&self) -> bool { matches!(self.gpu, Some(Ok(_))) }
 
     /// One frame: the instanced draw of the cells that pass the HISM culling, with this frame's SetMesh values. Returns true when the path became active this frame.
+    pub fn prebuild(&mut self, set: &PakSet, cache: &mut TextureCache, fx: &mut FxRenderer, shared: SharedBuffers, grass: &Grass) -> bool {
+        let Some(src) = grass.source.clone() else { return false };
+        if self.gpu.is_some() { return false; }
+        let t0 = std::time::Instant::now();
+        let r = build(set, fx, cache, shared, &src, &mut self.log);
+        let ok = r.is_ok();
+        match &r {
+            Ok(_) => self.log.push(format!("grass: real-shader path built in {:.0} ms", t0.elapsed().as_secs_f32() * 1000.)),
+            Err(e) => { let m = format!("grass: NOT ON THE REAL-SHADER PATH ({e}): the old static-mesh grass stays"); eprintln!("[grass] {m}"); self.log.push(m); }
+        }
+        self.gpu = Some(r);
+        ok
+    }
+
     pub fn frame(&mut self, set: &PakSet, cache: &mut TextureCache, fx: &mut FxRenderer, shared: SharedBuffers, grass: &Grass, view: &ViewParams, view_distance_scale: f32, out: &mut FxFrame) -> bool {
         let Some(src) = grass.source.clone() else { return false };
         let mut became_active = false;

@@ -8,7 +8,7 @@
 //! numbers, and the muzzle socket of the weapon mesh. Then the referenced particle systems (with their materials / textures / meshes) are decoded by `fn-particles` into
 //! `<out>` (`index.json`, `systems/`, ...) next to `<out>/muzzle.json`.
 use fn_uasset::{Package, PackageData, PackageIndex, Value};
-use fn_vfx::table::{MuzzleTable, SocketInfo, WeaponMuzzle};
+use fn_vfx::table::{MuzzleTable, ReloadSmokeData, ShellsData, SocketInfo, WeaponMuzzle};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -23,7 +23,7 @@ fn object_path(pkg: &Package, v: &Value) -> Option<String> {
     v.as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
-struct Cdo { props: Vec<(String, Value)>, pkg_particles: BTreeMap<String, String>, super_path: Option<String> }
+struct Cdo { props: Vec<(String, Value)>, pkg_particles: BTreeMap<String, String>, objects: BTreeMap<String, String>, super_path: Option<String> }
 
 /// CDO properties of a Blueprint package (+ its resolved super class package, `None` for native supers).
 fn load_cdo(set: &fn_pak::PakSet, long: &str) -> Result<Cdo, String> {
@@ -32,6 +32,7 @@ fn load_cdo(set: &fn_pak::PakSet, long: &str) -> Result<Cdo, String> {
     let super_path = pkg.super_class().map(|r| r.path().to_string()).filter(|p| p.starts_with("/Game/")).map(|p| pkg_of(&p));
     let mut props = vec![];
     let mut particles = BTreeMap::new();
+    let mut objects = BTreeMap::new();
     if let Some(Ok(cdo)) = pkg.read_default_object() {
         for p in cdo.props.iter() {
             let key = if p.index > 0 { format!("{}[{}]", p.name, p.index) } else { p.name.clone() };
@@ -39,10 +40,11 @@ fn load_cdo(set: &fn_pak::PakSet, long: &str) -> Result<Cdo, String> {
             if let Value::Object(i) = &p.value {
                 if let ObjectClass::Particle = object_class(&pkg, *i) { if let Some(path) = object_path(&pkg, &p.value) { particles.insert(key.clone(), pkg_of(&path)); } }
             }
+            if let Some(path) = object_path(&pkg, &p.value) { objects.insert(key.clone(), path); }
             props.push((key, p.value.clone()));
         }
     }
-    Ok(Cdo { props, pkg_particles: particles, super_path })
+    Ok(Cdo { props, pkg_particles: particles, objects, super_path })
 }
 enum ObjectClass { Particle, Other }
 fn object_class(pkg: &Package, i: PackageIndex) -> ObjectClass {
@@ -63,6 +65,51 @@ fn find_socket(set: &fn_pak::PakSet, mesh_long: &str, socket: &str) -> Option<So
     let spkg = load(sp.split('.').next()?)?;
     let sk = fn_mesh::Skeleton::parse(&spkg).ok()?;
     sk.sockets.iter().find(|s| s.name == socket).map(|s| conv(s, "skeleton"))
+}
+
+fn reload_notifies(set: &fn_pak::PakSet, long: &str) -> Vec<(String, f32)> {
+    let Ok(data) = PackageData::load(set, long) else { return vec![] };
+    let Ok(pkg) = data.package() else { return vec![] };
+    let mut stages: BTreeMap<String, String> = BTreeMap::new();
+    for i in 0..pkg.exports.len() {
+        if !pkg.export_class_name(i).starts_with("AnimNotify_PlayReloadFX") { continue; }
+        let Ok(e) = pkg.read_export(i) else { continue };
+        stages.insert(pkg.exports[i].name.clone(), e.get("ReloadStage").and_then(|v| v.as_str()).unwrap_or("").to_string());
+    }
+    let mut out = vec![];
+    for i in 0..pkg.exports.len() {
+        let Ok(e) = pkg.read_export(i) else { continue };
+        let Some(arr) = e.get("Notifies").and_then(|v| v.as_array()) else { continue };
+        for n in arr {
+            let Some(st) = n.as_struct() else { continue };
+            let Some(obj) = st.get("Notify").and_then(|v| v.as_object()) else { continue };
+            let path = pkg.object_path(obj);
+            let leaf = path.rsplit([':', '.']).next().unwrap_or("").to_string();
+            let Some(stage) = stages.get(&leaf) else { continue };
+            out.push((stage.clone(), st.get("LinkValue").and_then(|v| v.as_f32()).unwrap_or(0.0) + st.get("TriggerTimeOffset").and_then(|v| v.as_f32()).unwrap_or(0.0)));
+        }
+    }
+    out.sort_by(|a, b| a.1.total_cmp(&b.1));
+    out
+}
+
+fn pump_notifies(set: &fn_pak::PakSet, long: &str) -> Vec<f32> {
+    let Ok(data) = PackageData::load(set, long) else { return vec![] };
+    let Ok(pkg) = data.package() else { return vec![] };
+    let mut out = vec![];
+    for i in 0..pkg.exports.len() {
+        let Ok(e) = pkg.read_export(i) else { continue };
+        let Some(arr) = e.get("Notifies").and_then(|v| v.as_array()) else { continue };
+        for n in arr {
+            let Some(st) = n.as_struct() else { continue };
+            let Some(obj) = st.get("Notify").and_then(|v| v.as_object()) else { continue };
+            let cls = pkg.object_path(obj);
+            if !cls.contains("AnimNotify_ShellsOnPumpFX") { continue; }
+            let t = st.get("LinkValue").and_then(|v| v.as_f32()).unwrap_or(0.0) + st.get("TriggerTimeOffset").and_then(|v| v.as_f32()).unwrap_or(0.0);
+            out.push(t);
+        }
+    }
+    out
 }
 
 fn main() {
@@ -112,6 +159,44 @@ fn main() {
             }
             for (k, p) in &cdo.pkg_particles { if k != "MuzzleParticleSystem" && !k.contains("ImpactPhysicalSurface") { w.other_particle_refs.entry(k.clone()).or_insert_with(|| p.clone()); } }
             cur = cdo.super_path;
+        }
+        let mut first: BTreeMap<String, (Value, String, String)> = BTreeMap::new();
+        for bp in &w.chain {
+            let Ok(cdo) = load_cdo(&set, bp) else { continue };
+            for (k, v) in &cdo.props { if !first.contains_key(k) { first.insert(k.clone(), (v.clone(), cdo.pkg_particles.get(k).cloned().unwrap_or_default(), cdo.objects.get(k).cloned().unwrap_or_default())); } }
+        }
+        let fb = |k: &str| first.get(k).and_then(|v| v.0.as_bool()).unwrap_or(false);
+        let ff = |k: &str, d: f32| first.get(k).and_then(|v| v.0.as_f32()).unwrap_or(d);
+        let fv = |k: &str| first.get(k).and_then(|v| v.0.as_vec3()).unwrap_or([0.0; 3]);
+        let fs = |k: &str| first.get(k).and_then(|v| v.0.as_str().map(String::from));
+        let fp = |k: &str| first.get(k).map(|v| v.1.clone()).filter(|p| !p.is_empty());
+        let fo = |k: &str| first.get(k).map(|v| pkg_of(&v.2)).filter(|p| !p.is_empty());
+        let (on_fire, on_reload, on_pump) = (fb("UseShellsOnFire?"), fb("UseShellsOnReload?"), fb("UseShellsOnPump?"));
+        if on_fire || on_reload || on_pump {
+            if let Some(sys) = fp("ShellsParticleSystemTemplate") {
+                let socket_name = fs("Shells Socket Name").unwrap_or_default();
+                let shell_type = fs("ShellTypeSelect").and_then(|e| e.rsplit("NewEnumerator").next().and_then(|n| n.parse::<u8>().ok())).unwrap_or(0);
+                let mut pump_notify_times = vec![];
+                if on_pump {
+                    let mut ms: Vec<String> = ["WeaponFireMontage", "WeaponFireDownsightsMontage"].iter().filter_map(|k| fo(k)).collect();
+                    ms.sort(); ms.dedup();
+                    for m in &ms { let t = pump_notifies(&set, m); println!("{name}: {m} ShellsOnPumpFX at {t:?}"); pump_notify_times.extend(t); }
+                    pump_notify_times.sort_by(|a, b| a.total_cmp(b)); pump_notify_times.dedup();
+                }
+                let reload_shell_delay = if on_reload { fo("ReloadAnimation").and_then(|m| { let n = reload_notifies(&set, &m); println!("{name}: {m} PlayReloadFX {n:?}"); let max = n.iter().find(|x| x.0.ends_with("Max_None"))?.1; let start = n.iter().filter(|x| x.0.is_empty() || x.0.ends_with("ReloadStart")).map(|x| x.1).filter(|t| *t <= max).fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.min(t))))?; Some(max - start) }) } else { None };
+                let socket = if mesh.is_empty() { None } else { find_socket(&set, &mesh, &socket_name) };
+                if socket.is_none() { eprintln!("{name}: shells socket `{socket_name}` not on {mesh}: attached at the mesh origin"); }
+                systems.insert(sys.clone());
+                w.shells = Some(ShellsData { system: sys, socket_name, socket, on_fire, on_reload, on_pump, shell_type, spawn_rate_scale: ff("Shells Spawn Rate Scale", 1.0), rotation_rate: fv("ShellsRotationRate"), velocity: fv("Shells Velocity"), gravity: fv("Shells Gravity"), lifetime: ff("Shells Lifetime", 1.0), size: fv("Shells Size"), inherit_parent_velocity: ff("Inherit Parent Velocity", 0.0), cylinder_radius: ff("Cylindrical Radius", 0.0), cylinder_height: ff("Cylindrical Height", 0.0), time_dilation: ff("Shells Time Dilation", 1.0), pump_notify_times, reload_shell_delay });
+            }
+        }
+        if fb("Use Reload Particles") {
+            if let Some(sys) = fp("Reload_ParticleSystem") {
+                let socket_name = fs("ReloadSocketName").unwrap_or_default();
+                let socket = if mesh.is_empty() { None } else { find_socket(&set, &mesh, &socket_name) };
+                systems.insert(sys.clone());
+                w.reload_smoke = Some(ReloadSmokeData { system: sys, socket_name, socket });
+            }
         }
         if let Some(s) = &w.muzzle_system { systems.insert(s.clone()); }
         // beam / shells / reload / destroy effects are listed in the table but not exported; the muzzle variants (`MuzzleFlash(Charged)`, `MuzzleWindParticleSystem`, ...) are

@@ -1,0 +1,17 @@
+[package]
+name = "fn-bots"
+version.workspace = true
+edition.workspace = true
+description = "Fortnite 30.0 Phoebe bots: baked behavior trees, blackboard, skill sets and perception for the 1.8 port"
+
+[dependencies]
+glam.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "phoebe-bake"
+path = "src/bin/phoebe_bake.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+dead_code = "allow"

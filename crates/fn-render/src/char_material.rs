@@ -40,6 +40,7 @@ pub struct CharMaterial {
     /// CHAR PREPASS (2026-10-06): fixed texture slots 8, 9, 10 of the depth-only coverage shader (CharacterResInEffect: T_NoisePack_01, T_Slowfield_GridSquares_01,
     /// ShieldPowerAnim; `fn_pose::br_material`).
     pub res_in: [FixedTexture; 3],
+    pub tangents: Vec<[f32; 4]>,
 }
 
 /// The eye-region modulate overlay.
@@ -67,6 +68,7 @@ pub struct CharGpu {
     pub char_pipeline: wgpu::RenderPipeline,
     /// CHAR PREPASS (2026-10-06): the depth pre-pass draw of a character material primitive (its `FDepthOnlyPS`); `char_pipeline` then draws with depth Equal.
     pub char_depth_pipeline: wgpu::RenderPipeline,
+    pub char_sss_pipeline: wgpu::RenderPipeline,
     pub overlay_bgl: wgpu::BindGroupLayout,
     pub overlay_pipeline: wgpu::RenderPipeline,
 }
@@ -95,6 +97,7 @@ const SKINNED_ATTRS: [wgpu::VertexAttribute; 5] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint16x4, offset: 32, shader_location: 3 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 40, shader_location: 4 },
 ];
+const TANGENT_ATTR: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 6 }];
 const COLOR_ATTR: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm8x4, offset: 0, shader_location: 5 }];
 
 /// One constant-buffer array of a generated (translated) program: its name, the slots the wrapper writes per pixel (`char_scene.wgsl` / `char_overlay.wgsl`),
@@ -183,7 +186,7 @@ impl CharGpu {
         };
         let char_layout = layout("char scene layout", &[bgl_globals, bgl_material, bgl_obj_skinned, &char_bgl]);
         let stride = std::mem::size_of::<crate::mesh::SkinnedVertex>() as u64;
-        let vbufs = [Some(wgpu::VertexBufferLayout { array_stride: stride, step_mode: wgpu::VertexStepMode::Vertex, attributes: &SKINNED_ATTRS })];
+        let vbufs = [Some(wgpu::VertexBufferLayout { array_stride: stride, step_mode: wgpu::VertexStepMode::Vertex, attributes: &SKINNED_ATTRS }), Some(wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Vertex, attributes: &TANGENT_ATTR })];
         let vertex = || wgpu::VertexState { module: &char_sm, entry_point: Some("vs_char"), compilation_options: Default::default(), buffers: &vbufs };
         // CHAR PREPASS (2026-10-06): BLEND_Masked base pass after the pre-pass: depth Equal, no depth write, no clip (the translated base-pass PS has none)
         let char_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -192,6 +195,15 @@ impl CharGpu {
             depth_stencil: Some(wgpu::DepthStencilState { format: depth, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Equal), stencil: Default::default(), bias: Default::default() }),
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState { module: &char_sm, entry_point: Some("fs_char"), compilation_options: Default::default(), targets: &crate::reflection::lit_targets(hdr) }), // REFLECTION APPLY: + reflection inputs
+            multiview_mask: None, cache: None,
+        });
+        let sss_target = Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL });
+        let char_sss_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("char subsurface inputs"), layout: Some(&char_layout), vertex: vertex(),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: depth, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Equal), stencil: Default::default(), bias: Default::default() }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &char_sm, entry_point: Some("fs_char_sss"), compilation_options: Default::default(), targets: &[sss_target.clone(), sss_target.clone(), sss_target.clone(), sss_target] }),
             multiview_mask: None, cache: None,
         });
         // CHAR PREPASS (2026-10-06): the depth pre-pass draw (FDepthOnlyPS: the material's coverage clip; CF_DepthNearOrEqual like the other pre-pass draws)
@@ -221,7 +233,7 @@ impl CharGpu {
             fragment: Some(wgpu::FragmentState { module: &overlay_sm, entry_point: Some("fs_overlay"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: Some(modulate), write_mask: wgpu::ColorWrites::ALL })] }),
             multiview_mask: None, cache: None,
         });
-        CharGpu { char_bgl, char_pipeline, char_depth_pipeline, overlay_bgl, overlay_pipeline }
+        CharGpu { char_bgl, char_pipeline, char_depth_pipeline, char_sss_pipeline, overlay_bgl, overlay_pipeline }
     }
 
     /// Bind group 3 of a character material primitive.
@@ -232,23 +244,47 @@ impl CharGpu {
 }
 
 /// [`CharGpu::char_bind_group`] from the layout alone (a `ModelBuilder` on another thread holds clones of the layouts, not the `CharGpu`).
-pub fn char_bind_group_with(layout: &wgpu::BindGroupLayout, device: &wgpu::Device, queue: &wgpu::Queue, m: &CharMaterial, label: &str) -> wgpu::BindGroup {
-    let mut u = CharMatUniform { cb: [[0.0; 4]; 32], meta: [m.perm as u32, 0, 0, 0] };
-    for (i, r) in m.cb.iter().take(32).enumerate() { u.cb[i] = *r; }
-    let buf = crate::texture::buffer_init(device, &[u], wgpu::BufferUsages::UNIFORM, label);
+pub fn char_bind_group_with(layout: &wgpu::BindGroupLayout, device: &wgpu::Device, queue: &wgpu::Queue, m: &CharMaterial, label: &str) -> wgpu::BindGroup { char_binding_with(layout, device, queue, m, label).0 }
+
+pub struct CharSrc { pub perm: CharPerm, pub base: Vec<[f32; 4]>, views: [wgpu::TextureView; 4], samplers: [wgpu::Sampler; 4] }
+
+fn char_uniform(perm: CharPerm, cb: &[[f32; 4]]) -> CharMatUniform {
+    let mut u = CharMatUniform { cb: [[0.0; 4]; 32], meta: [perm as u32, 0, 0, 0] };
+    for (i, r) in cb.iter().take(32).enumerate() { u.cb[i] = *r; }
+    u
+}
+
+pub fn char_binding_with(layout: &wgpu::BindGroupLayout, device: &wgpu::Device, queue: &wgpu::Queue, m: &CharMaterial, label: &str) -> (wgpu::BindGroup, std::sync::Arc<CharSrc>, wgpu::Buffer) {
     let (view, sampler) = upload_fixed(device, queue, &m.noise, label);
-    let [(v8, s8), (v9, s9), (v10, s10)] = [0, 1, 2].map(|i| upload_fixed(device, queue, &m.res_in[i], label)); // CHAR PREPASS
+    let [(v8, s8), (v9, s9), (v10, s10)] = [0, 1, 2].map(|i| upload_fixed(device, queue, &m.res_in[i], label));
+    let src = CharSrc { perm: m.perm, base: m.cb.clone(), views: [view, v8, v9, v10], samplers: [sampler, s8, s9, s10] };
+    let buf = crate::texture::buffer_init(device, &[char_uniform(m.perm, &m.cb)], wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, label);
+    (char_bind_group_from(layout, device, &src, &buf, label), std::sync::Arc::new(src), buf)
+}
+
+pub fn char_instance_buffer(device: &wgpu::Device, src: &CharSrc, label: &str) -> wgpu::Buffer { crate::texture::buffer_init(device, &[char_uniform(src.perm, &src.base)], wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, label) }
+
+pub fn char_write(queue: &wgpu::Queue, buf: &wgpu::Buffer, perm: CharPerm, cb: &[[f32; 4]]) { queue.write_buffer(buf, 0, bytemuck::bytes_of(&char_uniform(perm, cb))); }
+
+pub fn char_bind_group_from(layout: &wgpu::BindGroupLayout, device: &wgpu::Device, src: &CharSrc, buf: &wgpu::Buffer, label: &str) -> wgpu::BindGroup {
+    let [view, v8, v9, v10] = &src.views;
+    let [sampler, s8, s9, s10] = &src.samplers;
     device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &[
         wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
-        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
-        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&v8) },
-        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&s8) },
-        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&v9) },
-        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&s9) },
-        wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&v10) },
-        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&s10) },
+        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(v8) },
+        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(s8) },
+        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(v9) },
+        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(s9) },
+        wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(v10) },
+        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(s10) },
     ] })
+}
+
+pub fn char_tangent_buffer(device: &wgpu::Device, m: &CharMaterial, vertex_count: usize, label: &str) -> wgpu::Buffer {
+    let t: Vec<[f32; 4]> = if m.tangents.len() == vertex_count { m.tangents.clone() } else { vec![[0.0; 4]; vertex_count.max(1)] };
+    crate::texture::buffer_init(device, &t, wgpu::BufferUsages::VERTEX, label)
 }
 
 /// [`CharGpu::overlay`] from the layout alone.
@@ -315,6 +351,7 @@ mod tests {
         ge.extend(crate::distance_field::globals_layout_entries()); // DISTANCE FIELD HOOK: the renderer's globals carry bindings 5..10
         ge.extend(crate::sky_reflection::globals_layout_entries()); // SKY REFLECTION HOOK: bindings 11..14
         ge.extend(crate::light_function::globals_layout_entries()); // LIGHT FUNCTION: bindings 20..22
+        ge.extend(crate::local_lights::globals_layout_entries());
         let globals = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("globals"), entries: &ge });
         let d2 = wgpu::TextureViewDimension::D2;
         let material = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("material"), entries: &[ent(0, f, uni), ent(1, f, tex(d2)), ent(2, f, tex(d2)), ent(3, f, tex(d2)), ent(4, f, tex(d2))] });

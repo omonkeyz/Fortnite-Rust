@@ -96,6 +96,7 @@ pub enum SoundEvent {
     PickupCue { cue: &'static str, pos: Option<glam::Vec3> },
     /// BUILDING HOOK: a building cue of [`BUILDING_CUES`] (`Fort_Build_Done_Cue`, a death cue, the edit-mode `PlayerUIFeedback` cues) at `pos` (world metres; `None` = 2D).
     BuildingCue { cue: &'static str, pos: Option<glam::Vec3> },
+    CueVolume { cue: &'static str, pos: Option<glam::Vec3>, volume: f32 },
     /// BUILDING HOOK: the construction sound attached to a piece (`BuildingConstructionSounds`, `ABuildingSMActor::vfunc_403`), channel `key`; a running one on the key is replaced.
     BuildingLoop { cue: &'static str, key: u32, pos: Option<glam::Vec3> },
     /// BUILDING HOOK: the piece ended (`ABuildingSMActor::EndPlay` stops its construction sound).
@@ -105,7 +106,11 @@ pub enum SoundEvent {
     ContainerLoop { cue: &'static str, key: u32, pos: Option<glam::Vec3> },
     /// CONTAINERS: stops the channel `key`, fading out over `fade` seconds (0 = at once; the chest's `ReceiveDestroyed` calls `FadeOut(3, 0)`).
     ContainerLoopStop { key: u32, fade: f32 },
+    ContainerLoopFadeIn { cue: &'static str, key: u32, pos: Option<glam::Vec3>, fade: f32 },
     LoopMove { key: u32, pos: glam::Vec3 },
+    LoopGain { key: u32, gain: f32 },
+    ParamLoopFadeIn { cue: &'static str, key: u32, pos: Option<glam::Vec3>, fade: f32, param: &'static str, value: f32 },
+    LoopParam { key: u32, param: &'static str, value: f32 },
     MenuOpen,
     MenuClose,
     MenuClick,
@@ -140,12 +145,17 @@ pub trait AudioSink {
     fn set_music(&mut self, _track: Option<MusicCue>) {}
     /// MUSIC HOOK: a loading screen is up (`DefaultGameData.LoadingScreenSoundMix` = `Fort_Loading_Mix`: SFX, Voice and Music to 0; 0.5 s in, 1.0 s out).
     fn set_loading_screen(&mut self, _on: bool) {}
+    fn push_player_killed_mix(&mut self) {}
     /// AMBIENCE HOOK: where the level's ambient emitters stand in the game world: `center_cm` = the UE world position (cm) the game's layout is centred on,
     /// `anchor_m` = where that centre sits in game metres (`audio = anchor + (ue.x - c.x, ue.z - c.z, ue.y - c.y)`). Call once; the default maps UE to `(x, z, y)`.
     fn ambient_map(&mut self, _center_cm: [f32; 3], _anchor_m: glam::Vec3) {}
     /// AMBIENCE HOOK: once per frame while playing. `pawn` = the pawn's location (game metres), `forward` its horizontal forward; `trace(from_m, dir, len_m)` is a
     /// line trace against world geometry that ignores pawns (used by the bed's "surrounded" test, a few times per 1.5 s).
     fn ambient_frame(&mut self, _dt: f32, _pawn: glam::Vec3, _forward: glam::Vec3, _trace: &mut dyn FnMut(glam::Vec3, glam::Vec3, f32) -> bool) {}
+    fn add_baked(&mut self, _waves: Vec<(String, Arc<fn_audio::mixer::LoadedWave>)>, _cues: Vec<(String, Arc<fn_audio::cue::SoundCue>)>) {}
+    fn play_baked(&mut self, _cue: &str, _pos: Option<glam::Vec3>, _volume: f32, _pitch: f32, _ints: &[(&str, i32)], _floats: &[(&str, f32)]) -> u64 { 0 }
+    fn adjust_baked(&mut self, _id: u64, _pos: Option<glam::Vec3>, _floats: &[(&str, f32)]) {}
+    fn fade_baked(&mut self, _id: u64, _from: Option<f32>, _target: f32, _secs: f32, _stop: bool) {}
 }
 
 /// Drops everything.
@@ -212,6 +222,9 @@ pub const BUILDING_CUES: &[&str] = &[
     "/Game/Sounds/Fort_Impact_Sounds/Demolition/Defaults/Demo_WoodPlayer_ImpactFinal_Cue", "/Game/Sounds/Fort_Impact_Sounds/Demolition/Defaults/Demo_RockPlayer_ImpactFinal_Cue",
     "/Game/Sounds/Fort_Impact_Sounds/Demolition/Defaults/Demo_Metal_ImpactFinal_Cue",
     "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_G_To_Edit_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_CancelEdit_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_Edit_TurnOnTile_Cue",
+    "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_Select_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_Rotate_Cue",
+    "/Game/Sounds/Fort_UI_Sounds/Gameplay/UI_CantBuild_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/UI_NotEnoughResources_Cue",
+    "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_SelectWood_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_SelectRock_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_SelectMetal_Cue",
 ];
 /// BUILDING HOOK: the [`BUILDING_CUES`] entry of a cue path (`.Name` suffix allowed), `None` when it is not in the table.
 pub fn building_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); BUILDING_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
@@ -265,23 +278,53 @@ pub const TRAP_CUES: &[&str] = &[
     "/Game/Sounds/Fort_Traps/Electric_Trap/Electric_Trap_Place_Athena", "/Game/Sounds/Fort_Traps/Electric_Trap/Electric_Trap_Charged_Athena",
     "/Game/Sounds/Fort_Traps/JumpPad/JumpPad_Destroyed_Cue", "/Game/Sounds/Fort_Traps/JumpPad/JumpPad_Fire_Cue", "/Game/Sounds/Fort_Traps/JumpPad/JumpPad_Placed_Cue",
 ];
+pub const BOUNCE_CUES: &[&str] = &[
+    "/Game/Sounds/Fort_Test_Sounds/World_Objects/Bouncing/TwangRubber1_Cue", "/Game/Sounds/Fort_Test_Sounds/World_Objects/Bouncing/Hydrant_Launch_Cue",
+    "/Game/Sounds/Fort_GamePlay_Sounds/Bouncers/FireHydrant_WaterStream_Cue",
+];
+pub fn bounce_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); BOUNCE_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
 pub fn trap_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); TRAP_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
 
 pub const ROCKET_CUES: &[&str] = &[
     "/Game/Sounds/Fort_Weapons/PumpkinLauncher/Pumpkin_Proj_Impact_Athena_Cue", "/Game/Sounds/Fort_Weapons/PumpkinLauncher/Pumpkin_InAirLoop_Athena_Cue",
     "/Game/Sounds/Fort_Weapons/PumpkinLauncher/Pumpkin_InAirLoop_Cue", "/Game/Sounds/Fort_GamePlay_Sounds/Explosives/Grenade_Launcher_Explosion_MLTI_Athena_Cue",
-    "/Game/Sounds/Fort_GamePlay_Sounds/Explosives/Grenade_Projectile_Bounce_Cue",
+    "/Game/Sounds/Fort_GamePlay_Sounds/Explosives/Grenade_Projectile_Bounce_Cue", "/Game/Sounds/Fort_GamePlay_Sounds/Explosives/Grenade_Explosion_Athena_Cue",
+    "/Game/Sounds/Fort_Gadgets/Soldier/Soldier_Proxy_Mine_Activate_Cue",
 ];
+pub const GUNFX_CUES: &[&str] = &["/Game/Athena/Sounds/Impacts/Sniper_Rifle_Surface_Rico_Cue", "/Game/Athena/Sounds/Impacts/Sniper_Rifle_Player_Impact_Athena_Cue"];
+pub fn gunfx_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); GUNFX_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
 pub const DROP_CUES: &[&str] = &[
     "/Game/Athena/Sounds/Vehicles/Athena_Bus_Flying_Loop_Cue", "/Game/Athena/Sounds/Vehicles/Athena_Bus_Music_Loop_Cue", "/Game/Athena/Sounds/Bus/FlyingBus_Drop_Cue",
     "/Game/Athena/Sounds/Wind_Falling/Wind_UmbrellaClosed_Loop_01_Cue", "/Game/Athena/Sounds/Wind_Falling/Wind_UmbrellaOpen_Loop_01_Cue",
     "/Game/Sounds/Fort_Gadgets/Athena/Athena_Glider_Open_Cue", "/Game/Sounds/Fort_Gadgets/Athena/Athena_Glider_Close_Cue",
 ];
+pub const SUPPLY_DROP_CUES: &[&str] = &[
+    "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Flare_Loop_Athena_Cue", "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Reticle_Loop_Athena_Cue",
+    "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Falling_Loop_Athena_Cue", "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Appear_Athena_Cue",
+    "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Reticle_Appear_Athena_Cue", "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_LastSecond_Athena_Cue",
+    "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Land_Athena_Cue", "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Open_Athena_Cue",
+    "/Game/Athena/Sounds/SupplyDrops/Fort_SupplyDrop_Balloon_Explode_Cue",
+];
+pub fn supply_drop_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); SUPPLY_DROP_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
 pub const STORM_CUES: &[&str] = &[
     "/Game/Athena/Sounds/Shield/Shield_Passthrough_Cue", "/Game/Athena/Sounds/Shield/SafeZone_Storm_Loop_Cue", "/Game/Athena/Sounds/Shield/SafeZone_HoldingBegin_Cue",
     "/Game/Athena/Sounds/Shield/SafeZone_BeginShrinking_Cue", "/Game/Athena/Sounds/Shield/Shield_PowerLoop_Ambient_Cue", "/Game/Athena/Sounds/Shield/Shield_PowerLoop_Moving_Cue",
     "/Game/Athena/Sounds/Impacts/Storm_Player_Damage_Zaps_Cue", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_GamePhaseChange_Message_Athena_Cue",
 ];
+pub const DEATH_CUES: &[&str] = &[
+    "/Game/Sounds/Fort_Foley_Sounds/Moves/Player_Foley_BodyFall_Athena_Cue", "/Game/Athena/Sounds/Character/PlayerKilled_Cue",
+    "/Game/Sounds/Fort_GamePlay_Sounds/Player/Revive_Player_Athena_Cue",
+    "/Game/Sounds/Fort_Gadgets/Teleporter/teleporter_place_Cue", "/Game/Sounds/Fort_Gadgets/Teleporter/teleport_Cue",
+    "/Game/Athena/Sounds/Character/Athena_Character_DBNO_HandPlace_Cue", "/Game/Athena/Sounds/Character/Athena_Character_DBNO_Shuffle_Left_Cue", "/Game/Athena/Sounds/Character/Athena_Character_DBNO_Shuffle_Right_Cue",
+    "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_DBNOTeammate_Message_Athena_Cue",
+];
+pub const EMOTE_CUES: &[&str] = &[
+    "/Game/Sounds/Fort_Music/Dance/Dance_Clap_Cue", "/Game/Sounds/Fort_Music/Dance/fort_dance_01_Cue", "/Game/Sounds/Fort_Music/Dance/fort_dance_music_ridethepony_Cue",
+    "/Game/Sounds/Fort_UI_Sounds/FrontEnd/New_FrontEnd/Fortnite_UI_MainMenu_Tab_Hover_02_Cue", "/Game/Sounds/Fort_UI_Sounds/FrontEnd/New_FrontEnd/Fortnite_UI_MainMenu_Generic_03_Cue",
+    "/Game/Sounds/Fort_UI_Sounds/FrontEnd/fort_ui_dismiss_03_Cue",
+];
+pub fn emote_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); EMOTE_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
+pub fn death_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); DEATH_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
 pub fn rocket_cue(object_path: &str) -> Option<&'static str> { let p = object_path.split('.').next().unwrap_or(object_path); ROCKET_CUES.iter().copied().find(|c| c.eq_ignore_ascii_case(p)) }
 
 /// DOORS: the [`DOOR_CUES`] entry of a door sound path (`.Name` suffix allowed), `None` when it is not in the table.
@@ -325,9 +368,14 @@ fn core_cues() -> Vec<&'static str> {
     .chain(fn_audio::demolition::CUES.iter().copied())
     .chain(CONTAINER_CUES.iter().copied()) // CONTAINERS
     .chain(TRAP_CUES.iter().copied())
+    .chain(BOUNCE_CUES.iter().copied())
         .chain(ROCKET_CUES.iter().copied())
+    .chain(GUNFX_CUES.iter().copied())
     .chain(DROP_CUES.iter().copied())
     .chain(STORM_CUES.iter().copied())
+    .chain(SUPPLY_DROP_CUES.iter().copied())
+    .chain(DEATH_CUES.iter().copied())
+    .chain(EMOTE_CUES.iter().copied())
     .chain(weapon_events::bp_played_cues()) // WEAPON BP TABLE: every BR weapon Blueprint's cues + montage-notify cues
     .collect::<std::collections::BTreeSet<_>>().into_iter().collect()
 }
@@ -607,6 +655,7 @@ impl AudioSink for EngineSink {
             }
             SoundEvent::PickupCue { cue, pos } => self.play(cue, pos.map(cm)), // PICKUPS HOOK
             SoundEvent::BuildingCue { cue, pos } => self.play(cue, pos.map(cm)), // BUILDING HOOK
+            SoundEvent::CueVolume { cue, pos, volume } => { let _ = self.handle.play_cue(cue, PlayParams { position: pos.map(cm), volume, ..Default::default() }); }
             SoundEvent::BuildingLoop { cue, key, pos } => { // BUILDING HOOK: the fire-loop channel table, keys offset by the caller
                 if let Some(old) = self.fire_loops.remove(&key) { self.handle.stop(old); }
                 if let Ok(pid) = self.handle.play_cue(cue, PlayParams { position: pos.map(cm), ..Default::default() }) { self.fire_loops.insert(key, pid); }
@@ -616,7 +665,17 @@ impl AudioSink for EngineSink {
                 if let Some(old) = self.fire_loops.remove(&key) { self.handle.stop(old); }
                 if let Ok(pid) = self.handle.play_cue(cue, PlayParams { position: pos.map(cm), ..Default::default() }) { self.fire_loops.insert(key, pid); }
             }
+            SoundEvent::ContainerLoopFadeIn { cue, key, pos, fade } => {
+                if let Some(old) = self.fire_loops.remove(&key) { self.handle.stop(old); }
+                if let Ok(pid) = self.handle.play_cue(cue, PlayParams { position: pos.map(cm), ..Default::default() }) { if fade > 0. { self.handle.fade_play(pid, 0., 0., false); self.handle.fade_play(pid, 1., fade, false); } self.fire_loops.insert(key, pid); }
+            }
             SoundEvent::ContainerLoopStop { key, fade } => { if let Some(pid) = self.fire_loops.remove(&key) { if fade > 0. { self.handle.fade_play(pid, 0., fade, true) } else { self.handle.stop(pid) } } } // CONTAINERS
+            SoundEvent::LoopGain { key, gain } => { if let Some(pid) = self.fire_loops.get(&key) { self.handle.fade_play(*pid, gain, 0., false); } }
+            SoundEvent::ParamLoopFadeIn { cue, key, pos, fade, param, value } => {
+                if let Some(old) = self.fire_loops.remove(&key) { self.handle.stop(old); }
+                if let Ok(pid) = self.handle.play_cue(cue, PlayParams { position: pos.map(cm), floats: vec![(param.to_owned(), value)], ..Default::default() }) { if fade > 0. { self.handle.fade_play(pid, 0., 0., false); self.handle.fade_play(pid, 1., fade, false); } self.fire_loops.insert(key, pid); }
+            }
+            SoundEvent::LoopParam { key, param, value } => { if let Some(pid) = self.fire_loops.get(&key) { self.handle.adjust_play(*pid, fn_audio::playadj::Adjust { floats: vec![(param.to_owned(), value)], ..Default::default() }); } }
             SoundEvent::LoopMove { key, pos } => { if let Some(pid) = self.fire_loops.get(&key) { self.handle.adjust_play(*pid, fn_audio::playadj::Adjust { position: Some(Some(cm(pos))), ..Default::default() }); } }
             SoundEvent::MenuOpen => self.play(events::MENU_OPEN, None),
             SoundEvent::MenuClose => self.play(events::MENU_CLOSE, None),
@@ -695,6 +754,32 @@ impl AudioSink for EngineSink {
     fn set_loading_screen(&mut self, on: bool) {
         self.set_loading_mix(on);
     }
+    fn push_player_killed_mix(&mut self) {
+        EngineSink::push_player_killed_mix(self);
+    }
+    fn add_baked(&mut self, waves: Vec<(String, Arc<fn_audio::mixer::LoadedWave>)>, cues: Vec<(String, Arc<fn_audio::cue::SoundCue>)>) {
+        for (k, w) in waves {
+            let _ = self.handle.add_wave_arc(&k, w);
+        }
+        for (k, c) in cues {
+            let _ = self.handle.add_cue(&k, c);
+        }
+    }
+    fn play_baked(&mut self, cue: &str, pos: Option<glam::Vec3>, volume: f32, pitch: f32, ints: &[(&str, i32)], floats: &[(&str, f32)]) -> u64 {
+        let params = PlayParams { position: pos.map(cm), volume, pitch, ints: ints.iter().map(|(n, v)| (n.to_string(), *v)).collect(), floats: floats.iter().map(|(n, v)| (n.to_string(), *v)).collect(), ..Default::default() };
+        self.handle.play_cue(cue, params).unwrap_or(0)
+    }
+    fn adjust_baked(&mut self, id: u64, pos: Option<glam::Vec3>, floats: &[(&str, f32)]) {
+        if id == 0 {
+            return;
+        }
+        self.handle.adjust_play(id, fn_audio::playadj::Adjust { position: pos.map(|p| Some(cm(p))), floats: floats.iter().map(|(n, v)| (n.to_string(), *v)).collect(), ..Default::default() });
+    }
+    fn fade_baked(&mut self, id: u64, from: Option<f32>, target: f32, secs: f32, stop: bool) {
+        if id != 0 {
+            self.handle.adjust_play(id, fn_audio::playadj::Adjust { gain: Some((from, target, secs, stop)), ..Default::default() });
+        }
+    }
 }
 
 /// An [`EngineSink`] together with the output stream it plays through (keep it on the thread that created it).
@@ -734,12 +819,27 @@ impl AudioSink for DeviceSink {
     fn set_loading_screen(&mut self, on: bool) {
         self.sink.set_loading_screen(on)
     }
+    fn push_player_killed_mix(&mut self) {
+        self.sink.push_player_killed_mix()
+    }
     // AMBIENCE HOOK
     fn ambient_map(&mut self, center_cm: [f32; 3], anchor_m: glam::Vec3) {
         self.sink.ambient_map(center_cm, anchor_m)
     }
     fn ambient_frame(&mut self, dt: f32, pawn: glam::Vec3, forward: glam::Vec3, trace: &mut dyn FnMut(glam::Vec3, glam::Vec3, f32) -> bool) {
         self.sink.ambient_frame(dt, pawn, forward, trace)
+    }
+    fn add_baked(&mut self, waves: Vec<(String, Arc<fn_audio::mixer::LoadedWave>)>, cues: Vec<(String, Arc<fn_audio::cue::SoundCue>)>) {
+        self.sink.add_baked(waves, cues)
+    }
+    fn play_baked(&mut self, cue: &str, pos: Option<glam::Vec3>, volume: f32, pitch: f32, ints: &[(&str, i32)], floats: &[(&str, f32)]) -> u64 {
+        self.sink.play_baked(cue, pos, volume, pitch, ints, floats)
+    }
+    fn adjust_baked(&mut self, id: u64, pos: Option<glam::Vec3>, floats: &[(&str, f32)]) {
+        self.sink.adjust_baked(id, pos, floats)
+    }
+    fn fade_baked(&mut self, id: u64, from: Option<f32>, target: f32, secs: f32, stop: bool) {
+        self.sink.fade_baked(id, from, target, secs, stop)
     }
 }
 
@@ -862,6 +962,26 @@ mod tests {
         assert!(peak(&mut eng) > 1e-4, "explosion cue audible");
         sink.event(SoundEvent::BuildingCue { cue: ROCKET_CUES[3], pos: Some(glam::Vec3::new(0., 0., -3.)) });
         assert!(peak(&mut eng) > 1e-4, "grenade launcher explosion cue audible");
+    }
+
+    #[test]
+    fn skydive_and_glider_wind_loops_are_audible() {
+        let Some(r) = root() else { eprintln!("SKIP: no install"); return };
+        let mut lib = Library::open(r).unwrap();
+        lib.compact_pcm = true;
+        let mut eng = AudioEngine::new(48000);
+        let mut sink = EngineSink::with_engine(eng.handle(), &mut lib);
+        for c in DROP_CUES { assert!(!sink.missing.iter().any(|(m, _)| m == c), "{c}: {:?}", sink.missing); }
+        sink.listener(glam::Vec3::new(300., 900., -200.), glam::Vec3::NEG_Z, glam::Vec3::Y);
+        let rms = |eng: &mut AudioEngine| { let b = eng.render_offline(48000, 9); (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt() };
+        sink.event(SoundEvent::ContainerLoop { cue: DROP_CUES[3], key: 1, pos: None });
+        let sky = rms(&mut eng);
+        sink.event(SoundEvent::ContainerLoopStop { key: 1, fade: 0. });
+        let _ = rms(&mut eng);
+        sink.event(SoundEvent::ContainerLoop { cue: DROP_CUES[4], key: 2, pos: None });
+        let glide = rms(&mut eng);
+        eprintln!("skydive rms {sky} glide rms {glide}");
+        assert!(sky > 1e-3 && glide > 1e-4, "skydive {sky} glide {glide}");
     }
 
     #[test]

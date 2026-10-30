@@ -39,6 +39,41 @@ pub struct WeaponMuzzle {
     pub other_particle_refs: BTreeMap<String, String>,
     /// Numeric CDO properties named `*Light*` (`Muzzle Flash Light Intensity (Charged)` ...).
     pub light_properties: BTreeMap<String, f32>,
+    #[serde(default)]
+    pub shells: Option<ShellsData>,
+    #[serde(default)]
+    pub reload_smoke: Option<ReloadSmokeData>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShellsData {
+    pub system: String,
+    pub socket_name: String,
+    pub socket: Option<SocketInfo>,
+    pub on_fire: bool,
+    pub on_reload: bool,
+    pub on_pump: bool,
+    pub shell_type: u8,
+    pub spawn_rate_scale: f32,
+    pub rotation_rate: [f32; 3],
+    pub velocity: [f32; 3],
+    pub gravity: [f32; 3],
+    pub lifetime: f32,
+    pub size: [f32; 3],
+    pub inherit_parent_velocity: f32,
+    pub cylinder_radius: f32,
+    pub cylinder_height: f32,
+    pub time_dilation: f32,
+    pub pump_notify_times: Vec<f32>,
+    #[serde(default)]
+    pub reload_shell_delay: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReloadSmokeData {
+    pub system: String,
+    pub socket_name: String,
+    pub socket: Option<SocketInfo>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

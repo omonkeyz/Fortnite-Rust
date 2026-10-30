@@ -32,3 +32,15 @@ pub fn save(name: &str) {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save(_name: &str) {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn get(key: &str) -> Option<String> { call(&storage()?, "getItem", &[key])?.as_string() }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get(_key: &str) -> Option<String> { None }
+
+#[cfg(target_arch = "wasm32")]
+pub fn set(key: &str, value: &str) { if let Some(s) = storage() { let _ = call(&s, "setItem", &[key, value]); } }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set(_key: &str, _value: &str) {}

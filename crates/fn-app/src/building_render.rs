@@ -192,7 +192,7 @@ pub struct BuildingRender {
 /// (browser: 150-510 ms of material work plus the GPU process' pipeline compile per piece, `verification/browser/first_use1`; native 30-55 ms,
 /// `verification/first_use/run2`): the first draw of a piece built its materials (WGSL + pipelines + textures), shadow-depth programs, mirrored-culling
 /// variant, blueprint MID, damage overlay and distance field, and the first construction effect its particle materials.
-enum Warm { Init, Class(String), Edit, Effect(String) }
+enum Warm { Init, Class(String), Edit, Effect(String), Door(String, Option<String>) }
 /// The view of the warm-up's scratch draws (only their sort keys read it; nothing is presented).
 const WARM_VIEW: ViewParams = ViewParams { eye: Vec3::ZERO, forward: Vec3::NEG_Z, up: Vec3::Y, tan_half: (1.0, 0.5625), near_m: 0.1, far_m: 1000.0, width: 1920, height: 1080, time: 0.0, real_time: 0.0, delta_world: 0.0 };
 /// Where the scratch draws are placed (far below the map: nothing of them is ever drawn).
@@ -214,7 +214,7 @@ fn yaw_mat(yaw_deg: f32) -> Mat3 { Mat3::from_rotation_z(yaw_deg.to_radians()) }
 impl BuildingRender {
     pub fn new(install: &Path, asset_roots: &[PathBuf]) -> Result<BuildingRender, String> {
         let set = Arc::new(PakSet::open_install(install).map_err(|e| e.to_string())?);
-        Ok(BuildingRender { set, install: install.to_path_buf(), asset_roots: asset_roots.to_vec(), gpu_ready: false, cache: TextureCache::default(), shared: None, fade_buf: None, defs: HashMap::new(), meshes: HashMap::new(), entries: vec![], index: HashMap::new(), mirrored: HashMap::new(), bp_params: HashMap::new(), sockets: HashMap::new(), vs_bufs: HashMap::new(), camera_cut: false, cut_pending: false, pool: vec![], used: 0, binds: HashMap::new(), pieces: HashMap::new(), cursor: 0, fx: None, fx_tried: false, time: 0., view: None, offset: Vec3::ZERO, warned: HashSet::new(), log: vec![],
+        Ok(BuildingRender { set, install: install.to_path_buf(), asset_roots: asset_roots.to_vec(), gpu_ready: false, cache: TextureCache::deferred(), shared: None, fade_buf: None, defs: HashMap::new(), meshes: HashMap::new(), entries: vec![], index: HashMap::new(), mirrored: HashMap::new(), bp_params: HashMap::new(), sockets: HashMap::new(), vs_bufs: HashMap::new(), camera_cut: false, cut_pending: false, pool: vec![], used: 0, binds: HashMap::new(), pieces: HashMap::new(), cursor: 0, fx: None, fx_tried: false, time: 0., view: None, offset: Vec3::ZERO, warned: HashSet::new(), log: vec![],
             shadows: HashMap::new(), shadow_binds: HashMap::new(), default_mat: None, dfs: HashMap::new(), shadow_written: HashSet::new(), casting: false, now: 0.,
             gamedata: None, pending_hits: HashMap::new(), dying: vec![], bounce_convexes: HashMap::new(), warm: None, warm_t0: None })
     }
@@ -313,6 +313,9 @@ impl BuildingRender {
                 for variant in ["Solid", "Floor", "StairW", "RoofC"] { q.push_back(Warm::Class(vis::piece_class(m, 0, variant))); }
             }
             q.push_back(Warm::Edit);
+            let mut doors: Vec<(String, Option<String>)> = vec![];
+            for d in crate::door_hook::map_draws() { let k = (d.mesh.clone(), d.material.clone()); if !doors.contains(&k) { doors.push(k); } }
+            q.extend(doors.into_iter().map(|(m, s0)| Warm::Door(m, s0)));
             self.warm = Some(q);
             self.warm_t0 = Some(t);
         }
@@ -327,6 +330,7 @@ impl BuildingRender {
                 Warm::Class(c) => self.warm_class(fx, &c),
                 Warm::Edit => self.warm_edit(fx),
                 Warm::Effect(s) => self.warm_effect(fx, &s),
+                Warm::Door(m, s0) => self.warm_door(fx, &m, s0.as_deref()),
             }
             if t.elapsed() >= budget { break; }
         }
@@ -481,6 +485,18 @@ impl BuildingRender {
     /// `ABuildingSMActor` / `ABuildingWall` / `ABuildingFloor` / `ABuildingStairs` / `ABuildingRoof` ctors never set 26 / 27 / 28, the PBWA class defaults
     /// serialize neither); `ABuildingSMActor`'s ctor (@14045b960) sets CastShadow / bCastDynamicShadow / bCastStaticShadow on its mesh component.
     /// FX SHADOW SELF-SHADOW BIAS: `animating` = damage-visuals state 1, whose component overrides the self-shadow bias ([`ANIMATING_DF_SELF_SHADOW_BIAS`]).
+    fn warm_door(&mut self, fx: &mut FxRenderer, mesh: &str, slot0: Option<&str>) {
+        if self.mesh(fx, mesh).is_ok() {
+            let (num_uv, sections, paths) = { let g = self.meshes[mesh].as_ref().unwrap(); (g.num_uv, g.sections.clone(), g.material_paths.clone()) };
+            for (slot, _, _) in sections {
+                let own = paths.get(slot).cloned().flatten();
+                let path = if slot == 0 { slot0.map(str::to_owned).or(own) } else { own };
+                if let Some(p) = path { let _ = self.material(fx, &p, num_uv, &[]); }
+            }
+        }
+        let _ = self.piece_df(mesh, false);
+    }
+
     fn piece_df(&mut self, mesh_path: &str, animating: bool) -> Option<Arc<fn_render::distance_field::MeshDistanceField>> {
         if !self.dfs.contains_key(mesh_path) {
             let object = format!("{}.{}", fn_fx::data::long_package(mesh_path), mesh_path.rsplit('/').next().unwrap_or(mesh_path).split('.').next().unwrap_or(""));
@@ -1142,6 +1158,33 @@ pub fn prebuild_step(fx: &mut FxRenderer, budget_ms: f32) -> bool {
     if !warm_enabled() { return true; }
     let Ok(mut g) = STATE.lock() else { return true };
     match g.as_mut() { Some(b) => b.warm_step(fx, std::time::Duration::from_secs_f32(budget_ms.max(0.0) / 1000.0)), None => true }
+}
+pub fn prebuild_doors(fx: &mut FxRenderer, budget_ms: f32) -> bool {
+    if !warm_enabled() { return true; }
+    static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(poi) = crate::poi::current() else { return true };
+    let Ok(mut g) = STATE.lock() else { return true };
+    let Some(b) = g.as_mut() else { return true };
+    let t = std::time::Instant::now();
+    prewarm_doors(&b.set);
+    b.init_gpu(fx);
+    b.init_particles(fx);
+    let _ = b.gamedata();
+    let mut kinds: Vec<(String, Option<String>)> = vec![];
+    for d in &poi.doors { let k = (d.def.mesh.clone(), d.def.animating_material.clone()); if !kinds.contains(&k) { kinds.push(k); } }
+    let view = *b.view.get_or_insert(WARM_VIEW);
+    let eye = fn_fx::view::to_ue(view.eye).as_vec3();
+    let (mut out, mut tr) = (FxFrame::default(), vec![]);
+    while let Some((mesh, mat)) = kinds.get(AT.load(std::sync::atomic::Ordering::Relaxed)).cloned() {
+        AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for mirrored in [false, true] { b.draw_door_leaf(fx, &mut out, &mut tr, eye, &mesh, mat.as_deref(), &[], &[], None, BuildingRender::l2w(WARM_AT, 0.0, mirrored)); }
+        b.used = 0;
+        b.shadow_written.clear();
+        if t.elapsed().as_secs_f32() * 1000. >= budget_ms { break; }
+    }
+    let done = AT.load(std::sync::atomic::Ordering::Relaxed) >= kinds.len();
+    if done { static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false); if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) { eprintln!("[building] door warm-up: {} door kinds of {} map doors", kinds.len(), poi.doors.len()); } }
+    done
 }
 /// The frame of the building visuals (see [`BuildingRender::frame`]); no-op before [`init`].
 pub fn frame(fx: &mut FxRenderer, world: &BuildingWorld, offset: Vec3, preview: Option<&Preview>, edit: Option<&EditVisuals>, view: &ViewParams, dt: f32, out: &mut FxFrame) -> Vec<SoundEvent> {

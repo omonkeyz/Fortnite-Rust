@@ -220,6 +220,75 @@ fn get(u: &str, range: Option<(u64, u64)>) -> io::Result<Option<js_sys::Uint8Arr
     Ok(r)
 }
 
+static IO_SLOTS: Mutex<Option<HashMap<u32, Option<io::Result<Option<Vec<u8>>>>>>> = Mutex::new(None);
+static IO_DONE: std::sync::Condvar = std::sync::Condvar::new();
+static IO_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+thread_local! { static IO_PORT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; static IO_HIGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+static IO_PARTS: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+const IO_PART_RESERVE_MAX: u64 = 256 << 20;
+static IO_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const IO_WAIT_S: u64 = 120;
+
+fn io_port() -> bool {
+    IO_PORT.with(|c| {
+        if c.get() == 0 { c.set(if crate::pool::can_block() && crate::js::fnweb_io_port() { 1 } else { 2 }); }
+        c.get() == 1
+    })
+}
+
+fn get_bytes(u: &str, range: Option<(u64, u64)>) -> io::Result<Option<Vec<u8>>> {
+    if !io_port() || IO_BROKEN.load(Ordering::Relaxed) { return Ok(get(u, range)?.map(|a| a.to_vec())); }
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    record(u, range);
+    let (a, b) = range.map_or((-1.0, -1.0), |(a, b)| (a as f64, b as f64));
+    let t = now_us();
+    let id = IO_NEXT.fetch_add(1, Ordering::Relaxed);
+    IO_SLOTS.lock().map_err(|_| io::Error::other("poisoned"))?.get_or_insert_with(HashMap::new).insert(id, None);
+    let reserve = range.map_or(0, |(a, b)| (b.saturating_sub(a) + 1).min(IO_PART_RESERVE_MAX)) as usize;
+    if let Ok(mut p) = IO_PARTS.lock() { p.get_or_insert_with(HashMap::new).insert(id, Vec::with_capacity(reserve)); }
+    crate::js::fnweb_io_request(id, u, a, b, token(), IO_HIGH.with(|c| c.get()));
+    let mut g = IO_SLOTS.lock().map_err(|_| io::Error::other("poisoned"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(IO_WAIT_S);
+    let r = loop {
+        if let Some(m) = g.as_mut() { if let Some(v) = m.get_mut(&id) { if let Some(v) = v.take() { m.remove(&id); break Some(v); } } }
+        let now = std::time::Instant::now();
+        if now >= deadline || IO_BROKEN.load(Ordering::Relaxed) { if let Some(m) = g.as_mut() { m.remove(&id); } if let Ok(mut p) = IO_PARTS.lock() { if let Some(p) = p.as_mut() { p.remove(&id); } } break None; }
+        g = IO_DONE.wait_timeout(g, (deadline - now).min(std::time::Duration::from_millis(500))).map_err(|_| io::Error::other("poisoned"))?.0;
+    };
+    let r = match r {
+        Some(r) => r,
+        None => {
+            drop(g);
+            if !IO_BROKEN.swap(true, Ordering::Relaxed) { eprintln!("[fnweb vfs] {u}: no answer from the I/O worker in {IO_WAIT_S} s: file reads go back to synchronous requests"); }
+            return Ok(get(u, range)?.map(|a| a.to_vec()));
+        }
+    };
+    drop(g);
+    HTTP_US.fetch_add(now_us().saturating_sub(t), Ordering::Relaxed);
+    if let Ok(Some(v)) = &r { FETCHED.fetch_add(v.len() as u64, Ordering::Relaxed); }
+    r
+}
+
+pub fn io_chunk(id: u32, chunk: &js_sys::Uint8Array) {
+    let n = chunk.length() as usize;
+    if n == 0 { return; }
+    if let Ok(mut g) = IO_PARTS.lock() {
+        if let Some(v) = g.as_mut().and_then(|m| m.get_mut(&id)) { let at = v.len(); v.resize(at + n, 0); chunk.copy_to(&mut v[at..]); }
+    }
+}
+
+pub fn io_done(id: u32, status: u32, body: Option<Vec<u8>>, err: String) {
+    let parts = IO_PARTS.lock().ok().and_then(|mut g| g.as_mut().and_then(|m| m.remove(&id)));
+    let r = match status {
+        404 => Ok(None),
+        200 | 206 | 204 => Ok(Some(body.or(parts).unwrap_or_default())),
+        403 => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("HTTP 403: {err}"))),
+        s => Err(io::Error::other(format!("HTTP {s}: {err}"))),
+    };
+    if let Ok(mut g) = IO_SLOTS.lock() { if let Some(slot) = g.get_or_insert_with(HashMap::new).get_mut(&id) { *slot = Some(r); } }
+    IO_DONE.notify_all();
+}
+
 fn send(method: &str, u: &str, body: Option<&[u8]>) -> io::Result<bool> {
     REQUESTS.fetch_add(1, Ordering::Relaxed);
     let body = body.map(js_sys::Uint8Array::from);
@@ -230,8 +299,8 @@ fn send(method: &str, u: &str, body: Option<&[u8]>) -> io::Result<bool> {
 /// File bytes (optionally a range): like [get], but always as a Vec, and on the main thread the request is made by an I/O thread (a Window's
 /// synchronous XHR can only return text, which JS converts byte by byte: slow for anything but small metadata replies).
 fn fetch(u: &str, range: Option<(u64, u64)>) -> io::Result<Option<Vec<u8>>> {
-    if crate::pool::can_block() { return Ok(get(u, range)?.map(|a| a.to_vec())); }
-    on_io_thread(|| get(u, range).map(|r| r.map(|a| a.to_vec())))
+    if crate::pool::can_block() { return get_bytes(u, range); }
+    on_io_thread(|| get_bytes(u, range))
 }
 
 // ------------------------------------------------------------------------------------------------------------------------------------------
@@ -249,7 +318,7 @@ static IO_THREADS: AtomicUsize = AtomicUsize::new(0);
 pub fn start_io_threads() {
     if IO_THREADS.swap(2, Ordering::SeqCst) != 0 { return; }
     for i in 0..2 {
-        let spawned = std::thread::Builder::new().name(format!("fnweb-io-{i}")).spawn(|| loop {
+        let spawned = std::thread::Builder::new().name(format!("fnweb-io-{i}")).spawn(|| { IO_HIGH.with(|c| c.set(true)); loop {
             let job = {
                 let mut q = IO_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
@@ -258,7 +327,7 @@ pub fn start_io_threads() {
                 }
             };
             job();
-        });
+        } });
         if spawned.is_err() { IO_THREADS.fetch_sub(1, Ordering::SeqCst); }
     }
 }
@@ -462,7 +531,20 @@ fn tree_root(p: &str) -> Option<&'static str> {
 fn tree(root: &'static str) -> Option<Arc<Tree>> {
     if let Some(t) = TREES.lock().ok()?.get_or_insert_with(HashMap::new).get(root) { return t.clone(); }
     let listing = fetch(&url("tree", root), None).ok().flatten().map(|b| String::from_utf8_lossy(&b).into_owned());
-    let t = listing.map(|body| {
+    let t = listing.map(|body| Arc::new(parse_tree(root, &body)));
+    if let Ok(mut g) = TREES.lock() { g.get_or_insert_with(HashMap::new).insert(root, t.clone()); }
+    t
+}
+
+pub fn set_tree(root: &str, body: &str) {
+    if remote() { return; }
+    let Some(r) = TREE_ROOTS.iter().copied().find(|r| *r == root) else { return };
+    let t = Arc::new(parse_tree(r, body));
+    if let Ok(mut g) = TREES.lock() { g.get_or_insert_with(HashMap::new).entry(r).or_insert(Some(t)); }
+}
+
+fn parse_tree(root: &'static str, body: &str) -> Tree {
+    {
         let base = root.to_ascii_lowercase();
         let mut stat = HashMap::new();
         let mut dirs: HashMap<String, Vec<(String, u8, u64, f64)>> = HashMap::new();
@@ -481,10 +563,8 @@ fn tree(root: &'static str) -> Option<Arc<Tree>> {
             if k == 2 { dirs.entry(abs).or_default(); }
             dirs.entry(parent).or_default().push((name.to_owned(), k, s, m));
         }
-        Arc::new(Tree { stat, dirs, exact })
-    });
-    if let Ok(mut g) = TREES.lock() { g.get_or_insert_with(HashMap::new).insert(root, t.clone()); }
-    t
+        Tree { stat, dirs, exact }
+    }
 }
 
 fn parse_stat(s: &str) -> Option<(u8, u64, f64)> {
@@ -587,7 +667,7 @@ fn read_remote(path: &Arc<str>, size: u64, off: u64, buf: &mut [u8]) -> io::Resu
     let u = file_url(path);
     let block_size = block();
     if len as u64 >= block_size {
-        if crate::pool::can_block() {
+        if crate::pool::can_block() && !io_port() {
             let a = get(&u, Some((off, off + len as u64 - 1)))?.ok_or_else(|| not_found(path))?;
             let n = (a.length() as usize).min(len);
             a.subarray(0, n as u32).copy_to(&mut buf[..n]);
@@ -621,11 +701,115 @@ fn read_remote(path: &Arc<str>, size: u64, off: u64, buf: &mut [u8]) -> io::Resu
     Ok(done)
 }
 
+fn file_rec(path: &str, off: u64, len: usize, t0: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::env::get("FNWEB_FILEREC").is_some_and(|v| v == "1")) { return; }
+    let us = now_us().saturating_sub(t0);
+    if us >= 300 { eprintln!("[filerec] {:.1}\t{path}\t{off}\t{len}", us as f64 / 1000.); }
+}
+
 /// Main-thread reads at least this large are done by a pool worker (see [`read_at`]).
 const MAIN_DELEGATE: usize = 64 << 10;
 
+enum Pref { Pending, InFlight, Ready(Vec<u8>), Used(Vec<u8>, f64), Cancelled }
+static PREF: Mutex<Option<HashMap<(String, u64, usize), Pref>>> = Mutex::new(None);
+static PREF_BYTES: AtomicUsize = AtomicUsize::new(0);
+const PREF_CAP: usize = 256 << 20;
+const PREF_WINDOW: usize = 160 << 20;
+static PREF_QUEUE: Mutex<VecDeque<(String, u64, usize)>> = Mutex::new(VecDeque::new());
+static PREF_HITS: AtomicU64 = AtomicU64::new(0);
+static PREF_SWEEP: AtomicU64 = AtomicU64::new(0);
+const PREF_USED_MS: f64 = 20000.;
+static PREF_KEEP: Mutex<Option<std::collections::HashSet<(String, u64, usize)>>> = Mutex::new(None);
+
+pub fn prefetch_keep(list: Vec<(String, u64, usize)>) {
+    if let Ok(mut g) = PREF_KEEP.lock() { g.get_or_insert_with(Default::default).extend(list); }
+}
+static PREF_JOINED: AtomicU64 = AtomicU64::new(0);
+static PREF_KEPT: AtomicUsize = AtomicUsize::new(0);
+const PREF_KEEP_CAP: usize = 8 << 20;
+static PREF_MISSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn prefetch(list: Vec<(String, u64, usize)>, threads: usize) {
+    {
+        let Ok(mut g) = PREF.lock() else { return };
+        let m = g.get_or_insert_with(HashMap::new);
+        let Ok(mut q) = PREF_QUEUE.lock() else { return };
+        for k in list { if !m.contains_key(&k) { m.insert(k.clone(), Pref::Pending); q.push_back(k); } }
+    }
+    for _ in 0..threads.max(1) {
+        let _ = std::thread::Builder::new().name("fnweb-prefetch".into()).spawn(|| loop {
+            let Some(k) = PREF_QUEUE.lock().ok().and_then(|mut q| q.pop_front()) else { break };
+            let mut waited = 0;
+            while PREF_BYTES.load(Ordering::Relaxed) + k.2 > PREF_WINDOW && waited < 150 && PREF.lock().ok().is_some_and(|g| g.as_ref().is_some_and(|m| matches!(m.get(&k), Some(Pref::Pending)))) { std::thread::sleep(std::time::Duration::from_millis(20)); waited += 1; }
+            let live = PREF.lock().ok().is_some_and(|mut g| g.as_mut().is_some_and(|m| match m.get_mut(&k) { Some(e @ Pref::Pending) => { *e = Pref::InFlight; true } _ => false }));
+            if !live || PREF_BYTES.load(Ordering::Relaxed) + k.2 > PREF_CAP { if let Ok(mut g) = PREF.lock() { if let Some(m) = g.as_mut() { if matches!(m.get(&k), Some(Pref::InFlight | Pref::Pending)) { m.remove(&k); } } } continue; }
+            let data = (|| -> io::Result<Vec<u8>> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&k.0)?;
+                f.seek(SeekFrom::Start(k.1))?;
+                let mut v = vec![0u8; k.2];
+                let mut n = 0;
+                while n < v.len() { let r = f.read(&mut v[n..])?; if r == 0 { break; } n += r; }
+                v.truncate(n);
+                Ok(v)
+            })();
+            if let Ok(mut g) = PREF.lock() {
+                if let Some(m) = g.as_mut() {
+                    match (m.get(&k), data) {
+                        (Some(Pref::InFlight), Ok(v)) => { PREF_BYTES.fetch_add(v.len(), Ordering::Relaxed); m.insert(k, Pref::Ready(v)); }
+                        _ => { m.remove(&k); }
+                    }
+                }
+            }
+        });
+    }
+}
+pub fn prefetch_bundles(folders: Vec<String>) {
+    let _ = std::thread::Builder::new().name("fnweb-bundles".into()).spawn(move || { for f in folders { let _ = small_file(&format!("/fn/assets/{}/fnweb-prefetch.json", f.to_ascii_lowercase()), 0); } });
+}
+pub fn prefetch_drop() {
+    if let Ok(mut q) = PREF_QUEUE.lock() { q.clear(); }
+    if let Ok(mut g) = PREF.lock() { if let Some(m) = g.as_mut() { let n = m.len(); m.retain(|_, v| matches!(v, Pref::Pending | Pref::InFlight)); for v in m.values_mut() { *v = Pref::Cancelled; } if n > 0 { eprintln!("[filewarm] {} prefetched reads used ({} joined in flight, {} missed while queued), {n} kept or left dropped", PREF_HITS.load(Ordering::Relaxed), PREF_JOINED.load(Ordering::Relaxed), PREF_MISSED.load(Ordering::Relaxed)); } } }
+    PREF_BYTES.store(0, Ordering::Relaxed);
+    PREF_KEPT.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = PREF_KEEP.lock() { *g = None; }
+}
+fn prefetched(path: &str, off: u64, buf: &mut [u8]) -> Option<usize> {
+    let k = (path.to_owned(), off, buf.len());
+    let mut joined = false;
+    loop {
+        {
+            let mut g = PREF.lock().ok()?;
+            let m = g.as_mut()?;
+            let now = crate::js::fnweb_now_ms();
+            if PREF_SWEEP.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                let mut freed = 0;
+                m.retain(|_, v| match v { Pref::Used(d, t) if now - *t > PREF_USED_MS => { freed += d.len(); false } _ => true });
+                if freed > 0 { PREF_BYTES.fetch_sub(freed.min(PREF_BYTES.load(Ordering::Relaxed)), Ordering::Relaxed); }
+            }
+            let e = m.get_mut(&k)?;
+            match e {
+                Pref::Used(v, t) => { let n = v.len().min(buf.len()); buf[..n].copy_from_slice(&v[..n]); *t = now; PREF_HITS.fetch_add(1, Ordering::Relaxed); return Some(n); }
+                Pref::Ready(v) => {
+                    let n = v.len().min(buf.len()); buf[..n].copy_from_slice(&v[..n]); PREF_HITS.fetch_add(1, Ordering::Relaxed); if joined { PREF_JOINED.fetch_add(1, Ordering::Relaxed); }
+                    let len = v.len();
+                    if PREF_KEEP.lock().ok().is_some_and(|mut g| g.as_mut().is_some_and(|s| s.remove(&k))) { return Some(n); }
+                    if PREF_KEPT.load(Ordering::Relaxed) + len > PREF_KEEP_CAP { let d = std::mem::take(v); *e = Pref::Used(d, now); } else { PREF_KEPT.fetch_add(len, Ordering::Relaxed); }
+                    return Some(n);
+                }
+                e @ Pref::Pending => { *e = Pref::Cancelled; PREF_MISSED.fetch_add(1, Ordering::Relaxed); return None; }
+                Pref::InFlight => { joined = true; }
+                Pref::Cancelled => return None,
+            }
+        }
+        for _ in 0..256 { std::hint::spin_loop(); }
+    }
+}
+
 pub fn read_at(h: u64, off: u64, buf: &mut [u8]) -> io::Result<usize> {
     let node = handle(h)?;
+    if let Node::Remote { path, .. } = &*node { if !crate::pool::can_block() { if let Some(n) = prefetched(path, off, buf) { return Ok(n); } } }
     if let Node::Remote { path, size } = &*node {
         if let Some(d) = crate::webcook_files::file(path, *size).or_else(|| small_file(path, *size)) {
             if off >= d.len() as u64 { return Ok(0); }
@@ -639,7 +823,16 @@ pub fn read_at(h: u64, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         // done by an I/O thread instead (ArrayBuffer XHR, copied straight into `buf`, which lives in the shared memory); the main thread spins
         // meanwhile.
         Node::Remote { path, size } if !crate::pool::can_block() && buf.len().min(size.saturating_sub(off) as usize) >= MAIN_DELEGATE => {
-            main_wait(&format!("{path} @{off}+{}", buf.len()), || on_io_thread(|| read_remote(path, *size, off, buf)))
+            let t = now_us();
+            let r = main_wait(&format!("{path} @{off}+{}", buf.len()), || on_io_thread(|| read_remote(path, *size, off, buf)));
+            file_rec(path, off, buf.len(), t);
+            r
+        }
+        Node::Remote { path, size } if !crate::pool::can_block() => {
+            let t = now_us();
+            let r = main_wait(&format!("{path} @{off}+{}", buf.len()), || read_remote(path, *size, off, buf));
+            file_rec(path, off, buf.len(), t);
+            r
         }
         Node::Remote { path, size } => main_wait(&format!("{path} @{off}+{}", buf.len()), || read_remote(path, *size, off, buf)),
         Node::Mem { data, .. } => {

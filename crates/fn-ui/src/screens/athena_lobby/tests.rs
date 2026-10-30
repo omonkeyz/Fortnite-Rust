@@ -74,13 +74,13 @@ fn the_screen_is_composed_the_way_the_front_end_creates_it() {
         st.selected_tab = 0;
         let f = l.draw(uic, 1920.0, 1080.0, &st);
         // FrontEnd -> MainContentStack -> AthenaTabsScreen -> tab list + AthenaLobby
-        for n in ["FrontEnd", "MainContentStack", "AthenaTabsScreen", "TopTabList", "AthenaLobby", "OverlayMain", "Launch", "PlayButton", "PlaylistRotator", "TeamFillRotator", "PlayerPanel", "TopBar", "BottomBar", "FortniteLogo", "MainMenuButton"] {
+        for n in ["FrontEnd", "MainContentStack", "AthenaTabsScreen", "TopTabList", "AthenaLobby", "OverlayMain", "Launch", "PlayButton", "PlaylistRotator", "TeamFillRotator", "PlayerPanel", "TopBar", "Social", "BottomBar", "FortniteLogo", "MainMenuButton"] {
             assert!(f.rect(n).is_some(), "missing widget {n}");
         }
         // tabs: `PreregisteredTabInfoArray` order, hidden registrations (Compendium) not created
         let labels: Vec<&str> = f.tabs.iter().map(|t| t.0.as_str()).collect();
         // AthenaTabsScreen::HandleTabCreated: ButtonText = TextToUpper(ButtonText)
-        assert_eq!(labels, ["LOBBY", "LOCKER", "ITEM SHOP", "SEASON SHOP", "STATS", "LEADERBOARDS", "STORE"]);
+        assert_eq!(labels, ["LOBBY", "LOCKER", "ITEM SHOP", "SEASON SHOP", "STATS", "LEADERBOARDS"]);
         assert!(f.missing.is_empty(), "unresolved assets: {:?}", f.missing);
     }) else { return };
 }
@@ -225,7 +225,7 @@ fn bottom_bar_news_button_and_pad_widgets() {
 fn rotator_right_buttons_are_mirrored() {
     let Some(()) = with_lobby(|l, _| {
         let n = l.ui.w.iter().filter(|w| w.name == "ButtonRight" && w.transform.scale == [-1.0, 1.0]).count();
-        assert_eq!(n, 2, "both rotators' ButtonRight must carry the mirror transform");
+        assert_eq!(n, 2 + l.option_rows().len(), "every rotator's ButtonRight must carry the mirror transform");
         assert!(l.ui.w.iter().filter(|w| w.name == "ButtonLeft").all(|w| w.transform.scale == [1.0, 1.0]));
     }) else { return };
 }
@@ -266,5 +266,51 @@ fn v_bucks_box_keeps_the_right_shade_style_and_shows_the_balance() {
         let f = l.draw(uic, 1920.0, 1080.0, &LobbyState { mtx_balance: 1234567, ..LobbyState::default() });
         assert_eq!(l.ui.w[a].text.as_deref(), Some("1,234,567"));
         assert!(f.rect("Amount").is_some());
+    }) else { return };
+}
+
+#[test]
+fn join_code_box_sits_left_of_news_on_the_bottom_bar() {
+    let Some(()) = with_lobby(|l, uic| {
+        for (w, h) in [(1920.0, 1080.0), (2544.0, 1353.0), (1280.0, 720.0)] {
+            let st = LobbyState { join_code_input: Some("AB".into()), ..LobbyState::default() };
+            let f = l.draw(uic, w, h, &st);
+            let join = l.join_code_widget().expect("join code box");
+            let jt = l.ui.var(join, "CenterButtonTextWidget").unwrap();
+            assert_eq!(l.ui.w[jt].text.as_deref(), Some("AB_"));
+            let news = l.ui.w.iter().find(|x| x.text.as_deref() == Some("News")).map(|x| x.id).expect("news text");
+            let (j, n) = (f.id_rects[join], f.id_rects[news]);
+            assert!(j.w > 0.0 && j.x + j.w <= n.x && j.x > w * 0.5, "{j:?} {n:?}");
+            assert!(j.y < n.y + n.h * 0.5 && n.y + n.h * 0.5 < j.y + j.h && j.y > h * 0.8, "{j:?} {n:?}");
+            let f = l.draw(uic, w, h, &LobbyState::default());
+            assert_eq!(l.ui.w[jt].text.as_deref(), Some(JOIN_CODE_LABEL));
+            assert!(f.id_rects[join].w > 0.0);
+        }
+    }) else { return };
+}
+
+#[test]
+fn enhanced_mode_row_is_a_team_fill_row_copy_under_it() {
+    let Some(()) = with_lobby(|l, uic| {
+        let mut st = LobbyState::default();
+        let f = l.draw(uic, 1920.0, 1080.0, &st);
+        let &(row, rot) = l.option_rows().first().expect("option row");
+        let fill = l.ui.find_by_name("TeamFillRow").unwrap();
+        assert_eq!(l.ui.w[row].parent, l.ui.w[fill].parent);
+        assert_eq!(l.ui.w[rot].class, "AthenaRotator_C");
+        let (r, fr) = (f.id_rects[row], f.id_rects[fill]);
+        assert!(r.y >= fr.y + fr.h - 0.5 && (r.x - fr.x).abs() < 0.5 && (r.w - fr.w).abs() < 0.5 && (r.h - fr.h).abs() < 0.5, "{r:?} {fr:?}");
+        let play = f.rect("PlayButton").unwrap();
+        let launch = f.rect("Launch").unwrap();
+        eprintln!("row {r:?} play {play:?} launch {launch:?}");
+        assert!(play.y >= r.y + r.h - 0.5, "{play:?} {r:?}");
+        let text = l.ui.var(rot, "MyText").unwrap();
+        assert_eq!(l.ui.w[text].text.as_deref(), Some("Off"));
+        assert!(l.ui.w[row].kids.iter().any(|&k| l.ui.w[k].text.as_deref() == Some("Enhanced Mode")));
+        st.option_mut(ENHANCED_MODE).unwrap().step(1);
+        let _ = l.draw(uic, 1920.0, 1080.0, &st);
+        assert_eq!(l.ui.w[text].text.as_deref(), Some("On"));
+        let right = l.ui.find_in(rot, "ButtonRight").unwrap();
+        assert_eq!(crate::screens::athena_locker::controller::Controller::role(l, right), crate::screens::athena_locker::controller::Role::OptionArrow(0, 1));
     }) else { return };
 }

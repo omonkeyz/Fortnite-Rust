@@ -207,7 +207,7 @@ impl Resources {
     /// An empty resource set (a worker's scratch space): only the player's hand socket is carried.
     pub(crate) fn scratch(player_hand_socket: fn_mesh::Socket) -> Resources {
         Resources { player_hand_socket, items: vec![], bindings: vec![], montages: HashMap::new(), composites: HashMap::new(), sequences: HashMap::new(), blendspaces: HashMap::new(), core_anims: HashMap::new(), core_asset_paths: HashMap::new(),
-            materials: HashMap::new(), material_textures: HashMap::new(), definitions: vec![], stat_extras: vec![], healables: vec![], ui_images: vec![], ammo: Default::default(), ads: vec![], inventory: vec![], extra_guns: vec![] }
+            materials: HashMap::new(), material_textures: HashMap::new(), definitions: vec![], stat_extras: vec![], healables: vec![], ui_images: vec![], ammo: Default::default(), ads: vec![], inventory: vec![], extra_guns: vec![], montage_curves: HashMap::new() }
     }
     /// What is loaded already (see [`Known`]).
     pub fn known(&self) -> Known {

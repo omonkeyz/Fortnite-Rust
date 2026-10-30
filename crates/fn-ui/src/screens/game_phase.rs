@@ -18,6 +18,7 @@ pub const BANNER_TIME_COLOR_LINEAR: [f32; 3] = [1.696782, 0., 1.];
 pub const BANNER_TIME_SHADOW: ([f32; 2], [f32; 4]) = ([1., 3.], [0., 0., 0., 0.34]);
 pub const MODE_CHANGED_LENGTH: f32 = 6.;
 pub const ICON_PULSE_LENGTH: f32 = 0.65;
+pub const ICON_PIVOT: [f32; 2] = [0., 1.];
 pub const ICON_SLIDE_LENGTH: f32 = 1.5;
 
 pub fn message(step: u8) -> &'static str {
@@ -35,13 +36,55 @@ pub fn message(step: u8) -> &'static str {
     }
 }
 
+pub const LOC_NAMESPACE: &str = "GamePhaseChanging";
+pub const LOCRES_NAME: &str = "Game.locres";
+pub const LOCRES_DIR: &str = "Localization/Game/en/";
+
+pub fn message_key(step: u8) -> Option<&'static str> {
+    match step {
+        1 => Some("WaitingForContendersWarmup"),
+        2 => Some("WaitingForPlayers"),
+        3 => Some("AircraftStartingIn"),
+        4 => Some("AircraftUnlockingIn"),
+        5 => Some("AircraftEndingTime"),
+        6 => Some("StormFormingIn"),
+        7 => Some("StormShrinkingIn"),
+        8 => Some("StormEyeShrinking"),
+        9 => Some("GameOverReturning"),
+        _ => None,
+    }
+}
+
+pub const SECONDS_FORMAT: (&str, &str) = ("SecondsRemainingFormat", "{0} Seconds");
+pub const MINUTES_SECONDS_FORMAT: (&str, &str) = ("MinutesSecondsRemainingFormat", "{0} Minutes {1} Seconds");
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhaseTexts { pub messages: [String; 10], pub seconds: String, pub minutes_seconds: String }
+
+impl Default for PhaseTexts {
+    fn default() -> Self { PhaseTexts { messages: std::array::from_fn(|i| message(i as u8).to_owned()), seconds: SECONDS_FORMAT.1.to_owned(), minutes_seconds: MINUTES_SECONDS_FORMAT.1.to_owned() } }
+}
+
+impl PhaseTexts {
+    pub fn from_locres(get: impl Fn(&str, &str) -> Option<String>) -> PhaseTexts {
+        let d = PhaseTexts::default();
+        PhaseTexts {
+            messages: std::array::from_fn(|i| message_key(i as u8).and_then(|k| get(LOC_NAMESPACE, k)).unwrap_or_else(|| d.messages[i].clone())),
+            seconds: get(LOC_NAMESPACE, SECONDS_FORMAT.0).unwrap_or(d.seconds),
+            minutes_seconds: get(LOC_NAMESPACE, MINUTES_SECONDS_FORMAT.0).unwrap_or(d.minutes_seconds),
+        }
+    }
+    pub fn message(&self, step: u8) -> &str { self.messages.get(step as usize).map_or("", |s| s.as_str()) }
+    pub fn banner_time(&self, step: u8, t: f32) -> String {
+        if step == 1 { return String::new(); }
+        let secs = floor_to_int(t);
+        if secs < 60 { self.seconds.replace("{0}", &(secs % 60).to_string()) } else { self.minutes_seconds.replace("{0}", &(secs / 60).to_string()).replace("{1}", &(secs % 60).to_string()) }
+    }
+}
+
 pub fn floor_to_int(t: f32) -> i32 { ((t + t - 0.5).round() as i32) >> 1 }
 
-pub fn banner_time(step: u8, t: f32) -> String {
-    if step == 1 { return String::new(); }
-    let secs = floor_to_int(t);
-    if secs < 60 { format!("{} Seconds", secs % 60) } else { format!("{} Minutes {} Seconds", secs / 60, secs % 60) }
-}
+pub fn banner_time(step: u8, t: f32) -> String { PhaseTexts::default().banner_time(step, t) }
 
 pub fn small_time(t: f32) -> String {
     let s = t.trunc() as i32;
@@ -52,7 +95,7 @@ pub fn alert_sound(step: u8) -> bool { (1..=8).contains(&step) }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Key { pub t: f32, pub v: f32, pub interp: u8, pub arrive: f32, pub leave: f32 }
-const fn k(t: f32, v: f32, interp: u8, arrive: f32) -> Key { Key { t, v, interp, arrive, leave: 0. } }
+const fn k(t: f32, v: f32, interp: u8, arrive: f32) -> Key { Key { t, v, interp, arrive, leave: arrive } }
 
 pub fn eval_curve(keys: &[Key], t: f32) -> f32 {
     let (Some(first), Some(last)) = (keys.first(), keys.last()) else { return 0. };
@@ -82,16 +125,25 @@ pub fn eval_curve(keys: &[Key], t: f32) -> f32 {
 pub const MODE_ALPHA: [Key; 4] = [k(0., 0., 2, 0.), k(0.3, 1., 0, 0.333333), k(5.7, 1., 2, -0.175439), k(6., 0., 2, 0.)];
 pub const MODE_TX: [Key; 4] = [k(0., 700., 2, 0.), k(0.3, 0., 0, -233.333328), k(5.7, 0., 2, 122.807022), k(6., 700., 2, 0.)];
 pub const MODE_TY: [Key; 4] = [k(0., 130., 2, 0.), k(0.3, 0., 0, -33.333332), k(5.7, 0., 2, 17.543859), k(6., 130., 2, 0.)];
-pub const MODE_SCALE: [Key; 4] = [k(0., 0., 2, 0.), k(0.3, 1., 1, 0.3), k(5.7, 1., 2, -0.175439), k(6., 0., 2, 0.)];
+pub const MODE_SCALE: [Key; 4] = [k(0., 0., 2, 0.), Key { t: 0.3, v: 1., interp: 1, arrive: 0.3, leave: 0. }, k(5.7, 1., 2, -0.175439), k(6., 0., 2, 0.)];
 pub const PULSE_TY: [Key; 4] = [k(0., 0., 1, 0.), k(0.4, 0., 2, 11.111112), k(0.45, 5., 2, 0.), k(0.55, 0., 2, 0.)];
 pub const PULSE_SCALE: [Key; 5] = [k(0., 1., 1, 0.), k(0.4, 1., 2, -0.222222), k(0.45, 0.9, 2, 3.333333), k(0.55, 1.5, 2, 0.5), k(0.65, 1., 2, 0.)];
 pub const SLIDE_TX: [Key; 3] = [k(0., -150., 0, 0.), k(0.45, -150., 2, 100.), k(1.5, 0., 2, 0.)];
 pub const SLIDE_SCALE_X: [Key; 3] = [k(0.36, 1., 2, 0.), k(0.39, 0.5, 2, 0.), k(0.5, 1., 2, 0.)];
 
 #[derive(Clone, Debug, Default)]
-pub struct GamePhaseHud { last_step: Option<u8>, mode_t: Option<f32>, icon_t: f32, slide: bool }
+pub struct GamePhaseHud { last_step: Option<u8>, mode_t: Option<f32>, icon_t: f32, slide: bool, texts: Option<PhaseTexts>, fallback: PhaseTexts, missed: bool }
 
 impl GamePhaseHud {
+    pub fn texts(&mut self, ctx: &UiContext) -> &PhaseTexts {
+        if self.texts.is_none() {
+            match ctx.assets.source.read_in(LOCRES_NAME, LOCRES_DIR).and_then(|b| crate::screens::athena_lobby::store::Locres::parse(&b)) {
+                Some(l) => self.texts = Some(PhaseTexts::from_locres(|ns, k| l.get(ns, k).map(str::to_owned))),
+                None => if !self.missed { self.missed = true; eprintln!("[game phase] no {LOCRES_DIR}{LOCRES_NAME} yet: the banner uses the source texts"); },
+            }
+        }
+        self.texts.as_ref().unwrap_or(&self.fallback)
+    }
     pub fn tick(&mut self, phase: Option<(u8, f32)>, dt: f32) -> bool {
         let mut changed = false;
         if let Some((step, _)) = phase {
@@ -123,12 +175,14 @@ impl GamePhaseHud {
         width
     }
 
-    pub fn build_banner(&self, ctx: &mut UiContext, w: f32, h: f32, phase: (u8, f32), icon: Option<MaterialKind>, out: &mut RenderList) {
+    pub fn build_banner(&mut self, ctx: &mut UiContext, w: f32, h: f32, phase: (u8, f32), icon: Option<MaterialKind>, out: &mut RenderList) {
         let Some(t) = self.mode_t else { return };
         let s = dpi_scale(w, h);
         let (mpx, tpx) = (atlas_px(BANNER_MESSAGE_FONT, s), atlas_px(BANNER_TIME_FONT, s));
-        let msg = message(phase.0);
-        let time = banner_time(phase.0, phase.1);
+        let texts = self.texts(ctx);
+        let msg = texts.message(phase.0).to_owned();
+        let time = texts.banner_time(phase.0, phase.1);
+        let msg = msg.as_str();
         let mw = text_width(ctx, FontId::Bold, msg, mpx);
         let tw = text_width(ctx, FontId::Title, &time, tpx);
         let mlh = crate::screens::line_height(ctx, FontId::Bold, mpx).max(1.);
@@ -146,7 +200,7 @@ impl GamePhaseHud {
             let (tx, ty, sx, sy) = if self.slide { (eval_curve(&SLIDE_TX, it), 0., eval_curve(&SLIDE_SCALE_X, it), 1.) } else { let sc = eval_curve(&PULSE_SCALE, it); (0., eval_curve(&PULSE_TY, it), sc, sc) };
             let (cw, ch) = (icon_rect.w * sx, icon_rect.h * sy);
             let r = Rect::new(icon_rect.x + tx * s, icon_rect.y + icon_rect.h - ch + ty * s, cw, ch);
-            out.material(m, Rect::new(r.x + (icon_rect.w - cw) * 0.5, r.y, r.w, r.h), WHITE, false);
+            out.material(m, Rect::new(r.x + (icon_rect.w - cw) * ICON_PIVOT[0], r.y, r.w, r.h), WHITE, false);
         }
         let ry = y0 + icon_sz;
         let rx = x0 + (total_w - row_w) * 0.5;
@@ -165,6 +219,7 @@ impl GamePhaseHud {
 
 pub fn icon_parts(step: u8) -> Option<(u8, &'static str)> {
     match step {
+        1 | 9 => Some((4, "T-Icon-Check-52.png")),
         2 => Some((0, "T_Clock.png")),
         3 | 4 => Some((0, "T_Bus.png")),
         5 => Some((1, "T_Jump.png")),
@@ -173,6 +228,8 @@ pub fn icon_parts(step: u8) -> Option<(u8, &'static str)> {
         _ => None,
     }
 }
+
+pub fn prewarm(ctx: &mut UiContext) { for s in 1..=9 { let _ = icon(ctx, s); } }
 
 pub fn icon(ctx: &mut UiContext, step: u8) -> Option<MaterialKind> {
     let (shader, name) = icon_parts(step)?;
@@ -211,6 +268,18 @@ mod tests {
         assert_eq!(message(6), "STORM FORMING IN");
         assert_eq!(message(8), "STORM EYE SHRINKING");
         assert!(alert_sound(8) && !alert_sound(9) && !alert_sound(0));
+    }
+    #[test] fn banner_texts_come_from_the_cooked_locres() {
+        let p = crate::pak_assets::default_install();
+        if !p.exists() { return; }
+        use crate::assets::AssetSource;
+        let src = crate::pak_assets::PakAssets::open(&p).unwrap();
+        let l = crate::screens::athena_lobby::store::Locres::parse(&src.read_in(LOCRES_NAME, LOCRES_DIR).unwrap()).unwrap();
+        for step in 1..=9u8 { assert!(l.get(LOC_NAMESPACE, message_key(step).unwrap()).is_some(), "step {step}"); }
+        let t = PhaseTexts::from_locres(|ns, k| l.get(ns, k).map(str::to_owned));
+        assert_eq!(t, PhaseTexts::default());
+        assert_eq!(t.message(6), "STORM FORMING IN");
+        assert_eq!(t.banner_time(7, 200.4), "3 Minutes 20 Seconds");
     }
     #[test] fn floor_to_int_matches_the_exe_rounding() {
         assert_eq!(floor_to_int(3.99), 3);

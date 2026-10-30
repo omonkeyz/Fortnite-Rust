@@ -74,6 +74,7 @@ pub struct Cosmetic {
     /// texture object paths; the item's own previews, else the hero's / weapon definition's
     pub small_icon: Option<String>,
     pub large_icon: Option<String>,
+    pub animation: Option<String>,
 }
 
 /// `EFortRarity` enumerators in the order compiled into the 1.8 exe (strings at 0x42e93a0..0x42ea1d0). `RarityData.RarityCollection[n]` is indexed by the value
@@ -162,15 +163,18 @@ fn read_item(set: &PakSet, long: &str, locres: Option<&Locres>) -> Result<Option
         name: text_of(p.get("DisplayName"), locres),
         description: text_of(p.get("Description"), locres),
         short_description: text_of(p.get("ShortDescription"), locres),
-        rarity: p.get("Rarity").and_then(tail).unwrap_or_else(|| "Handmade".to_owned()),
+        rarity: p.get("Rarity").and_then(tail).unwrap_or_else(|| "Ordinary".to_owned()),
         test_asset: long.to_ascii_lowercase().contains("/00_testassets/"),
         hero, hero_package,
         weapon: path_of(p.get("WeaponDefinition")),
         skeletal_mesh: path_of(p.get("SkeletalMesh")),
         small_icon: path_of(p.get("SmallPreviewImage")),
         large_icon: path_of(p.get("LargePreviewImage")),
+        animation: path_of(p.get("Animation")),
     }))
 }
+
+pub fn read_definition(set: &PakSet, long: &str) -> Result<Option<Cosmetic>, String> { let locres = Locres::open(set); read_item(set, long, locres.as_ref()) }
 
 fn preview_images(set: &PakSet, long: &str) -> (Option<String>, Option<String>) {
     match main_export(set, long) {

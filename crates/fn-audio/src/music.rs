@@ -59,6 +59,7 @@ pub const LOBBY_ATHENA: &str = "/Game/Sounds/Fort_Music/Menu/fortnite_lobby_musi
 /// `DefaultGameData.LoadingScreenSoundMix`.
 pub const LOADING_MIX: &str = "/Game/Sounds/FortSoundClassesAndModes/Fort_Loading_Mix";
 /// `Fort_Music_Menu_PSM.PassiveSoundMixModifiers[0]` (min volume 0, max volume 10).
+pub const PLAYER_KILLED_MIX: &str = "/Game/Sounds/FortSoundClassesAndModes/Fort_PlayerKilled_Athena_MixMod";
 pub const MENU_SUPPRESS_MIX: &str = "/Game/Sounds/FortSoundClassesAndModes/Fort_Suppress_NormalMusic_MixMod";
 /// The SoundClass of every front-end music cue.
 pub const MENU_MUSIC_CLASS: &str = "Fort_Music_Menu_PSM";

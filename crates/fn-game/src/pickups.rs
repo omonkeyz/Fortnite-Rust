@@ -22,7 +22,7 @@
 //! [`DEFAULT_TOSS_DISTANCE`] (512 cm, the exe's constant `DAT_143ff904c` used when final == initial) ahead.
 //!
 //! Simplifications (reported): the world is the flat baseplate (y = 0) plus nothing else (the original sweeps the capsule against the level; props are not blocking here); the flight to the
-//! pawn is a straight line scaled by the curve instead of the native spline.
+//! pawn is the native 5-point Catmull-Rom spline into the pawn's `LootEntryPosition` socket.
 use glam::Vec3;
 
 /// Touch capsule (`CollisionCylinder` of `AFortPickup`), metres.
@@ -49,6 +49,7 @@ pub const FLY_RANDOM_MAX: f32 = 1.05;
 /// Time span of `LootBackpackCurves` (first key -0.0011812488 s, last 1.4036946 s).
 pub const FLY_CURVE_SPAN: f32 = 1.4036946 + 0.0011812488;
 pub const FLY_CURVE_START: f32 = -0.0011812488;
+pub const SPLINE_OFFSET: f32 = 1.75;
 /// `AFortPlayerController::InteractDistance` / `InteractTraceExtent` (cm -> m).
 pub const INTERACT_DISTANCE: f32 = 2.56;
 pub const INTERACT_TRACE_EXTENT: f32 = 0.15;
@@ -124,6 +125,7 @@ pub struct PawnState {
     pub forward: Vec3,
     /// `CharacterMovement->Velocity` is not zero.
     pub moving: bool,
+    pub loot: Vec3,
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------
@@ -139,9 +141,17 @@ const CURVE_X: [(f32, f32, f32, f32, bool); 6] = [
     (1.403_694_6, 0.999_950_05, 0.0, 0.0, false),
 ];
 
+const CURVE_Y: [(f32, f32, f32, f32, bool); 2] = [
+    (0.999_388_8, 0.0, 0.0, 0.0, true),
+    (1.249_562_1, 1.0, 11.273_595, 0.0, true),
+];
+
 /// `FRichCurve::Eval` of those keys (linear / cubic Hermite with the tangents scaled by the key interval, constant outside).
-pub fn fly_fraction(t: f32) -> f32 {
-    let k = &CURVE_X;
+pub fn fly_fraction(t: f32) -> f32 { eval_keys(&CURVE_X, t) }
+pub fn black_hole_strength(t: f32) -> f32 { eval_keys(&CURVE_Y, t) }
+pub fn curve_time(t: f32, fly_time: f32) -> f32 { FLY_CURVE_START + (t / fly_time.max(1e-6)).clamp(0., 1.) * FLY_CURVE_SPAN }
+
+pub fn eval_keys(k: &[(f32, f32, f32, f32, bool)], t: f32) -> f32 {
     if t <= k[0].0 { return k[0].1; }
     if t >= k[k.len() - 1].0 { return k[k.len() - 1].1; }
     let i = (0..k.len() - 1).rposition(|i| k[i].0 <= t).unwrap_or(0);
@@ -157,6 +167,21 @@ pub fn fly_fraction(t: f32) -> f32 {
 // ---------------------------------------------------------------------------------------------------------------------------------------------------
 // launch solver
 // ---------------------------------------------------------------------------------------------------------------------------------------------------
+fn catmull_rom(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
+    let (t2, t3) = (t * t, t * t * t);
+    ((p2 - p0) * t + p1 * 2. + (p0 * 2. - p1 * 5. + p2 * 4. - p3) * t2 + (-p0 + p1 * 3. - p2 * 3. + p3) * t3) * 0.5
+}
+
+pub fn flight_point(start: Vec3, target: Vec3, x: f32) -> Vec3 {
+    let up = Vec3::Y * SPLINE_OFFSET;
+    let p = [start + up, start, target + up, target, target - up];
+    let segments = (p.len() - 3) as f32;
+    let u = (x.clamp(0., 1.) * segments).clamp(0., segments);
+    if (u - segments).abs() <= 1e-8 { return p[p.len() - 2]; }
+    let i = (u.floor() as usize).min(p.len() - 4);
+    catmull_rom(p[i], p[i + 1], p[i + 2], p[i + 3], u - i as f32)
+}
+
 /// `FUN_1402ad0b0`: the launch velocity (m/s) of a toss from `start` to `end` that takes `fly_time` at a fixed `arc` angle: horizontal speed = horizontal distance / fly_time,
 /// vertical = `tan(arc) * horizontal speed` (raised when the end is above the start). Degenerate cases (no horizontal distance / no time) fly straight at `speed`.
 pub fn launch_velocity(start: Vec3, end: Vec3, fly_time: f32, arc_deg: f32) -> Vec3 {
@@ -302,10 +327,7 @@ impl PickupWorld {
                 }
                 Phase::Flying { ref mut t, fly_time, start } => {
                     *t += dt; p.picked_for += dt;
-                    if *t >= 0. {
-                        let a = fly_fraction(FLY_CURVE_START + (*t / fly_time).min(1.) * FLY_CURVE_SPAN);
-                        p.pos = start + (pawn.pos - start) * a;
-                    }
+                    if *t >= 0. { p.pos = flight_point(start, pawn.loot, fly_fraction(curve_time(*t, fly_time))); }
                 }
             }
         }
@@ -385,7 +407,7 @@ fn limit(v: Vec3, max: f32) -> Vec3 { if max > 0. && v.length() > max { v.normal
 mod tests {
     use super::*;
     const G: f32 = 9.8;
-    fn pawn_at(p: Vec3, moving: bool) -> PawnState { PawnState { pos: p, eye: p + Vec3::new(0., 1.0, 0.), forward: Vec3::new(0., 0., -1.), moving } }
+    fn pawn_at(p: Vec3, moving: bool) -> PawnState { PawnState { pos: p, eye: p + Vec3::new(0., 1.0, 0.), forward: Vec3::new(0., 0., -1.), moving, loot: p + Vec3::new(0., 0.45, 0.) } }
     fn run(w: &mut PickupWorld, pawn: &PawnState, secs: f32) -> Vec<Event> { let mut all = vec![]; let n = (secs * 60.) as usize; for _ in 0..n { all.extend(w.update(1. / 60., pawn, &|_| 0., &mut |_| true)); } all }
 
     #[test] fn the_loot_curve_is_the_cooked_one() {
@@ -396,6 +418,24 @@ mod tests {
         let mut last = -1.;
         for i in 0..=140 { let v = fly_fraction(i as f32 * 0.01); assert!(v >= last - 1e-4, "monotonic at {i}: {v} < {last}"); last = v; }
         assert!((FLY_CURVE_SPAN - 1.404_875_8).abs() < 1e-5);
+    }
+    #[test] fn the_flight_is_the_catmull_rom_spline_through_start_and_loot_point() {
+        let (s, t) = (Vec3::new(2., 0.8, 0.), Vec3::new(0., 1.2, 0.));
+        assert!((flight_point(s, t, 0.) - s).length() < 1e-6);
+        assert!((flight_point(s, t, 1.) - t).length() < 1e-6);
+        assert!((flight_point(s, t, 0.5) - (t + Vec3::Y * SPLINE_OFFSET)).length() < 1e-5, "half way = the point 175 cm above the loot entry");
+        let q = flight_point(s, t, 0.25);
+        assert!(q.y > s.y + 0.5 && q.x < s.x && q.x > t.x, "the first segment rises towards the point above the pawn: {q:?}");
+        let r = flight_point(s, t, 0.9);
+        assert!(r.y > t.y && r.y < t.y + SPLINE_OFFSET && r.x.abs() < 0.2, "the second segment drops into the backpack from above: {r:?}");
+    }
+    #[test] fn the_black_hole_strength_is_the_y_curve() {
+        assert_eq!(black_hole_strength(0.5), 0.);
+        assert_eq!(black_hole_strength(0.999), 0.);
+        assert_eq!(black_hole_strength(1.3), 1.);
+        let m = black_hole_strength(1.12);
+        assert!(m > 0.1 && m < 0.9, "{m}");
+        assert!((curve_time(1.4, 1.4) - 1.4036946).abs() < 1e-5);
     }
     #[test] fn fly_time_is_the_curve_span_times_one_to_one_point_oh_five() {
         let mut w = PickupWorld::new(7);
@@ -503,7 +543,7 @@ mod tests {
         assert_eq!((p.count, p.toss, p.pos), (6, TossState::AtRest, rest));
         assert!(matches!(p.phase, Phase::World));
         assert!(w.arrived.is_empty());
-        let look = PawnState { pos: Vec3::new(0., 0.75, 1.0), eye: Vec3::new(0., 1.6, 1.0), forward: Vec3::new(0., -0.6, -1.).normalize(), moving: false };
+        let look = PawnState { pos: Vec3::new(0., 0.75, 1.0), eye: Vec3::new(0., 1.6, 1.0), forward: Vec3::new(0., -0.6, -1.).normalize(), moving: false, loot: Vec3::new(0., 1.2, 1.0) };
         assert_eq!(w.focus(&look), Some(id), "the rest can be picked up again with Use");
         assert!(!w.settle(id, 1, rest), "settled once");
     }
@@ -548,7 +588,7 @@ mod tests {
         let near = w.spawn_at_rest(0, 1, 17, 1, Vec3::new(0., TOUCH_HALF_HEIGHT, -2.0));
         let _off = w.spawn_at_rest(1, 1, 17, 1, Vec3::new(3.0, TOUCH_HALF_HEIGHT, -2.0));
         let _far = w.spawn_at_rest(2, 1, 17, 1, Vec3::new(0., TOUCH_HALF_HEIGHT, -9.0));
-        let pawn = PawnState { pos: Vec3::new(0., 0.75, 0.), eye: Vec3::new(0., 1.6, 0.), forward: Vec3::new(0., -0.1, -1.).normalize(), moving: false };
+        let pawn = PawnState { pos: Vec3::new(0., 0.75, 0.), eye: Vec3::new(0., 1.6, 0.), forward: Vec3::new(0., -0.1, -1.).normalize(), moving: false, loot: Vec3::new(0., 1.2, 0.) };
         assert_eq!(w.focus(&pawn), Some(near));
         let away = PawnState { forward: Vec3::new(0., 0., 1.), ..pawn };
         assert_eq!(w.focus(&away), None);

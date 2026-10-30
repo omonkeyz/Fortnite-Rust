@@ -153,6 +153,7 @@ fn tint(c: [f32; 3], a: f32) -> [f32; 4] { let t = srgb3(c); [t[0], t[1], t[2], 
 impl TeamInfo {
     pub fn new() -> Self { Self::default() }
 
+    pub fn prewarm(&mut self, ctx: &mut UiContext) { let _ = self.ensure_tex(ctx); }
     fn ensure_tex(&mut self, ctx: &mut UiContext) -> Tex {
         if let Some(t) = self.tex { return t; }
         let t = Tex {

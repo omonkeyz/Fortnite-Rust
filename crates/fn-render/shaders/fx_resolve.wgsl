@@ -52,6 +52,7 @@ fn fx_scene_lit(frag: vec4<f32>, n_in: vec3<f32>, emissive: vec3<f32>, base: vec
     }
     // SKY REFLECTION HOOK: the sky light's specular + SSR, applied by the deferred reflection pass (lit_common.wgsl reflection_inputs; ReflectionApplyPS reads the
     // GBuffer roughness unclamped and GBufferAO)
+    lit = lit + local_lighting(world, n, v, diffuse_color, spec_color, roughness, SM_DEFAULT_LIT, vec4<f32>(0.0), gbuffer_ao);
     reflection_inputs(n, v, world, spec_color, roughness, gbuffer_ao);
     if (dbg_part_any()) { dbg_terms(diffuse_color, n, ndl, vis, select(vec3<f32>(0.0), light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, l, max(roughness, FX_SUN_MIN_ROUGHNESS), spec_color) * vis, ndl > 0.0)); }
     return lit_out(output_hdr(lit, amb, world, cam));

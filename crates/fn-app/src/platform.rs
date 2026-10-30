@@ -298,8 +298,12 @@ pub fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
     let t = Instant::now(); let r = f();
     let ms = t.elapsed().as_secs_f32() * 1000.;
     if ms > crate::gfx::SLOW_MS { eprintln!("[slow] {what} took {ms:.1} ms"); }
+    section(what, ms);
     r
 }
+thread_local! { static SECTIONS: std::cell::RefCell<Vec<(String, f32)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+pub fn section(what: &str, ms: f32) { if ms < 1. { return; } SECTIONS.with(|v| { let mut v = v.borrow_mut(); match v.iter_mut().find(|e| e.0 == what) { Some(e) => e.1 += ms, None => v.push((what.to_owned(), ms)) } }); }
+pub fn take_sections() -> Vec<(String, f32)> { SECTIONS.with(|v| std::mem::take(&mut *v.borrow_mut())) }
 
 impl PlatformHost for WinitPlatform {
     fn display_modes(&mut self) -> Vec<DisplayMode> { match monitor_of(&self.window) { Some(m) => modes_from(self.modes.get(&m, Instant::now())), None => vec![] } }

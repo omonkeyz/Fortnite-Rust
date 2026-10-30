@@ -109,6 +109,28 @@ fn preview_from_the_camera() {
     assert!((grid::centroid(PieceKind::Floor, p.loc, p.rot.yaw) - Vec3::new(0., 0., 0.)).abs().max_element() < 1e-3, "{:?}", p.loc);
 }
 
+#[test]
+fn preview_grid_snap_flag_and_existing_actor_after_placing() {
+    let Some(cat) = catalog() else { eprintln!("FN_TEST_ROOT not set: skipped"); return };
+    let mut world = BuildingWorld::new();
+    let env = PlacementEnv { ground_z: Some(0.), grid_origin: Vec3::ZERO, ..Default::default() };
+    let pawn = Vec3::new(100., 100., 90.);
+    let view = ViewInput { camera: pawn + Vec3::new(-250., 60., 60.), view: Rot { pitch: -10., yaw: 0., roll: 0. }, pawn };
+    let mut p = BuildPreview::default();
+    p.set_piece(PieceKind::Wall);
+    assert_eq!(p.update(&world, &cat, &env, &view), QueryResult::CanAdd);
+    assert!(p.snapped);
+    p.update(&world, &cat, &env, &view);
+    assert!(!p.snapped);
+    let (id, cost) = placement::place(&mut world, &cat, &env, &p, 999).unwrap();
+    assert_eq!(cost, 10);
+    assert_eq!(p.update(&world, &cat, &env, &view), QueryResult::ExistingActor(id));
+    assert!(!p.snapped);
+    assert_eq!(placement::place(&mut world, &cat, &env, &p, 999), Err(QueryResult::ExistingActor(id)));
+    p.update(&world, &cat, &env, &ViewInput { view: Rot { pitch: -10., yaw: 90., roll: 0. }, ..view });
+    assert!(p.snapped);
+}
+
 /// The lattice is the level's: with the level origin at `o` in the world space, every snapped transform moves by exactly `o`
 /// (no player-relative term), and the preview of a camera moved by `o` lands on the moved lattice.
 #[test]

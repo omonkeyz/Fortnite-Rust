@@ -20,6 +20,7 @@ impl Vis {
     pub fn draws(self) -> bool { !matches!(self, Vis::Collapsed | Vis::Hidden) }
 }
 
+#[derive(Clone)]
 pub struct Widget {
     pub id: usize,
     pub parent: Option<usize>,
@@ -51,6 +52,7 @@ pub struct Widget {
     /// INVENTORY FIX2: vector parameters the Blueprint set on this border's / image's dynamic material (`GetDynamicMaterial` + `SetVectorParameterValue`, e.g.
     /// `ItemDetailsHeader.UpdateItemsForWidgets`: `RarityBorderMID` "Rarity 2..4", `Level Bar MID` RGBA0 / RGBA1)
     pub mat_vectors: Vec<(String, [f32; 4])>,
+    pub mat_textures: Vec<(String, String)>,
     pub slot_halign: Option<String>,
     pub slot_valign: Option<String>,
     pub note: String,
@@ -94,6 +96,7 @@ pub struct Ui {
     pub cur_scalars: Vec<(String, f32)>,
     /// INVENTORY FIX2: vector parameters of the border / image being painted (`Widget::mat_vectors`)
     pub cur_vectors: Vec<(String, [f32; 4])>,
+    pub cur_textures: Vec<(String, String)>,
     /// FRONT END: material time (seconds) for the animated material brushes in `timed_mats` (re-rastered every paint, e.g. the login throbber)
     pub mat_time: f32,
     pub timed_mats: Vec<String>,
@@ -109,20 +112,22 @@ pub struct Settled {
     pub selected_tab: usize,
 }
 
+pub fn is_styled_common_text(class: &str, props: &Value) -> bool {
+    matches!(class, "CommonTextBlock" | "CommonNumericTextBlock") && props.get("Style").and_then(|s| s.as_str()).map_or(false, |s| !s.is_empty())
+}
 fn exp_vis(props: &Value) -> Vis { props.get("Visibility").and_then(|v| v.as_str()).map(Vis::parse).unwrap_or(Vis::Visible) }
 
 impl Ui {
     pub fn new(store: Rc<Store>) -> Ui {
-        Ui { store, w: vec![], by_path: HashMap::new(), styles: StyleCache::default(), class_paths: HashMap::new(), log: vec![], unresolved: Default::default(), cur_scalars: vec![], cur_vectors: vec![], mat_time: 0.0, timed_mats: vec![], tex_subst: HashMap::new(), mat_res: vec![] }
+        Ui { store, w: vec![], by_path: HashMap::new(), styles: StyleCache::default(), class_paths: HashMap::new(), log: vec![], unresolved: Default::default(), cur_scalars: vec![], cur_vectors: vec![], cur_textures: vec![], mat_time: 0.0, timed_mats: vec![], tex_subst: HashMap::new(), mat_res: vec![] }
     }
 
     /// `/Game/..` class path of a Blueprint class name (`IconTabButton_C`): the first package of that stem under /Game.
     pub fn find_class_path(&mut self, class: &str) -> Option<String> {
         if let Some(c) = self.class_paths.get(class) { return c.clone(); }
         let base = class.strip_suffix("_C").unwrap_or(class);
-        let pat = format!("**/{base}.uasset");
         let mut found: Option<String> = None;
-        for (_, e) in self.store.pak_set().glob(&pat) {
+        for (_, e) in self.store.pak_set().by_file_name(&format!("{base}.uasset")) {
             if let Some(g) = fn_pak::pak_path_to_game(e.rel_path()).or_else(|| fn_pak::pak_path_to_game(&e.path)) {
                 let long = g.trim_end_matches(".uasset").to_owned();
                 if long.starts_with("/Game/") && long.rsplit('/').next() == Some(base) { found = Some(format!("{long}.{class}")); break; }
@@ -156,12 +161,13 @@ impl Ui {
         // FRONT END: UCommonVisibilityWidget (ctor exe 0x143929cb0: VisibleType SelfHitTestInvisible, HiddenType Collapsed; update 0x14395ae10) on PC:
         // hidden when its serialized bShowForPC is false (the 1.8 picker's QUIT button, absent in the live PC client)
         if e.class == "CommonVisibilityWidget" && props.get("bShowForPC").and_then(|b| b.as_bool()) == Some(false) { vis = Vis::Collapsed; }
+        if is_styled_common_text(&e.class, &props) { if let Some(m) = props.as_object_mut() { m.remove("ColorAndOpacity"); } }
         let transform = Transform::from_json(props.get("RenderTransform"));
         let ds = jvec::<2>(props.get("DesiredSizeScale")).unwrap_or([1.0, 1.0]);
         let enabled = props.get("bIsEnabled").and_then(|b| b.as_bool()).unwrap_or(true);
         self.w.push(Widget {
             id, parent, class: e.class.clone(), name: e.name.clone(), path: e.path.clone(), props, slot_class, slot, kids: vec![], pkg: pkg.clone(),
-            user: None, owner, vis, text: None, text_style: None, brush: None, btn_state: BtnState::Normal, enabled, transform, desired_scale: ds, mat_scalars: vec![], mat_vectors: vec![],
+            user: None, owner, vis, text: None, text_style: None, brush: None, btn_state: BtnState::Normal, enabled, transform, desired_scale: ds, mat_scalars: vec![], mat_vectors: vec![], mat_textures: vec![],
             slot_halign: None, slot_valign: None, note: String::new(),
         });
         self.by_path.entry(e.path.clone()).or_default().push(id);
@@ -206,6 +212,26 @@ impl Ui {
         self.build(&pkg, &root_path, Some(id), String::new(), json!({}));
         self.hooks(id);
         Some(id)
+    }
+
+    pub fn clone_subtree(&mut self, src: usize, parent: usize, name: &str) -> usize {
+        let mut order = vec![src];
+        let mut i = 0;
+        while i < order.len() { let k = self.w[order[i]].kids.clone(); order.extend(k); i += 1; }
+        let base = self.w.len();
+        let map: HashMap<usize, usize> = order.iter().enumerate().map(|(k, &o)| (o, base + k)).collect();
+        for &o in &order {
+            let mut c = self.w[o].clone();
+            c.id = map[&o];
+            c.parent = if o == src { Some(parent) } else { c.parent.map(|p| map.get(&p).copied().unwrap_or(p)) };
+            c.owner = c.owner.map(|p| map.get(&p).copied().unwrap_or(p));
+            c.kids = c.kids.iter().map(|k| map[k]).collect();
+            if o == src { c.name = name.to_owned(); }
+            self.by_path.entry(c.path.clone()).or_default().push(c.id);
+            self.w.push(c);
+        }
+        self.w[parent].kids.push(base);
+        base
     }
 
     /// Compose the widget at `path` (and its subtree) under `parent`.
@@ -298,7 +324,7 @@ impl Ui {
         Some(self.styles.button(&store, &cls))
     }
     pub fn is_common_button(&self, id: usize) -> bool {
-        self.chain_has(id, "/Script/CommonUI.CommonButton") || self.chain_has(id, "/Script/CommonUI.CommonRotator")
+        self.chain_has(id, "/Script/CommonUI.CommonButton") || self.chain_has(id, "/Script/CommonUI.CommonRotator") || self.chain_has(id, "/Script/FortniteUI.FortPartyTreeItemBase")
     }
 
     // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -364,7 +390,9 @@ impl Ui {
     /// `IconTextButton` (Kismet: `Set Text`, `UpdateTextStyle`, `InitializeButton`, `UpdateContentAlignment`, `Construct`).
     fn hook_icon_text_button(&mut self, id: usize) {
         let text_w = self.var(id, "CenterButtonTextWidget");
-        let btn_text = self.w[id].props.get("ButtonText").and_then(|t| self.text_of(t)).unwrap_or_default();
+        let action = self.w[id].props.get("TriggeringInputAction").and_then(|t| t.get("RowName")).and_then(|r| r.as_str()).map(|r| r.to_owned());
+        let action_text = action.and_then(|row| self.store.pkg("/Game/UI/Foundation/Input/InputActionDataTable").and_then(|p| p.named("InputActionDataTable").and_then(|e| e.props.get("Rows").and_then(|r| r.get(&row)).and_then(|r| r.get("DisplayName")).cloned()))).and_then(|t| self.text_of(&t)).filter(|t| !t.is_empty());
+        let btn_text = action_text.unwrap_or_else(|| self.w[id].props.get("ButtonText").and_then(|t| self.text_of(t)).unwrap_or_default());
         if let Some(t) = text_w {
             self.w[t].text = Some(btn_text.clone());
             self.w[t].vis = if btn_text.is_empty() { Vis::Collapsed } else { Vis::SelfHitTestInvisible };

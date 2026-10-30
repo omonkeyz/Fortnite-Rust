@@ -27,6 +27,8 @@ pub mod graph;
 pub mod gun_material; // GUN MATERIAL HOOK
 pub mod lighting;
 pub mod light_function; // LIGHT FUNCTION (2026-10-07): the sun light function, High material quality program (light_function.rs)
+pub mod local_lights;
+pub mod subsurface;
 pub mod light_shafts; // LIGHT SHAFT HOOK: light-shaft bloom of the sun (UE 4.16 LightShaftRendering.cpp)
 pub mod ssao_pass; // AO ORDER: screen-space AO applied to the HDR scene before fog / translucency / bloom
 pub mod ssao_ue; // UE SSAO: the UE 4.16 screen-space ambient occlusion passes (PostProcessAmbientOcclusion.usf)
@@ -40,12 +42,14 @@ pub mod occlusion; // OCCLUSION (2026-10-07): HZB readback occlusion culling of 
 pub mod reflection; // REFLECTION APPLY: deferred sky specular + screen space reflections (reflection.rs, docs/spec/reflection_gaps.md)
 pub mod renderer;
 pub mod scope_pass; // SCOPE HOOK: the post-process material pass of a scoped weapon (scope_pass.rs)
+pub mod decal_pass;
 pub mod outline_pass; // OUTLINE: the build preview highlight (custom depth + the outline post-process material), outline_pass.rs
 pub mod sky;
 pub mod sky_light; // SKY LIGHT: SLS_SpecifiedCubemap SH diffuse of the Athena sky light (sky_light.rs)
 pub mod sky_reflection; // SKY REFLECTION HOOK: the sky light's specular (processed cube, PreIntegratedGF, lit_common.wgsl reflection_inputs + reflection.rs)
 pub mod static_loader;
 pub mod static_mesh;
+pub mod static_gdf;
 pub mod statics;
 pub mod storm; // STORM HOOK: safe-zone wall + storm cloud constants / buffer contents (the draws go through the FX pass, see fn-matshader::storm)
 pub mod synthetic;

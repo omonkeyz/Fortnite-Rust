@@ -25,6 +25,7 @@ pub struct SkinPrim {
     pub material: String,
     /// COLOR_0 (RGBA) of the glTF primitive, empty when the mesh has no vertex colours (BR CHARACTER MATERIAL HOOK: the eyeshadow mask is painted in R).
     pub colors: Vec<[f32; 4]>,
+    pub tangents: Vec<[f32; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +64,7 @@ impl Part {
                 let r = p.reader(reader);
                 let (Some(pos), Some(nrm), Some(uv), Some(j), Some(w), Some(ix)) =
                     (r.read_positions(), r.read_normals(), r.read_tex_coords(0), r.read_joints(0), r.read_weights(0), r.read_indices()) else { return Err(bad("a mesh primitive lacks positions/normals/uvs/joints/weights/indices")) };
-                prims.push(SkinPrim { positions: pos.collect(), normals: nrm.collect(), uvs: uv.into_f32().collect(), joints: j.into_u16().collect(), weights: w.into_f32().collect(), indices: ix.into_u32().collect(), material: p.material().name().unwrap_or("").to_owned(), colors: r.read_colors(0).map(|c| c.into_rgba_f32().collect()).unwrap_or_default() });
+                prims.push(SkinPrim { positions: pos.collect(), normals: nrm.collect(), uvs: uv.into_f32().collect(), joints: j.into_u16().collect(), weights: w.into_f32().collect(), indices: ix.into_u32().collect(), material: p.material().name().unwrap_or("").to_owned(), colors: r.read_colors(0).map(|c| c.into_rgba_f32().collect()).unwrap_or_default(), tangents: r.read_tangents().map(|t| t.collect()).unwrap_or_default() });
             }
         }
         Ok(Part { name: name.to_owned(), tree: BoneTree::new(names, parents, local), joints, inverse_bind, prims })

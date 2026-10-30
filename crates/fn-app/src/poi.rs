@@ -26,7 +26,7 @@
 //!   marker, `bHiddenInGame`) is not drawn.
 //! * NOT PORTED: the structural collapse of POI buildings (pieces losing support do not fall), the per-class hit / death sounds and `DeathParticles` (the
 //!   prop-library proto tables do not know POI classes: the generic family sounds play), `bNoCameraCollision` (the camera collides with everything), the
-//!   lights / particle systems / loot the files list.
+//!   particle systems the files list (the lights are `PoiSet::lights`, lit by local_lights_hook.rs; the loot is chest_hook.rs).
 use fn_combat::{Harvestable, Kind, Resource};
 use fn_combat::{Hull, HullSet};
 use glam::{Mat3, Mat4, Quat, Vec3};
@@ -193,10 +193,46 @@ pub struct PoiContainer {
     pub searched_actor: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct PoiFloorLoot {
+    pub class: String,
+    pub tier_group: String,
+    pub t: Vec3,
+    pub q: Quat,
+    pub ue: [f32; 3],
+    pub group: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoiHidden {
+    pub actor: u32,
+    pub comp: String,
+    pub mesh: String,
+    pub overrides: Vec<Option<String>>,
+    pub l2w: Mat4,
+    pub cull_cm: f32,
+    pub cast_shadow: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoiLight {
+    pub actor: u32,
+    pub actor_class: String,
+    pub component: String,
+    pub kind: String,
+    pub hidden: bool,
+    pub t: Vec3,
+    pub q: Quat,
+    pub actor_ue: [f32; 3],
+    pub props: Value,
+}
+
 #[derive(Default)]
 pub struct PoiSet {
+    pub lights: Vec<PoiLight>,
     /// CONTAINERS (2026-10-08): every loot container of the files.
     pub containers: Vec<PoiContainer>,
+    pub floor_loot: Vec<PoiFloorLoot>,
     /// DOORS: every door wall of the files.
     pub doors: Vec<PoiDoor>,
     pub kinds: Vec<PoiKind>,
@@ -222,6 +258,8 @@ pub struct PoiSet {
     layout_rows: HashMap<(i32, i32), Vec<(Arc<str>, [f32; 2], f32, u32)>>,
     /// UE world cm -> FX space (the files' placement offset).
     pub off: Mat4,
+    pub hidden: Vec<PoiHidden>,
+    pub parents: HashMap<u32, Vec<String>>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct GroundCover { pub t: [f32; 3], pub q: [f32; 4], pub scale: f32, pub random: f32 }
@@ -248,6 +286,9 @@ fn vcol_hash(v: &[Value]) -> u64 { let mut h: u64 = 0xcbf29ce484222325; for x in
 
 fn occ_key(x: f32, y: f32) -> (i32, i32) { ((x / 10.).floor() as i32, (y / 10.).floor() as i32) }
 impl PoiSet {
+    pub fn is_a(&self, actor: u32, class: &str) -> bool {
+        self.classes.get(actor as usize).is_some_and(|c| c == class) || self.parents.get(&actor).is_some_and(|p| p.iter().any(|c| c == class))
+    }
     /// Is there an actor of `class` within [`DEDUP_CM`] (xy) of UE `abs_cm`?
     pub fn occupies(&self, class: &str, abs_cm: [f32; 3]) -> bool {
         let (kx, ky) = occ_key(abs_cm[0], abs_cm[1]);
@@ -339,6 +380,10 @@ struct FileOut {
     doors: Vec<PoiDoor>,
     /// CONTAINERS: the file's loot containers (`actor` file-local, `group` unset).
     containers: Vec<PoiContainer>,
+    floor_loot: Vec<PoiFloorLoot>,
+    lights: Vec<PoiLight>,
+    hidden: Vec<PoiHidden>,
+    parents: Vec<(u32, Vec<String>)>,
     note: String,
     hulls: usize,
     damageable: usize,
@@ -349,12 +394,13 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let doc: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     drop(bytes);
+    crate::water_hook::ingest_poi(&doc);
     let to_game = |u: Vec3| Vec3::new(u.x, u.z, u.y) * 0.01; // FX space (UE cm about the game origin) -> game metres (inverse of fn_fx::view::to_ue)
     let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("").to_owned();
     let actors = doc["actors"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     let meshes = doc["meshes"].as_object();
     let mut out = FileOut { name: name.clone(), kinds: vec![], placements: vec![], classes: actors.iter().map(|a| a["class"].as_str().unwrap_or("").to_owned()).collect(), actor_keys: { let mut lv: HashMap<String, Arc<str>> = HashMap::new(); actors.iter().map(|a| { let l = a["level"].as_str().unwrap_or(""); let l = lv.entry(l.to_owned()).or_insert_with(|| Arc::from(l)).clone(); (l, a["name"].as_str().unwrap_or("").to_owned(), a["group"].as_i64().unwrap_or(-1)) }).collect() }, harvestables: vec![], pieces: vec![],
-        actor_xy: actors.iter().map(|a| f3(&a["t"]).map_or([f32::NAN; 2], |t| [t[0], t[1]])).collect(), ground_cover: vec![], clusters: vec![], layout_rows: vec![], doors: vec![], containers: vec![], note: String::new(), hulls: 0, damageable: 0, invulnerable: 0 };
+        actor_xy: actors.iter().map(|a| f3(&a["t"]).map_or([f32::NAN; 2], |t| [t[0], t[1]])).collect(), ground_cover: vec![], clusters: vec![], layout_rows: vec![], doors: vec![], containers: vec![], floor_loot: vec![], lights: vec![], hidden: vec![], parents: actors.iter().enumerate().filter_map(|(i, a)| a["parents"].as_array().map(|p| (i as u32, p.iter().filter_map(|c| c.as_str().map(String::from)).collect()))).collect(), note: String::new(), hulls: 0, damageable: 0, invulnerable: 0 };
     let mut by_id: HashMap<String, usize> = HashMap::new();
     // WORLD (HLOD): the clusters (proxy kinds first) and which actor each one replaces
     let mut cluster_of: HashMap<usize, u32> = HashMap::new();
@@ -378,8 +424,9 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
     }
     // COLLISION: each mesh's convex pieces built ONCE in mesh-local cm, then mapped per placement (a hull of affinely mapped points = the mapped hull)
     let mut hulls_of: HashMap<String, Arc<Vec<Hull>>> = HashMap::new();
+    let mut hulls_flipped: HashMap<String, Arc<Vec<Hull>>> = HashMap::new();
     let mut actor_hulls: HashMap<u32, Vec<Hull>> = HashMap::new();
-    let (mut n, mut grass) = (0, 0);
+    let (mut n, mut grass, mut invisible) = (0, 0, 0usize);
     for p in doc["placements"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         let ai = p["actor"].as_u64().unwrap_or(0) as usize;
         let a = actors.get(ai).unwrap_or(&Value::Null);
@@ -390,6 +437,7 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
         let (Some(t), Some(s)) = (f3(&p["t"]), f3(&p["s"])) else { continue };
         let mesh = p["mesh"].as_str().unwrap_or("");
         let overrides: Vec<Option<String>> = p["overrides"].as_array().map(|a| a.iter().map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from)).collect()).unwrap_or_default();
+        if p["collide"].as_bool() != Some(true) && invisible_mesh(mesh, &overrides) { invisible += 1; continue; }
         let mut id = format!("poi:{}|{}", mesh, overrides.iter().map(|o| o.as_deref().unwrap_or("")).collect::<Vec<_>>().join(","));
         // WORLD: a component with painted vertex colours is its own kind (same mesh, its colour stream)
         let vraw = p["vcol"].as_array().filter(|v| !v.is_empty() && !no_vcol);
@@ -411,9 +459,16 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
             let local = hulls_of.entry(mesh.to_owned()).or_insert_with(|| Arc::new(meshes.and_then(|m| m.get(mesh)).map(mesh_pieces).unwrap_or_default().iter().filter_map(|pc| Hull::from_points(pc)).collect())).clone();
             // UE cm (left handed) -> game metres swaps y / z: a reflection, so the winding flips unless the placement mirrors too
             let flip = Mat3::from_mat4(l2w).determinant() > 0.;
+            let src = if flip { hulls_flipped.entry(mesh.to_owned()).or_insert_with(|| Arc::new(local.iter().map(Hull::reflected_topology).collect())).clone() } else { local };
             let e = actor_hulls.entry(ai as u32).or_default();
-            for h in local.iter() { e.push(h.mapped(|v| to_game(l2w.transform_point3(v)), flip)); }
+            for h in src.iter() { e.push(h.mapped_shared(|v| to_game(l2w.transform_point3(v)))); }
         }
+    }
+    for p in doc["hidden_placements"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let (Some(t), Some(s), Some(mesh)) = (f3(&p["t"]), f3(&p["s"]), p["mesh"].as_str()) else { continue };
+        out.hidden.push(PoiHidden { actor: p["actor"].as_u64().unwrap_or(0) as u32, comp: p["comp"].as_str().unwrap_or("").to_owned(), mesh: mesh.to_owned(),
+            overrides: p["overrides"].as_array().map(|a| a.iter().map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from)).collect()).unwrap_or_default(),
+            l2w: off * Mat4::from_scale_rotation_translation(Vec3::from(s), q4(&p["q"]), Vec3::from(t)), cull_cm: p["cull_cm"].as_f64().unwrap_or(0.) as f32, cast_shadow: p["cast_shadow"].as_bool().unwrap_or(true) });
     }
     // the actors as props: collision + building data
     let mut ids: Vec<u32> = actor_hulls.keys().copied().collect();
@@ -461,7 +516,11 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
     // CONTAINERS: the loot containers (`loot[]` minus the FloorLoot spawners) with their particle / light components and the root mesh's draw distance
     for l in doc["loot"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         let class = l["class"].as_str().unwrap_or("");
-        if class.contains("FloorLoot") || !class.starts_with("Tiered_") { continue; }
+        if class.contains("FloorLoot") {
+            if let Some(t) = f3(&l["t"]) { out.floor_loot.push(PoiFloorLoot { class: class.to_owned(), tier_group: l["tier_group"].as_str().unwrap_or("").to_owned(), t: off.transform_point3(Vec3::from(t)), q: q4(&l["q"]).normalize(), ue: t, group: NO_CLUSTER }); }
+            continue;
+        }
+        if !class.starts_with("Tiered_") { continue; }
         let ai = l["actor"].as_u64().unwrap_or(u64::MAX);
         let a = actors.get(ai as usize).unwrap_or(&Value::Null);
         let (Some(t), q, s) = (f3(&l["t"]), q4(&l["q"]).normalize(), f3(&a["s"]).map(Vec3::from).unwrap_or(Vec3::ONE)) else { continue };
@@ -473,6 +532,14 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
         let lights = doc["lights"].as_array().map(|ls| ls.iter().filter(|p| p["actor"].as_u64() == Some(ai)).filter_map(|p| Some((p["component"].as_str().unwrap_or("").to_owned(), p["props"].clone(), off.transform_point3(Vec3::from(f3(&p["t"])?))))).collect()).unwrap_or_default();
         out.containers.push(PoiContainer { actor: ai as u32, class: class.to_owned(), tier_group: l["tier_group"].as_str().unwrap_or("").to_owned(), t: off.transform_point3(Vec3::from(t)), q, s, ue: t, cull_cm: cull, particles, lights, group: NO_CLUSTER, searched_actor: NO_CLUSTER });
     }
+    for p in doc["lights"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let Some(t) = f3(&p["t"]) else { continue };
+        let ai = p["actor"].as_u64().unwrap_or(u64::MAX);
+        let a = actors.get(ai as usize).unwrap_or(&Value::Null);
+        out.lights.push(PoiLight { actor: ai as u32, actor_class: p["actor_class"].as_str().unwrap_or("").to_owned(), component: p["component"].as_str().unwrap_or("").to_owned(),
+            kind: p["class"].as_str().unwrap_or("").to_owned(), hidden: p["hidden"].as_bool().unwrap_or(false), t: off.transform_point3(Vec3::from(t)), q: q4(&p["q"]).normalize(),
+            actor_ue: f3(&a["t"]).unwrap_or(t), props: p["props"].clone() });
+    }
     // ALL POIS: the building worlds' ground cover, for the grass path
     if let Some(rows) = doc.pointer("/ground_cover/instances").and_then(|v| v.as_array()) {
         for r in rows {
@@ -481,7 +548,14 @@ fn read_file(path: &Path, off: Mat4) -> Result<FileOut, String> {
         }
     }
     out.note = format!("{name}: {n} placements of {} actors, {} ground-cover instances{}", actors.len(), out.ground_cover.len(), if grass > 0 { format!(" ({grass} map ground-cover instances left to the grass path)") } else { String::new() });
+    if invisible > 0 { out.note.push_str(&format!(", {invisible} placements of meshes that render nothing skipped")); }
     Ok(out)
+}
+
+const INVISIBLE_MATERIAL: &str = "/Game/Environments/Props/Rubble/Materials/M_Tire_JumpCollision_Clear.M_Tire_JumpCollision_Clear";
+fn invisible_mesh(mesh: &str, overrides: &[Option<String>]) -> bool {
+    mesh.starts_with("/Game/Environments/Props/Rubble/Meshes/TirePiles_0") && mesh.ends_with("_JumpCollision")
+        && overrides.iter().all(|o| o.as_deref().is_none_or(|m| m == INVISIBLE_MATERIAL))
 }
 
 /// Reads every POI file ([`file_list`]) and keeps the result for `statics_render` / the props / the grass. `center` = the layout centre (UE cm, mapped to
@@ -541,6 +615,8 @@ pub fn load(props_dir: &Path, center: [f32; 3], base_cm: f32) {
         }
         set.classes.extend(f.classes);
         set.actor_keys.extend(f.actor_keys);
+        for mut h in f.hidden { h.actor += base_actor; set.hidden.push(h); }
+        for (a, p) in f.parents { set.parents.insert(base_actor + a, p); }
         // WORLD (HLOD): the file's clusters and layout rows, rebased
         let base_cluster = set.clusters.len() as u32;
         for mut c in f.clusters { c.kind = kmap[c.kind]; set.clusters.push(c); }
@@ -558,7 +634,9 @@ pub fn load(props_dir: &Path, center: [f32; 3], base_cm: f32) {
         }
         let mut keys: Vec<(i32, i32)> = cells.keys().copied().collect();
         keys.sort();
+        let mut group_of_cell: HashMap<(i32, i32), u32> = HashMap::new();
         for k in keys {
+            group_of_cell.insert(k, set.groups.len() as u32);
             let pl = cells.remove(&k).unwrap_or_default();
             let pts: Vec<Vec3> = pl.iter().map(|&i| set.placements[i as usize].l2w.w_axis.truncate()).collect();
             let (lo, hi) = pts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
@@ -581,11 +659,17 @@ pub fn load(props_dir: &Path, center: [f32; 3], base_cm: f32) {
             for (gi, g) in set.groups.iter().enumerate().filter(|(_, g)| g.file == fi) { for &pi in &g.placements { group_of.entry(set.placements[pi as usize].actor).or_insert(gi as u32); } }
             for mut d in f.doors { d.actor += base_actor; d.group = group_of.get(&d.actor).copied().unwrap_or(NO_CLUSTER); set.doors.push(d); }
         }
+        for mut l in f.lights { l.actor += base_actor; set.lights.push(l); }
         // CONTAINERS: the file's containers, with the streaming group of their placements
         if !f.containers.is_empty() {
             let mut group_of: HashMap<u32, u32> = HashMap::new();
             for (gi, g) in set.groups.iter().enumerate().filter(|(_, g)| g.file == fi) { for &pi in &g.placements { group_of.entry(set.placements[pi as usize].actor).or_insert(gi as u32); } }
             for mut c in f.containers { c.actor += base_actor; c.group = group_of.get(&c.actor).copied().unwrap_or(NO_CLUSTER); set.containers.push(c); }
+        }
+        for mut fl in f.floor_loot {
+            let k = ((fl.t.x / CELL_CM).floor() as i32, (fl.t.y / CELL_CM).floor() as i32);
+            fl.group = group_of_cell.get(&k).copied().or_else(|| (-1..=1).flat_map(|dx| (-1..=1).map(move |dy| (k.0 + dx, k.1 + dy))).find_map(|c| group_of_cell.get(&c).copied())).unwrap_or(NO_CLUSTER);
+            set.floor_loot.push(fl);
         }
         for mut h in f.harvestables { h.proto = fn_combat::POI_PROTO | (base_actor + h.proto); set.harvestables.push(h); }
         for (a, k, y) in f.pieces { set.pieces.insert(base_actor + a, (k, y)); }
@@ -597,6 +681,7 @@ pub fn load(props_dir: &Path, center: [f32; 3], base_cm: f32) {
     eprintln!("[poi] WORLD: {} HLOD clusters (proxy drawn beyond {:.0} m of its bounds), {} layout rows; {} painted-colour kinds", set.clusters.len(), hlod_distance_cm() / 100., set.layout_rows.values().map(|v| v.len()).sum::<usize>(), set.kinds.iter().filter(|k| k.vcol.is_some()).count());
     eprintln!("[poi] {} files ({failed} failed), {} placements of {} mesh kinds in {} streaming groups ({:.0} m cells, resident within {:.0} m), {} ground-cover instances; layout centre ({:.0}, {:.0}) cm, ground ref z {base_cm:.0} cm; {} colliding actors ({} damageable, {} invulnerable, {} convex pieces); {:.0} ms\n[poi] {}",
         set.files.len(), set.placements.len(), set.kinds.len(), set.groups.len(), CELL_CM / 100., stream_cm() / 100., set.ground_cover.len(), center[0], center[1], set.harvestables.len(), damageable, invulnerable, hulls_total, t0.elapsed().as_secs_f32() * 1000., set.notes.join("\n[poi] "));
+    crate::bounce_hook::add_broken(&mut set);
     crate::chest_hook::add_searched(&mut set); // CONTAINERS: the searched-mesh pseudo actors (hidden until a search)
     if !set.placements.is_empty() { if let Ok(mut g) = POI.lock() { *g = Some(Arc::new(set)); } }
 }
@@ -671,5 +756,9 @@ mod tests {
         let a = Hull::from_points(&pts).unwrap().mapped(|v| to_game(l2w.transform_point3(v)), true);
         let b = Hull::from_points(&pts.iter().map(|v| to_game(l2w.transform_point3(*v))).collect::<Vec<_>>()).unwrap();
         for p in [Vec3::new(5.5, 1., -1.5), Vec3::new(5.0, 0.9, -2.5), Vec3::new(6.5, 0.5, -1.)] { assert!((a.sdf(p) - b.sdf(p)).abs() < 1e-3, "{p}: {} vs {}", a.sdf(p), b.sdf(p)); }
+        let local = Hull::from_points(&pts).unwrap().reflected_topology();
+        let c = local.mapped_shared(|v| to_game(l2w.transform_point3(v)));
+        assert!(Arc::ptr_eq(&c.tris, &local.tris) && Arc::ptr_eq(&c.edges, &local.edges));
+        for p in [Vec3::new(5.5, 1., -1.5), Vec3::new(5.0, 0.9, -2.5), Vec3::new(6.5, 0.5, -1.), Vec3::new(4., 0., 0.)] { assert!((c.sdf(p) - b.sdf(p)).abs() < 1e-3, "{p}: {} vs {}", c.sdf(p), b.sdf(p)); }
     }
 }

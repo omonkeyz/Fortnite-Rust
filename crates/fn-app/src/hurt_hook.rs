@@ -106,6 +106,7 @@ fn world_origin_ue() -> Vec3 {
 
 /// Per frame: fall landings -> damage (shield first, see fall_damage.rs) -> damage feedback; advances the camera shake by `dt`.
 pub fn on_frame(sim: &mut GameSim, arms: &mut Arms, dt: f32) {
+    crate::water_hook::on_frame(sim, arms);
     let landings = sim.fall.take_landings();
     let mut guard = STATE.lock().unwrap();
     let st = guard.get_or_insert_with(|| State { catalog: None, gpu: Gpu::default(), live: vec![], pawn_ue: Vec3::ZERO, shake: Shake::default(), rnd: 0x5eed, serial: 0 });

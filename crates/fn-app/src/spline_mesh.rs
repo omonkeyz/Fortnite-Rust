@@ -173,7 +173,7 @@ fn write_spline(floats: &mut [f32], g: &fn_fx::gpu::StageGlobals, vals: &[Vec<f3
     true
 }
 fn to_floats(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
-fn to_bytes(f: &[f32]) -> Vec<u8> { f.iter().flat_map(|x| x.to_le_bytes()).collect() }
+fn to_bytes(f: &[f32]) -> Vec<u8> { fn_fx::view::f32_bytes(f) }
 
 // ---- the export file ---------------------------------------------------------------------------------------------------------------------------
 
@@ -224,7 +224,7 @@ pub struct SplineRender {
     meshes: Vec<MeshG>, mesh_of: HashMap<String, Option<usize>>,
     entries: Vec<Entry>, entry_of: HashMap<(String, usize, bool), Option<usize>>,
     shadows: Vec<Option<MaterialGpu>>, // per entry
-    placed: Vec<Placed>, built: bool, log: Vec<String>,
+    placed: Vec<Placed>, built: bool, log: Vec<String>, pending: Option<(std::collections::VecDeque<Component>, Mat4, f32)>,
     pub stats: Stats,
 }
 #[derive(Clone, Debug, Default)]
@@ -235,7 +235,7 @@ impl SplineRender {
         let file = props_dir.join("splines").join("landscape_splines.json");
         if !file.is_file() { return Err(format!("{} missing (fn-export props splines)", file.display())); }
         let set = Arc::new(PakSet::open_install(install).map_err(|e| e.to_string())?);
-        Ok(SplineRender { set, file, cache: TextureCache::default(), shared: None, fade: None, meshes: vec![], mesh_of: HashMap::new(), entries: vec![], entry_of: HashMap::new(), shadows: vec![], placed: vec![], built: false, log: vec![], stats: Stats::default() })
+        Ok(SplineRender { set, file, cache: TextureCache::default(), shared: None, fade: None, meshes: vec![], mesh_of: HashMap::new(), entries: vec![], entry_of: HashMap::new(), shadows: vec![], placed: vec![], built: false, pending: None, log: vec![], stats: Stats::default() })
     }
     fn note(&mut self, s: String) { eprintln!("[splines] {s}"); self.log.push(s); }
 
@@ -327,16 +327,20 @@ impl SplineRender {
     }
 
     /// Reads the export and builds every component's GPU data (once).
-    fn build(&mut self, fx: &mut FxRenderer) {
-        if self.built { return; }
-        // the POI mapping (poi.rs `load`) must exist first: until then nothing is placed and the build is retried (FN_POI=0 = never: no spline meshes)
-        let Some(off) = crate::poi::current().map(|s| s.off) else { return };
-        self.built = true;
+    fn build(&mut self, fx: &mut FxRenderer) { while !self.build_step(fx, None) {} }
+    fn build_step(&mut self, fx: &mut FxRenderer, budget: Option<std::time::Duration>) -> bool {
+        if self.built { return true; }
         let t0 = std::time::Instant::now();
-        let doc: Value = match std::fs::read(&self.file).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())) { Ok(d) => d, Err(e) => { self.note(format!("{}: {e}", self.file.display())); return; } };
-        let comps = parse_components(&doc);
+        if self.pending.is_none() {
+        // the POI mapping (poi.rs `load`) must exist first: until then nothing is placed and the build is retried (FN_POI=0 = never: no spline meshes)
+        let Some(off) = crate::poi::current().map(|s| s.off) else { return true };
+        let doc: Value = match std::fs::read(&self.file).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())) { Ok(d) => d, Err(e) => { self.built = true; self.note(format!("{}: {e}", self.file.display())); return true; } };
+        self.pending = Some((parse_components(&doc).into(), off, 0.0));
+        }
         // `off` = the POI mapping: FX space = UE world about the layout centre moved to the game anchor, height minus the landscape ground reference
-        for c in comps {
+        loop {
+            if budget.is_some_and(|b| t0.elapsed() >= b) { if let Some(p) = self.pending.as_mut() { p.2 += t0.elapsed().as_secs_f32() * 1000.; } return false; }
+            let Some((c, off)) = self.pending.as_mut().and_then(|p| p.0.pop_front().map(|c| (c, p.1))) else { break };
             let Some(mi) = self.mesh(fx, &c.mesh) else { continue };
             let l2w = off * Mat4::from_scale_rotation_translation(c.s, c.q, c.t);
             let mb = self.meshes[mi].bounds;
@@ -359,9 +363,11 @@ impl SplineRender {
             }
             self.placed.push(Placed { c, mesh: mi, l2w, local, values, reverse, secs, prim: None, vs: HashMap::new(), binds: HashMap::new() });
         }
-        let ms = t0.elapsed().as_secs_f32() * 1000.;
+        self.built = true;
+        let ms = t0.elapsed().as_secs_f32() * 1000. + self.pending.take().map_or(0.0, |p| p.2);
         let n = self.placed.len();
         self.note(format!("{n} spline mesh components placed ({} meshes, {} material entries) in {ms:.0} ms", self.meshes.len(), self.entries.len()));
+        true
     }
 
     pub fn frame(&mut self, fx: &mut FxRenderer, view: &ViewParams, out: &mut FxFrame) {
@@ -476,7 +482,7 @@ pub fn init(install: Option<PathBuf>, roots: &[PathBuf]) {
 /// LOAD TIME: the components' GPU data + materials built under the loading screen (Finishing stage, as `statics_render::prebuild_step`), not in the first
 /// frame of play. Always true (one shot, about 1 s; nothing to wait for when disabled or before the POI mapping exists: [`frame`] then builds it).
 pub fn prebuild_step(fx: &mut FxRenderer) -> bool {
-    if let Ok(mut g) = STATE.lock() { if let Some(s) = g.as_mut() { s.init_gpu(fx); s.build(fx); } }
+    if let Ok(mut g) = STATE.lock() { if let Some(s) = g.as_mut() { s.init_gpu(fx); return s.build_step(fx, Some(std::time::Duration::from_millis(40))); } }
     true
 }
 /// The frame's spline-mesh draws (no-op before [`init`]).

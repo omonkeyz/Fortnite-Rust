@@ -8,3 +8,11 @@ static SCRIPT_USE: AtomicBool = AtomicBool::new(false);
 /// SCRIPT: the Use key row is held this frame (`key=use` / `key=e`).
 pub fn set_script_use(down: bool) { SCRIPT_USE.store(down, Ordering::Relaxed); }
 pub fn script_use() -> bool { SCRIPT_USE.load(Ordering::Relaxed) }
+static TAP: AtomicBool = AtomicBool::new(false);
+static CURVES: std::sync::Mutex<Vec<(&'static str, f32, f32)>> = std::sync::Mutex::new(Vec::new());
+pub fn note_tap() { TAP.store(true, Ordering::Relaxed); }
+pub fn take_tap() -> bool { TAP.swap(false, Ordering::Relaxed) }
+pub fn set_montage_curves(v: Vec<(&'static str, f32, f32)>) { if let Ok(mut c) = CURVES.lock() { *c = v; } }
+pub fn montage_curve(name: &str, pose_value: f32) -> f32 {
+    CURVES.lock().ok().and_then(|c| c.iter().find(|(n, _, w)| *n == name && *w > 0.).map(|&(_, sum, w)| pose_value * (1. - w.min(1.)) + sum)).unwrap_or(pose_value)
+}

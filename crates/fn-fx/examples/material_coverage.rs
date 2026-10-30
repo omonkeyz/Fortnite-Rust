@@ -29,7 +29,7 @@ fn check(set: &fn_pak::PakSet, path: &str, vf: &str) -> String {
     // the scene-lit assembly (translation of both programs) is the real test that the path can run it
     let asm = match (m.cooked.find(vf, VS), m.cooked.find(vf, PS)) {
         (Some(v), Some(p)) => {
-            let clip = if m.flags.blend == "BLEND_Masked" { m.cooked.programs.iter().find(|q| q.vertex_factory == vf && q.shader_type.starts_with(DEPTH_PS) && q.shader.major >= 5) } else { None };
+            let clip = if m.flags.blend == "BLEND_Masked" { m.cooked.programs.iter().find(|q| q.vertex_factory == vf && q.shader_type.starts_with(DEPTH_PS) && q.major >= 5).map(|e| &**e) } else { None };
             let r = if m.flags.uses_gbuffer() { fn_fx::program::assemble_scene_lit(v, p, clip, &fn_render::fx::default_scene_lit_prelude()).map(|a| a.targets) } else { fn_fx::program::assemble(v, p, false, clip).map(|a| a.targets) };
             match r { Ok(t) => format!("OK ({t} targets)"), Err(e) => format!("FAIL: {}", e.chars().take(90).collect::<String>()) }
         }

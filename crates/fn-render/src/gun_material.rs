@@ -105,6 +105,9 @@ pub struct GunRenderer {
     view_bufs: std::collections::HashSet<usize>,
     view_history: crate::taa::ViewHistory,
     view_size: (u32, u32),
+    write_seen: Vec<u64>,
+    uploaded: Vec<Vec<u8>>,
+    write_epoch: u64,
     dedup: HashMap<u64, usize>,
     #[cfg(target_arch = "wasm32")] web_pending: HashMap<usize, Vec<(u8, wgpu::PendingRenderPipeline, Option<wgpu::RenderPipeline>)>>,
     #[cfg(target_arch = "wasm32")] web_failed: std::collections::HashSet<usize>,
@@ -125,7 +128,7 @@ impl GunRenderer {
             common: [common, lit_common, resolve].join("\n"), bgl_globals: bgl_globals.clone(),
             textures: vec![], buffers: vec![], meshes: vec![], pipes: vec![], binds: vec![], samplers: HashMap::new(), frame: GunFrame::default(),
             bgl_empty, bg_empty, bgl_shadow_vp, shadow_vp_bgs: vec![], last_error: None, tex_stats: HashMap::new(),
-            velocity_pipes: HashMap::new(), view_bufs: Default::default(), view_history: Default::default(), view_size: (0, 0), // VELOCITY
+            velocity_pipes: HashMap::new(), view_bufs: Default::default(), view_history: Default::default(), view_size: (0, 0), write_seen: Vec::new(), uploaded: Vec::new(), write_epoch: 0, // VELOCITY
             dedup: HashMap::new(),
             #[cfg(target_arch = "wasm32")] web_pending: HashMap::new(),
             #[cfg(target_arch = "wasm32")] web_failed: Default::default(),
@@ -137,7 +140,8 @@ impl GunRenderer {
     /// TEXTURE MEMORY (2026-10-06, BC passthrough): a texture whose level 0 is `width` x `height` can be uploaded here as cooked BC blocks
     /// ([`Self::create_texture_fmt`]): the device takes BC (`fx::bc_native_hint`, `FN_DEBUG_NO_BC=1` turns it off) and the size is a multiple of 4.
     pub fn accepts_bc(&self, width: u32, height: u32) -> bool {
-        crate::fx::bc_native_hint() && self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC) && width % 4 == 0 && height % 4 == 0 && width > 0 && height > 0
+        static BC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        crate::fx::bc_native_hint() && *BC.get_or_init(|| self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC)) && width % 4 == 0 && height % 4 == 0 && width > 0 && height > 0
     }
     /// [`Self::create_texture`] with the levels in `format`: RGBA8 pixels, or a BC format's cooked 4x4 blocks (`ceil(w / 4) * ceil(h / 4)` blocks per level,
     /// sRGB / UNORM as `fx::FxTexFormat::wgpu`: BC4 / BC5 always linear like UE4.16's D3D11 RHI). Check [`Self::accepts_bc`] first: blocks this renderer
@@ -399,8 +403,22 @@ impl GunRenderer {
     pub fn prepare(&mut self) {
         #[cfg(target_arch = "wasm32")] self.web_poll();
         // VELOCITY: PrevTranslatedWorldToClip / PrevPreViewTranslation of the View buffers = their last frame's own matrices (taa.rs ViewHistory)
-        for (b, bytes) in self.frame.buffer_writes.iter_mut() { if self.view_bufs.contains(&b.0) { crate::taa::apply_view_size(bytes, self.view_size); self.view_history.patch(b.0, bytes); } }
-        for (b, bytes) in &self.frame.buffer_writes { if let Some(buf) = self.buffers.get(b.0) { let n = (bytes.len() as u64).min(buf.size()) as usize; self.queue.write_buffer(buf, 0, &bytes[..n]); } }
+        self.write_epoch += 1;
+        if self.write_seen.len() < self.buffers.len() { self.write_seen.resize(self.buffers.len(), 0); }
+        if self.uploaded.len() < self.buffers.len() { self.uploaded.resize(self.buffers.len(), Vec::new()); }
+        for (b, bytes) in self.frame.buffer_writes.iter_mut().rev() {
+            let Some(seen) = self.write_seen.get_mut(b.0) else { continue };
+            if *seen == self.write_epoch { continue; }
+            *seen = self.write_epoch;
+            if self.view_bufs.contains(&b.0) { crate::taa::apply_view_size(bytes, self.view_size); self.view_history.patch(b.0, bytes); }
+            if let Some(buf) = self.buffers.get(b.0) {
+                let n = (bytes.len() as u64).min(buf.size()) as usize;
+                let prev = &mut self.uploaded[b.0];
+                if n > 0 && prev.as_slice() == &bytes[..n] { continue; }
+                self.queue.write_buffer(buf, 0, &bytes[..n]);
+                prev.clear(); prev.extend_from_slice(&bytes[..n]);
+            }
+        }
         self.frame.buffer_writes.clear();
     }
     /// FULL PREPASS (2026-10-06): records the frame's draws with their depth twins into the renderer's depth pre-pass (group 0 = `globals`, set here). The base-pass

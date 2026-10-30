@@ -11,3 +11,4 @@ description = "Browser platform layer of the Fortnite 1.8 browser port: implemen
 wasm-bindgen = "=0.2.129"
 js-sys = "0.3.106"
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+dlmalloc = { version = "0.2.14", default-features = false }

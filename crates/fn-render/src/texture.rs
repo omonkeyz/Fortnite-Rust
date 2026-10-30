@@ -52,8 +52,11 @@ pub fn build_mips(img: &RgbaImage, filter: MipFilter) -> Vec<RgbaImage> {
 /// Uploads an RGBA8 image with a full mip chain. `srgb`: the texture's `SRGB` flag (hardware decode on sampling, like UE's `*_UNORM_SRGB` SRV); its
 /// mips are then averaged in LINEAR light (UE 4.16 TextureCompressorModule.cpp:2030-2086 builds every mip from the RGBA32F `EGammaSpace::Linear` copy of the
 /// image), so `filter` only applies to linear textures.
+pub fn mip_chain(img: &RgbaImage, srgb: bool, filter: MipFilter) -> Vec<RgbaImage> { if srgb { crate::static_mesh::build_mips_srgb(img, None) } else { build_mips(img, filter) } }
 pub fn upload_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, img: &RgbaImage, srgb: bool, filter: MipFilter, label: &str) -> wgpu::Texture {
-    let levels = if srgb { crate::static_mesh::build_mips_srgb(img, None) } else { build_mips(img, filter) };
+    upload_mip_chain(device, queue, img, &mip_chain(img, srgb, filter), srgb, label)
+}
+pub fn upload_mip_chain(device: &wgpu::Device, queue: &wgpu::Queue, img: &RgbaImage, levels: &[RgbaImage], srgb: bool, label: &str) -> wgpu::Texture {
     let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -75,6 +78,65 @@ pub fn upload_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, img: &RgbaImage,
     }
     texture
 }
+
+enum Deferred { Buf(wgpu::Buffer, Vec<u8>, usize), Tex(wgpu::Texture, u32, RgbaImage) }
+thread_local! { static DEFERRED: std::cell::RefCell<std::collections::VecDeque<Deferred>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) }; }
+
+pub fn buffer_deferred<T: bytemuck::NoUninit>(device: &wgpu::Device, data: &[T], usage: wgpu::BufferUsages, label: &str) -> wgpu::Buffer {
+    let mut bytes = bytemuck::cast_slice::<T, u8>(data).to_vec();
+    bytes.resize(bytes.len().next_multiple_of(4).max(4), 0);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: bytes.len() as u64, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    DEFERRED.with(|q| q.borrow_mut().push_back(Deferred::Buf(buf.clone(), bytes, 0)));
+    buf
+}
+
+pub fn upload_mip_chain_deferred(device: &wgpu::Device, levels: Vec<RgbaImage>, srgb: bool, label: &str) -> wgpu::Texture {
+    let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
+    let (w, h) = levels.first().map_or((1, 1), |l| (l.width(), l.height()));
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: levels.len().max(1) as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    DEFERRED.with(|q| { let mut q = q.borrow_mut(); for (i, l) in levels.into_iter().enumerate() { q.push_back(Deferred::Tex(texture.clone(), i as u32, l)); } });
+    texture
+}
+
+pub fn pump_deferred(queue: &wgpu::Queue, budget_bytes: usize) -> bool {
+    DEFERRED.with(|q| {
+        let mut q = q.borrow_mut();
+        let mut spent = 0usize;
+        while spent < budget_bytes {
+            let Some(front) = q.front_mut() else { break };
+            match front {
+                Deferred::Buf(buf, bytes, at) => {
+                    let n = (bytes.len() - *at).min((budget_bytes - spent).next_multiple_of(4).max(4 << 20));
+                    queue.write_buffer(buf, *at as u64, &bytes[*at..*at + n]);
+                    *at += n; spent += n;
+                    if *at >= bytes.len() { q.pop_front(); }
+                }
+                Deferred::Tex(tex, mip, level) => {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: tex, mip_level: *mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        level.as_raw(),
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * level.width()), rows_per_image: Some(level.height()) },
+                        wgpu::Extent3d { width: level.width(), height: level.height(), depth_or_array_layers: 1 },
+                    );
+                    spent += level.as_raw().len();
+                    q.pop_front();
+                }
+            }
+        }
+        q.is_empty()
+    })
+}
+
+pub fn deferred_bytes() -> usize { DEFERRED.with(|q| q.borrow().iter().map(|d| match d { Deferred::Buf(_, b, at) => b.len() - at, Deferred::Tex(_, _, l) => l.as_raw().len() }).sum()) }
 
 /// 1x1 texture of a constant colour (neutral material slots).
 pub fn solid_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, px: [u8; 4], label: &str) -> wgpu::Texture {

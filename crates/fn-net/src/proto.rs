@@ -7,17 +7,31 @@ pub const BUILD: u8 = 0x04;
 pub const HEAL: u8 = 0x05;
 pub const SELFDMG: u8 = 0x06;
 pub const INTERACT: u8 = 0x07;
+pub const REVIVE: u8 = 0x08;
 pub const PING: u8 = 0x09;
+pub const PICKUP_SPAWN: u8 = 0x0a;
+pub const PICKUP_CLAIM: u8 = 0x0b;
+pub const EMOTE: u8 = 0x0c;
 pub const HEALTH: u8 = 0x40;
 pub const ELIM: u8 = 0x41;
 pub const STORM: u8 = 0x42;
 pub const SPAWN: u8 = 0x43;
 pub const LOOT: u8 = 0x44;
 pub const DAMAGE: u8 = 0x45;
+pub const DBNO: u8 = 0x46;
+pub const PICKUP: u8 = 0x47;
+pub const PICKUP_GONE: u8 = 0x48;
 pub const CORRECT: u8 = 0x80;
 pub const PONG: u8 = 0x89;
 pub const SERVER_SLOT: u8 = 0xff;
 pub const NO_KILLER: u8 = 0xff;
+
+pub mod elim_flag { pub const WAS_DBNO: u8 = 1; pub const BLED_OUT: u8 = 2; pub const TEAM_WIPE: u8 = 4; }
+pub mod dbno_state { pub const REVIVED: u8 = 0; pub const DOWNED: u8 = 1; pub const REVIVE_START: u8 = 2; pub const REVIVE_STOP: u8 = 3; }
+pub mod pickup_flag { pub const DEATH: u8 = 1; pub const DROPPED: u8 = 2; }
+pub const NO_TAKER: u8 = 0xff;
+pub mod emote_op { pub const STOP: u8 = 0; pub const PLAY: u8 = 1; }
+pub mod damage_flag { pub const SHIELD: u8 = 1; pub const HEAD: u8 = 2; pub const DBNO: u8 = 4; }
 
 pub mod flag {
     pub const CROUCHED: u16 = 1;
@@ -29,6 +43,7 @@ pub mod flag {
     pub const SWINGING: u16 = 64;
     pub const HIDDEN: u16 = 128;
     pub const PICKAXE: u16 = 256;
+    pub const AERIAL: u16 = 0x8000;
     pub const GUN_SHIFT: u16 = 9;
     pub const GUN_MASK: u16 = 0x3f;
     pub fn with_gun(flags: u16, gun: Option<usize>) -> u16 { (flags & !(GUN_MASK << GUN_SHIFT)) | (gun.map_or(0, |g| (g as u16 + 1).min(GUN_MASK)) << GUN_SHIFT) }
@@ -63,14 +78,21 @@ pub enum Msg {
     Heal { health: u8, shield: u8 },
     SelfDamage { health: u8, shield: u8 },
     Interact { kind: u8, id: u32 },
+    Revive { target: u8, on: bool },
     Health(Vec<HealthEntry>),
-    Elim { victim: u8, killer: u8, weapon: u8, head: bool },
+    Elim { victim: u8, killer: u8, weapon: u8, head: bool, flags: u8 },
+    Dbno { victim: u8, state: u8, by: u8, weapon: u8, head: bool },
     Storm(Storm),
     Spawn { slot: u8, pos: Vec3 },
     Loot(Vec<u8>),
     Damage { victim: u8, attacker: u8, flags: u8, amount: f32 },
     Correct(Vec3),
     Pong { nonce: u32, server_ms: f64 },
+    PickupSpawn { flags: u8, count: u16, start: Vec3, end: Vec3, item: String },
+    PickupClaim { id: u32 },
+    Pickup { id: u32, owner: u8, flags: u8, count: u16, start: Vec3, end: Vec3, item: String },
+    PickupGone { id: u32, taker: u8 },
+    Emote { op: u8, item: u8 },
 }
 
 struct W(Vec<u8>);
@@ -112,13 +134,20 @@ pub fn encode(m: &Msg) -> Vec<u8> {
         Msg::Heal { health, shield } => W::new(HEAL).u8(*health).u8(*shield).0,
         Msg::SelfDamage { health, shield } => W::new(SELFDMG).u8(*health).u8(*shield).0,
         Msg::Interact { kind, id } => W::new(INTERACT).u8(*kind).u32(*id).0,
+        Msg::Revive { target, on } => W::new(REVIVE).u8(*target).u8(*on as u8).0,
         Msg::Health(list) => { let mut w = W::new(HEALTH).u8(list.len().min(16) as u8); for e in list.iter().take(16) { w = w.u8(e.slot).u8(e.health.min(100)).u8(e.shield.min(100)).u8(e.dead as u8); } w.0 }
-        Msg::Elim { victim, killer, weapon, head } => W::new(ELIM).u8(*victim).u8(*killer).u8(*weapon).u8(*head as u8).0,
+        Msg::Elim { victim, killer, weapon, head, flags } => W::new(ELIM).u8(*victim).u8(*killer).u8(*weapon).u8(*head as u8).u8(*flags).0,
+        Msg::Dbno { victim, state, by, weapon, head } => W::new(DBNO).u8(*victim).u8(*state).u8(*by).u8(*weapon).u8(*head as u8).0,
         Msg::Storm(s) => W::new(STORM).u8(s.phase).u8(s.state).u8(0).f32(s.center[0]).f32(s.center[1]).f32(s.center[2]).f32(s.next[0]).f32(s.next[1]).f32(s.next[2]).f32(s.time_left).0,
         Msg::Spawn { slot, pos } => W::new(SPAWN).u8(*slot).v3(*pos).0,
         Msg::Loot(b) => { let mut w = W::new(LOOT); w.0.extend_from_slice(&b[..b.len().min(199)]); w.0 }
         Msg::Damage { victim, attacker, flags, amount } => W::new(DAMAGE).u8(*victim).u8(*attacker).u8(*flags).f32(*amount).0,
         Msg::Correct(p) => W::new(CORRECT).u8(SERVER_SLOT).v3(*p).0,
+        Msg::PickupSpawn { flags, count, start, end, item } => { let id: Vec<u8> = item.bytes().take(64).collect(); let mut w = W::new(PICKUP_SPAWN).u8(*flags).u16(*count).v3(*start).v3(*end).u8(id.len() as u8); w.0.extend_from_slice(&id); w.0 }
+        Msg::PickupClaim { id } => W::new(PICKUP_CLAIM).u32(*id).0,
+        Msg::Pickup { id, owner, flags, count, start, end, item } => { let b: Vec<u8> = item.bytes().take(64).collect(); let mut w = W::new(PICKUP).u32(*id).u8(*owner).u8(*flags).u16(*count).v3(*start).v3(*end).u8(b.len() as u8); w.0.extend_from_slice(&b); w.0 }
+        Msg::PickupGone { id, taker } => W::new(PICKUP_GONE).u32(*id).u8(*taker).0,
+        Msg::Emote { op, item } => W::new(EMOTE).u8(*op).u8(*item).0,
         Msg::Pong { nonce, server_ms } => { let mut w = W::new(PONG).u8(SERVER_SLOT).u32(*nonce); w.0.extend_from_slice(&server_ms.to_le_bytes()); w.0 }
     }
 }
@@ -151,14 +180,23 @@ pub fn decode_relayed(b: &[u8]) -> Option<(u8, Msg)> {
         HEAL => Msg::Heal { health: r.u8()?, shield: r.u8()? },
         SELFDMG => Msg::SelfDamage { health: r.u8()?, shield: r.u8()? },
         INTERACT => Msg::Interact { kind: r.u8()?, id: r.u32()? },
+        REVIVE => Msg::Revive { target: r.u8()?, on: r.u8()? != 0 },
         HEALTH => { let n = r.u8()? as usize; let mut v = vec![]; for _ in 0..n.min(16) { v.push(HealthEntry { slot: r.u8()?, health: r.u8()?, shield: r.u8()?, dead: r.u8()? & 1 != 0 }); } Msg::Health(v) }
-        ELIM => Msg::Elim { victim: r.u8()?, killer: r.u8()?, weapon: r.u8()?, head: r.u8()? & 1 != 0 },
+        ELIM => Msg::Elim { victim: r.u8()?, killer: r.u8()?, weapon: r.u8()?, head: r.u8()? & 1 != 0, flags: r.u8()? },
+        DBNO => Msg::Dbno { victim: r.u8()?, state: r.u8()?, by: r.u8()?, weapon: r.u8()?, head: r.u8()? & 1 != 0 },
         STORM => { let (phase, state, _) = (r.u8()?, r.u8()?, r.u8()?); Msg::Storm(Storm { phase, state, center: [r.f32()?, r.f32()?, r.f32()?], next: [r.f32()?, r.f32()?, r.f32()?], time_left: r.f32()? }) }
         SPAWN => Msg::Spawn { slot: r.u8()?, pos: r.v3()? },
         LOOT => { let v = b[2..].to_vec(); r.at = b.len(); Msg::Loot(v) }
         DAMAGE => Msg::Damage { victim: r.u8()?, attacker: r.u8()?, flags: r.u8()?, amount: r.f32()? },
         CORRECT => Msg::Correct(r.v3()?),
         PONG => Msg::Pong { nonce: r.u32()?, server_ms: r.f64()? },
+        PICKUP => {
+            let (id, owner, flags, count, start, end, len) = (r.u32()?, r.u8()?, r.u8()?, r.u16()?, r.v3()?, r.v3()?, r.u8()? as usize);
+            let s = b.get(r.at..r.at + len)?; r.at += len;
+            Msg::Pickup { id, owner, flags, count, start, end, item: String::from_utf8(s.to_vec()).ok()? }
+        }
+        PICKUP_GONE => Msg::PickupGone { id: r.u32()?, taker: r.u8()? },
+        EMOTE => Msg::Emote { op: r.u8()?, item: r.u8()? },
         _ => return None,
     };
     if !r.done() { return None; }
@@ -177,10 +215,16 @@ mod tests {
         assert_eq!(encode(&Msg::Heal { health: 1, shield: 2 }).len(), 3);
         assert_eq!(encode(&Msg::Interact { kind: 1, id: 2 }).len(), 6);
         assert_eq!(ping(1).len(), 5);
-        assert_eq!(encode(&Msg::Elim { victim: 1, killer: 2, weapon: 3, head: true }).len(), 5);
+        assert_eq!(encode(&Msg::Elim { victim: 1, killer: 2, weapon: 3, head: true, flags: 1 }).len(), 6);
+        assert_eq!(encode(&Msg::Revive { target: 1, on: true }).len(), 3);
+        assert_eq!(encode(&Msg::Dbno { victim: 1, state: 1, by: 2, weapon: 3, head: false }).len(), 6);
         assert_eq!(encode(&Msg::Storm(Storm::default())).len(), 32);
         assert_eq!(encode(&Msg::Spawn { slot: 1, pos: Vec3::ONE }).len(), 14);
         assert_eq!(encode(&Msg::Damage { victim: 1, attacker: 2, flags: 0, amount: 3. }).len(), 8);
+        assert_eq!(encode(&Msg::PickupSpawn { flags: 1, count: 1, start: Vec3::ZERO, end: Vec3::ZERO, item: "Athena_Bandage".into() }).len(), 29 + 14);
+        assert_eq!(encode(&Msg::PickupClaim { id: 3 }).len(), 5);
+        assert_eq!(encode(&Msg::Emote { op: emote_op::PLAY, item: 0 }).len(), 3);
+        assert_eq!(relayed(0xff, &encode(&Msg::Pickup { id: 1, owner: 0, flags: 0, count: 1, start: Vec3::ZERO, end: Vec3::ZERO, item: "Athena_Bandage".into() })).len(), 35 + 14);
     }
     #[test] fn every_message_roundtrips() {
         roundtrip(Msg::State(State { seq: 9, t_ms: 1000, pos: Vec3::new(1., 2., 3.), vel: Vec3::new(4., 5., 6.), yaw: 90., pitch: -10., flags: 5, held: 3, air_dm: 7 }));
@@ -191,6 +235,13 @@ mod tests {
         roundtrip(Msg::Storm(Storm { phase: 2, state: 1, center: [1., 2., 3.], next: [4., 5., 6.], time_left: 30. }));
         roundtrip(Msg::Damage { victim: 1, attacker: 0, flags: 3, amount: 42. });
         roundtrip(Msg::Spawn { slot: 4, pos: Vec3::new(5., 6., 7.) });
+        roundtrip(Msg::Elim { victim: 1, killer: 2, weapon: 3, head: true, flags: elim_flag::WAS_DBNO | elim_flag::TEAM_WIPE });
+        roundtrip(Msg::Dbno { victim: 1, state: dbno_state::DOWNED, by: 2, weapon: 7, head: true });
+        roundtrip(Msg::Revive { target: 3, on: true });
+        roundtrip(Msg::Pickup { id: 9, owner: 2, flags: pickup_flag::DEATH, count: 30, start: Vec3::new(1., 2., 3.), end: Vec3::new(4., 0.8, 6.), item: "AthenaAmmoDataShells".into() });
+        roundtrip(Msg::PickupGone { id: 9, taker: 1 });
+        roundtrip(Msg::Emote { op: emote_op::PLAY, item: 2 });
+        roundtrip(Msg::Emote { op: emote_op::STOP, item: 0 });
     }
     #[test] fn truncated_and_trailing_bytes_are_rejected() {
         let b = relayed(1, &encode(&Msg::Hit(Hit::default())));

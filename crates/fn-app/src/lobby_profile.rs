@@ -81,6 +81,8 @@ pub struct Profile {
     display_name: Option<String>,
     season_level: i32,
     season_xp: i32,
+    banner: Option<(String, String)>,
+    match_options: BTreeMap<String, usize>,
     /// items every fresh profile owns (the 1.8 default outfits / harvesting tool / glider); re-applied on load and `reset`
     defaults: Vec<(Slot, String)>,
     /// items a fresh / reset profile owns on top of the defaults (default: every Athena cosmetic of the paks)
@@ -117,7 +119,7 @@ pub fn store_display_name(path: &Path, name: &str) -> std::io::Result<()> {
 impl Profile {
     /// A fresh in-memory profile: 1,000,000 V-Bucks, the `defaults` owned, the first default of each slot equipped.
     pub fn new(defaults: Vec<(Slot, String)>) -> Profile {
-        let mut p = Profile { vbucks: DEFAULT_VBUCKS, owned: BTreeSet::new(), loadout: BTreeMap::new(), shop_day_offset: 0, display_name: None, season_level: 1, season_xp: 0, defaults, starting: vec![], path: None, dirty: true };
+        let mut p = Profile { vbucks: DEFAULT_VBUCKS, owned: BTreeSet::new(), loadout: BTreeMap::new(), shop_day_offset: 0, display_name: None, season_level: 1, season_xp: 0, banner: None, match_options: BTreeMap::new(), defaults, starting: vec![], path: None, dirty: true };
         p.apply_defaults();
         p
     }
@@ -166,6 +168,8 @@ impl Profile {
         if let Some(n) = v.get("season_level").and_then(|x| x.as_i64()) { self.season_level = (n as i32).max(1); }
         if let Some(n) = v.get("season_xp").and_then(|x| x.as_i64()) { self.season_xp = (n as i32).max(0); }
         if let Some(n) = v.get("display_name").and_then(|x| x.as_str()).filter(|s| !s.trim().is_empty()) { self.display_name = Some(n.to_owned()); }
+        if let (Some(i), Some(c)) = (v.get("banner").and_then(|b| b.get("icon")).and_then(|x| x.as_str()), v.get("banner").and_then(|b| b.get("color")).and_then(|x| x.as_str())) { self.banner = Some((i.to_owned(), c.to_owned())); }
+        if let Some(o) = v.get("match_options").and_then(|x| x.as_object()) { for (k, n) in o { if let Some(n) = n.as_u64() { self.match_options.insert(k.clone(), n as usize); } } }
         self.apply_defaults();
         // the loadout may only hold owned items
         let bad: Vec<Slot> = self.loadout.iter().filter(|(_, id)| !self.owned.contains(*id)).map(|(s, _)| *s).collect();
@@ -176,7 +180,7 @@ impl Profile {
     pub fn to_json(&self) -> Value {
         let mut lo = serde_json::Map::new();
         for (s, id) in &self.loadout { lo.insert(s.key().to_owned(), json!(id)); }
-        json!({ "_note": "OFFLINE substitute for the account profile (no server, no real money)", "vbucks": self.vbucks, "owned": self.owned.iter().collect::<Vec<_>>(), "loadout": Value::Object(lo), "shop_day_offset": self.shop_day_offset, "display_name": self.display_name, "season_level": self.season_level, "season_xp": self.season_xp, "starting_items_granted": true })
+        json!({ "_note": "OFFLINE substitute for the account profile (no server, no real money)", "vbucks": self.vbucks, "owned": self.owned.iter().collect::<Vec<_>>(), "loadout": Value::Object(lo), "shop_day_offset": self.shop_day_offset, "display_name": self.display_name, "season_level": self.season_level, "season_xp": self.season_xp, "banner": self.banner.as_ref().map(|(i, c)| json!({ "icon": i, "color": c })), "match_options": self.match_options, "starting_items_granted": true })
     }
 
     /// Write the profile when it changed since the last save (no-op for a profile without a path). Returns the io error, if any.
@@ -246,6 +250,11 @@ impl Profile {
         self.dirty = true;
         Ok(())
     }
+    pub fn banner(&self) -> Option<(&str, &str)> { self.banner.as_ref().map(|(i, c)| (i.as_str(), c.as_str())) }
+    pub fn match_option(&self, id: &str) -> Option<usize> { self.match_options.get(id).copied() }
+    pub fn set_match_option(&mut self, id: &str, v: usize) { if self.match_options.insert(id.to_owned(), v) != Some(v) { self.dirty = true; } }
+    pub fn set_banner(&mut self, icon: &str, color: &str) { self.banner = Some((icon.to_owned(), color.to_owned())); self.dirty = true; }
+    pub fn unequip(&mut self, slot: Slot) { if self.loadout.remove(&slot).is_some() { self.dirty = true; } }
     pub fn loadout(&self) -> impl Iterator<Item = (Slot, &str)> { self.loadout.iter().map(|(s, i)| (*s, i.as_str())) }
 
     /// Back to a fresh profile (1,000,000 V-Bucks, the default items plus the starting items = everything, shop offset 0); keeps the file binding.

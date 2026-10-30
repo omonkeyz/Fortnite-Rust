@@ -26,10 +26,16 @@ const KEY_BUS_LOOP: u32 = 0x4255_0001;
 const KEY_BUS_MUSIC: u32 = 0x4255_0002;
 const KEY_SKYDIVE: u32 = 0x4255_0003;
 const KEY_GLIDER: u32 = 0x4255_0004;
+const SKYDIVE_FADE_IN: f32 = 1.0;
 const SKYDIVE_FADE_OUT: f32 = 0.5;
+const GLIDER_FADE_IN: f32 = 5.0;
+const GLIDER_FADE_OUT: f32 = 1.0;
+const GLIDER_GROUND_TRACE_CM: f32 = 10_000.;
+const GLIDER_FULL_VOLUME_HEIGHT_CM: f32 = 6_000.;
+const GLIDER_VOLUME_INTERP_SPEED: f32 = 1.;
 
 #[derive(Default)]
-struct State { install: Option<PathBuf>, dxbc: Option<Result<Dxbc, String>>, errors: HashSet<String>, bus_audio: bool, skydive_audio: bool, glider_audio: bool }
+struct State { install: Option<PathBuf>, dxbc: Option<Result<Dxbc, String>>, errors: HashSet<String>, bus_audio: bool, skydive_audio: bool, glider_audio: bool, glider_t: f32, glider_volume: f32 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R { let mut g = STATE.lock().unwrap_or_else(|p| p.into_inner()); f(g.get_or_insert_with(State::default)) }
 
@@ -68,11 +74,47 @@ pub fn begin_match(sim: &mut GameSim, deterministic: bool) {
 
 fn cue(path: &str) -> &'static str { DROP_CUES.iter().copied().find(|c| *c == path).unwrap_or("") }
 
-pub fn frame(sim: &mut GameSim) -> Vec<SoundEvent> {
+fn finterp_to(current: f32, target: f32, dt: f32, speed: f32) -> f32 {
+    if speed <= 0. { return target; }
+    let dist = target - current;
+    if dist * dist < 1e-8 { return target; }
+    current + dist * (dt * speed).clamp(0., 1.)
+}
+
+fn wind_loops(sim: &GameSim, dt: f32, s: &mut State, out: &mut Vec<SoundEvent>) {
+    let c = sim.controller.component();
+    let sky = !sim.on_bus() && c.in_aerial_mode() && !c.is_parachute_open();
+    let glide = !sim.on_bus() && c.is_parachute_open();
+    if sky != s.skydive_audio {
+        s.skydive_audio = sky;
+        out.push(if sky { SoundEvent::ContainerLoopFadeIn { cue: cue(DROP_CUES[3]), key: KEY_SKYDIVE, pos: None, fade: SKYDIVE_FADE_IN } } else { SoundEvent::ContainerLoopStop { key: KEY_SKYDIVE, fade: SKYDIVE_FADE_OUT } });
+    }
+    if glide != s.glider_audio {
+        s.glider_audio = glide;
+        s.glider_t = 0.;
+        s.glider_volume = 1.;
+        out.push(if glide { SoundEvent::ContainerLoopFadeIn { cue: cue(DROP_CUES[4]), key: KEY_GLIDER, pos: None, fade: GLIDER_FADE_IN } } else { SoundEvent::ContainerLoopStop { key: KEY_GLIDER, fade: GLIDER_FADE_OUT } });
+    } else if glide {
+        s.glider_t += dt;
+        if c.is_parachute_forced_open() {
+            let center = sim.feet() + Vec3::Y * (fn_game::drop_in::PAWN_HALF_HEIGHT / 100.);
+            let floor = sim.floor_below(center);
+            let height_cm = ((center.y - floor) * 100.).max(0.);
+            let ground = if height_cm <= GLIDER_GROUND_TRACE_CM { height_cm } else { GLIDER_FULL_VOLUME_HEIGHT_CM };
+            let target = (ground / GLIDER_FULL_VOLUME_HEIGHT_CM).clamp(0., 1.);
+            s.glider_volume = finterp_to(s.glider_volume, target, dt, GLIDER_VOLUME_INTERP_SPEED);
+            let fade = (s.glider_t / GLIDER_FADE_IN).clamp(0., 1.);
+            out.push(SoundEvent::LoopGain { key: KEY_GLIDER, gain: fade * s.glider_volume });
+        }
+    }
+}
+
+pub fn frame(sim: &mut GameSim, dt: f32) -> Vec<SoundEvent> {
     let mut out = vec![];
     crate::statics_render::set_stream_hint(landing_hint(sim));
     crate::statics_render::set_read_hint(bus_ground(sim));
-    let Some(d) = sim.drop.as_mut() else { return out };
+    with(|s| wind_loops(sim, dt, s, &mut out));
+    let Some(d) = sim.drop.as_mut() else { out.retain(|e| !matches!(e, SoundEvent::ContainerLoopFadeIn { cue: "", .. })); return out };
     let events = d.take_events();
     let bus = d.aircraft_view().map(|(p, _)| p);
     let pawn = sim.feet();
@@ -95,13 +137,8 @@ pub fn frame(sim: &mut GameSim) -> Vec<SoundEvent> {
             None if s.bus_audio => { s.bus_audio = false; out.push(SoundEvent::ContainerLoopStop { key: KEY_BUS_LOOP, fade: 0. }); out.push(SoundEvent::ContainerLoopStop { key: KEY_BUS_MUSIC, fade: 0. }); }
             None => {}
         }
-        let c = sim.controller.component();
-        let sky = !sim.on_bus() && c.is_skydiving() && !c.is_parachute_open();
-        let glide = !sim.on_bus() && c.is_parachute_open();
-        if sky != s.skydive_audio { s.skydive_audio = sky; out.push(if sky { SoundEvent::ContainerLoop { cue: cue(DROP_CUES[3]), key: KEY_SKYDIVE, pos: None } } else { SoundEvent::ContainerLoopStop { key: KEY_SKYDIVE, fade: SKYDIVE_FADE_OUT } }); }
-        if glide != s.glider_audio { s.glider_audio = glide; out.push(if glide { SoundEvent::ContainerLoop { cue: cue(DROP_CUES[4]), key: KEY_GLIDER, pos: None } } else { SoundEvent::ContainerLoopStop { key: KEY_GLIDER, fade: 0. } }); }
     });
-    out.retain(|e| !matches!(e, SoundEvent::BuildingCue { cue: "", .. } | SoundEvent::ContainerLoop { cue: "", .. }));
+    out.retain(|e| !matches!(e, SoundEvent::BuildingCue { cue: "", .. } | SoundEvent::ContainerLoop { cue: "", .. } | SoundEvent::ContainerLoopFadeIn { cue: "", .. }));
     out
 }
 
@@ -131,6 +168,7 @@ pub fn hud(sim: &GameSim, st: &mut fn_ui::screens::hud::HudState, jump_key: &str
     crate::statics_render::set_on_bus(matches!(sim.aerial_phase(), AerialPhase::BusCantExit | AerialPhase::BusCanExit));
     let action = match sim.aerial_phase() { AerialPhase::BusCanExit => Some(AerialAction::Jump), AerialPhase::Skydiving => Some(AerialAction::DeployGlider), AerialPhase::Parachuting => Some(AerialAction::Skydive), _ => None };
     st.world.aerial = action.map(|action| AerialPrompt { key: jump_key.to_owned(), action });
+    st.bus_map = sim.drop.as_ref().and_then(|d| Some((d.aircraft_view()?.0, d.aircraft.as_ref()?.path.yaw_deg))).map(|(p, yaw)| { let o = crate::storm_hook::offset_cm(); fn_ui::screens::hud_extra::MapIcon { uv: fn_hud_adapter::minimap_uv_ue(p.x * 100. - o[0], p.z * 100. - o[1]), yaw_deg: yaw } });
     if sim.on_bus() {
         st.visible.reticle = false; st.visible.player_health = false; st.visible.pickup_info = false; st.visible.quick_bar = false;
         st.kill_feed.clear(); st.world.ammo = None; st.world.equip = None; st.world.interaction = None; st.world.target = None;
@@ -138,6 +176,23 @@ pub fn hud(sim: &GameSim, st: &mut fn_ui::screens::hud::HudState, jump_key: &str
 }
 
 fn ue_yaw(deg: f32) -> Mat3 { Mat3::from_rotation_z(deg.to_radians()) }
+
+pub fn prebuild(fx: &mut FxRenderer) -> bool {
+    static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    with(|s| {
+        if s.dxbc.is_none() { s.dxbc = Some(match s.install.as_ref() { Some(i) => Dxbc::load(i, fx), None => Err("no install".into()) }); return false; }
+        let at = AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(Ok(dx)) = s.dxbc.as_mut() {
+            if let Some(mesh) = [BUS, BALLOON, APPARATUS, FLAME, GENERATOR].get(at) { let _ = dx.static_ready(fx, mesh); return false; }
+            if at > 5 { return true; }
+            let view = ViewParams { eye: Vec3::ZERO, forward: Vec3::NEG_Z, up: Vec3::Y, tan_half: (1.0, 0.5625), near_m: 0.1, far_m: 1000.0, width: 64, height: 64, time: 0.0, real_time: 0.0, delta_world: 0.0 };
+            dx.begin(&view);
+            for mesh in [BUS, BALLOON, APPARATUS, FLAME, GENERATOR] { let _ = dx.draw_static_item(fx, mesh, Vec3::new(0.0, 0.0, -1.0e7), Mat3::IDENTITY, [0.0; 3]); }
+            let _ = dx.take_frame();
+        }
+        true
+    })
+}
 
 pub fn fx_frame(fx: &mut FxRenderer, view: &ViewParams, sim: &GameSim, out: &mut FxFrame) {
     let Some(d) = sim.drop.as_ref() else { return };

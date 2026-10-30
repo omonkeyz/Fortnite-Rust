@@ -136,8 +136,8 @@ impl Door {
 
     /// FUN_1404c4be0 (Authority, Athena game state): `bDoorOpen = open`, the sound (vfunc_421, before anything else is decided), then
     /// * close: the component is turned to the closed rotation with collision on and vfunc_364 tests the pawns (`bCollisionBlockedByPawns`); free: desired =
-    ///   closed and a 0.4 s timer re-enables the collision; blocked: `bDoorOpen` flips back to open and desired = closed + delta (no timer: the collision stays
-    ///   off). Either way the component's collision is then off for the swing.
+    ///   closed and a 0.4 s timer re-enables the collision; blocked: `bDoorOpen` flips back to open and desired = closed + delta (1.8 arms no timer here and the collision stays off for good; the port arms the same 0.4 s timer so a pawn in the way never leaves the door unusable
+    ///   afterwards). Either way the component's collision is then off for the swing.
     /// * open: collision off, `bDoorCollisionDisabled`, a 0.4 s timer; with an instigator the delta flips (x -1, kept) when the instigator's forward points
     ///   against `FRotator(desired + delta).Vector()` (FUN_1412f4470), so the door swings the way the pawn faces; then a mirrored wall flips it again;
     ///   desired = normalize(closed + delta).
@@ -152,6 +152,7 @@ impl Door {
             } else {
                 self.desired_yaw = normalize_axis(self.closed_yaw + self.delta_yaw);
                 self.open = true;
+                self.timers.push(SWING_TIME);
             }
             self.collision = false;
         } else {
@@ -275,7 +276,7 @@ mod tests {
         assert!(near(d.yaw, 180.0) && d.collision);
     }
 
-    #[test] fn a_close_blocked_by_the_pawn_is_refused_after_its_sound_and_leaves_the_collision_off() {
+    #[test] fn a_close_blocked_by_the_pawn_is_refused_after_its_sound_and_the_door_stays_usable() {
         let mut d = Door::new(0.0, false);
         d.interact(Vec3::Y, &mut free);
         run(&mut d, 0.5, &mut free);
@@ -284,9 +285,12 @@ mod tests {
         assert_eq!(tested, vec![0.0], "vfunc_364 runs with the door at the closed rotation");
         assert_eq!(ev, vec![DoorEvent::Sound { opening: false }], "vfunc_421 played before the test");
         assert!(d.open && near(d.desired_yaw, 90.0), "stays open");
-        assert!(!d.collision && d.timers.is_empty(), "no FUN_1404c2ed0: the collision stays off");
+        assert!(!d.collision && !d.interactable() && d.timers.len() == 1, "the collision is off for the swing back");
         run(&mut d, 1.0, &mut free);
-        assert!(near(d.yaw, 90.0) && !d.collision);
+        assert!(near(d.yaw, 90.0) && d.collision && d.interactable() && d.open, "a pawn in the way never leaves the door unusable");
+        let ev = d.interact(Vec3::Y, &mut free);
+        assert_eq!(ev, vec![DoorEvent::Sound { opening: false }]);
+        assert!(!d.open && near(d.desired_yaw, 0.0));
     }
 
     #[test] fn a_door_that_ends_its_close_on_the_pawn_bounces_open_without_an_instigator() {

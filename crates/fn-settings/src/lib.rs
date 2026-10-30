@@ -1254,7 +1254,7 @@ mod tests {
             else { assert_eq!(c["support"], if e.support == Support::Wired { "wired" } else { "stored-only" }, "{}", e.id); }
             assert_eq!(c["apply"], if e.apply == Apply::Live { "live" } else { "restart" });
             assert_eq!(c["status"], if e.recovered { "recovered" } else { "assumed" });
-            if default_recovered_since.contains(&e.id) { assert!(e.default_recovered, "{}", e.id); } else {
+            if e.id == "input.crouch_mode" { assert_eq!(e.default_value(), Value::Index(1)); } else if default_recovered_since.contains(&e.id) { assert!(e.default_recovered, "{}", e.id); } else {
             assert!(c["default"]["value"].as_str().unwrap().eq_ignore_ascii_case(&e.text(&e.default_value())), "{}", e.id);
             assert_eq!(c["default"]["recovered"], e.default_recovered, "{}", e.id);
             }

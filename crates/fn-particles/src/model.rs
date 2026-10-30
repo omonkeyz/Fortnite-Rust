@@ -112,6 +112,30 @@ pub enum TypeData {
     Mesh { mesh: String, roll_pitch_yaw: Dist, override_material: bool },
     /// `ParticleModuleTypeDataGpu`: the same modules, simulated on the GPU in the original (sprites only).
     Gpu(GpuInfo),
+    Ribbon(RibbonInfo),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RibbonInfo {
+    pub max_tessellation_between_particles: i32,
+    pub max_particle_in_trail_count: i32,
+    pub tiling_distance: f32,
+    pub distance_tessellation_step_size: f32,
+    pub enable_tangent_diff_interp_scale: bool,
+    pub tangent_tessellation_scalar: f32,
+    pub tangent_spawning_scalar: f32,
+    pub spawn_initial_particle: bool,
+    pub render_axis: u8,
+    pub enable_previous_tangent_recalculation: bool,
+    pub tangent_recalculation_every_frame: bool,
+    pub dead_trails_on_deactivate: bool,
+}
+
+impl Default for RibbonInfo {
+    fn default() -> Self {
+        RibbonInfo { max_tessellation_between_particles: 25, max_particle_in_trail_count: 500, tiling_distance: 0.0, distance_tessellation_step_size: 15.0, enable_tangent_diff_interp_scale: false,
+            tangent_tessellation_scalar: 5.0, tangent_spawning_scalar: 0.0, spawn_initial_particle: false, render_axis: 0, enable_previous_tangent_recalculation: true, tangent_recalculation_every_frame: false, dead_trails_on_deactivate: true }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,7 +279,7 @@ impl ParticleSystem {
         let mut s = format!("{} ({} emitters, LOD distances {:?})\n", self.name, self.emitters.len(), self.lod_distances);
         for e in &self.emitters {
             let Some(l) = e.lods.first() else { s.push_str(&format!("  {}: no LOD\n", e.name)); continue };
-            let td = match &l.type_data { TypeData::Sprite => "sprite".to_string(), TypeData::Mesh { mesh, .. } => format!("mesh {}", mesh.rsplit('/').next().unwrap_or(mesh)), TypeData::Gpu(g) => format!("gpu-sprite max {} collision {}", g.max_particle_count, g.collision) };
+            let td = match &l.type_data { TypeData::Sprite => "sprite".to_string(), TypeData::Mesh { mesh, .. } => format!("mesh {}", mesh.rsplit('/').next().unwrap_or(mesh)), TypeData::Gpu(g) => format!("gpu-sprite max {} collision {}", g.max_particle_count, g.collision), TypeData::Ribbon(r) => format!("ribbon tiling {} max {}", r.tiling_distance, r.max_particle_in_trail_count) };
             let bursts: Vec<String> = l.spawn.bursts.iter().map(|b| format!("{}(low {})@{}", b.count, b.count_low, b.time)).collect();
             s.push_str(&format!("  {} [{}] mat {} bursts [{}] rate {:?} loops {} dur {} local {} align {:?} sort {:?} sub {}x{} lods {} enabled {} modules {} flags [{}]\n", e.name, td, l.required.material.rsplit('/').next().unwrap_or(""), bursts.join(","), l.spawn.rate.mean(0.0, 1)[0],
                 l.required.emitter_loops, l.required.emitter_duration, l.required.use_local_space, l.required.screen_alignment, l.required.sort_mode, l.required.sub_images_h, l.required.sub_images_v, e.lods.len(), l.enabled, l.modules.len(), e.lods.iter().map(|l| format!("{}{}", if l.enabled { "L" } else { "l" }, if l.required.required_enabled { "R" } else { "r" })).collect::<Vec<_>>().join(" ")));

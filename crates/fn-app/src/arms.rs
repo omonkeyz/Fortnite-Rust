@@ -70,7 +70,7 @@ pub fn montage_fx(m: &fn_anim::montage::AnimMontage) -> Vec<FxNotify> {
     v
 }
 fn static_slot(s: &str) -> Option<&'static str> {
-    Some(match s { "UpperBody" => "UpperBody", "MeshRotationUpperBody" => "MeshRotationUpperBody", "FullBody" => "FullBody", "FullBodyInPlace" => "FullBodyInPlace", "DefaultSlot" => "DefaultSlot", _ => return None })
+    Some(match s { "UpperBody" => "UpperBody", "MeshRotationUpperBody" => "MeshRotationUpperBody", "FullBody" => "FullBody", "FullBodyInPlace" => "FullBodyInPlace", "AdditiveFullBody" => "AdditiveFullBody", "DefaultSlot" => "DefaultSlot", _ => return None })
 }
 fn strip(p: &str) -> String { p.split('.').next().unwrap_or(p).to_owned() }
 impl MontageData {
@@ -172,7 +172,10 @@ impl AmmoRules {
 pub struct ArmsData { pub guns: Vec<GunData>, pub healables: Vec<HealableData>, pub start_bandages: u32, pub ammo: AmmoRules, /// `CoreAnims_Male` key of the consumables (`B_UtilityItem_Generic` CDO: TrapPlacement = the unarmed NoWep set; `loadout_consumable`).
     pub consumable_core: &'static str,
     /// CONTAINERS: `GA_DefaultPlayer_InteractSearch`'s montage (`Search`, UpperBody) played while a container search hold runs; None = not loaded (reported).
-    pub search: Option<MontageData> }
+    pub search: Option<MontageData>,
+    pub door: Option<MontageData>,
+    pub interact_curves: [Vec<(String, Vec<(f32, f32)>)>; 2],
+    pub death: Option<crate::death_hook::DeathData> }
 
 /// The `CoreAnims_Male` key as the animation graph's static table spells it (every key of the generated table is accepted).
 fn core_key(c: &str) -> Result<&'static str, String> { fn_animgraph::CORE_ANIMS_MALE.iter().map(|(k, _)| *k).find(|k| *k == c).ok_or_else(|| format!("unsupported weapon core animation {c}")) }
@@ -207,7 +210,12 @@ impl ArmsData {
         let search = match r.montages.get(fn_pose::loadout::SEARCH_MONTAGE).ok_or_else(|| format!("montage {} was not loaded", fn_pose::loadout::SEARCH_MONTAGE)).and_then(|m| MontageData::from_anim_in(m, &r.sequences)) {
             Ok(d) => Some(d), Err(e) => { eprintln!("[arms] search montage unavailable ({e}): no search animation"); None }
         };
-        Ok(ArmsData { guns, healables, start_bandages: r.items[3].quantity, ammo, consumable_core, search })
+        let door = match r.montages.get(fn_pose::loadout::DOOR_OPEN_MONTAGE).ok_or_else(|| format!("montage {} was not loaded", fn_pose::loadout::DOOR_OPEN_MONTAGE)).and_then(|m| MontageData::from_anim_in(m, &r.sequences)) {
+            Ok(d) => Some(d), Err(e) => { eprintln!("[arms] door-open montage unavailable ({e}): no tap interaction animation"); None }
+        };
+        let interact_curves = [fn_pose::loadout::SEARCH_MONTAGE, fn_pose::loadout::DOOR_OPEN_MONTAGE].map(|m| r.montage_curves.get(m).cloned().unwrap_or_default());
+        let death = match crate::death_hook::DeathData::from_resources(r) { Ok(d) => Some(d), Err(e) => { eprintln!("[arms] death / hit-react montages unavailable ({e})"); None } };
+        Ok(ArmsData { guns, healables, start_bandages: r.items[3].quantity, ammo, consumable_core, search, door, interact_curves, death })
     }
 }
 
@@ -264,6 +272,7 @@ pub struct Arms {
     pub health: f32, pub shield: f32,
     /// Magazine / inventory ammo stack per firearm (gun index = `data.guns` index; grows with [`Arms::add_gun`]).
     pub mags: Vec<u32>, pub reserve: Vec<u32>,
+    pub loose_ammo: Vec<(String, u32)>,
     /// Stack size per healable (HEALABLE_ITEMS order) and the healable occupying quickbar slot 5.
     pub stock: Vec<u32>, pub slot5: usize,
     /// INVENTORY HOOK (see `arms/inventory_ops.rs`): which healable (index into `data.healables`) and how many of it (one stack) each quickbar slot holds when it holds `QuickbarItem::Healable`;
@@ -291,6 +300,7 @@ pub struct Arms {
     pub sounds: Vec<ArmsSound>,
     /// HEAL FX: particle notifies of this frame's montages (drained by the front-end with [`Arms::take_particles`]; `heal_fx.rs` spawns them).
     pub particles: Vec<fn_anim::sequence::ParticleNotify>,
+    pub throws: Vec<usize>,
     /// Counters for tests / reports.
     pub shots: Vec<u32>,
     /// BUILD ANIM HOOK: montages stopped by a blueprint equip, blending out (see [`Arms::holster`]).
@@ -299,6 +309,7 @@ pub struct Arms {
     blueprint: bool,
     /// CONTAINERS: the search montage instance: (montage time, `Some(seconds since the stop, weight at the stop)` while blending out).
     interact: Option<(f32, Option<(f32, f32)>)>,
+    interact_use: Option<f32>,
 }
 /// BUILD ANIM HOOK: a montage instance stopped by `Montage_Play` of another montage of its group (UE 4.16 `FAnimMontageInstance::Stop(NewMontage->BlendIn)`):
 /// it keeps advancing at its play rate while its weight blends from `w0` to 0 over `dur` with the new montage's BlendIn option.
@@ -334,19 +345,20 @@ impl Arms {
         let n = data.guns.len();
         let mut stock = vec![0; data.healables.len()]; stock[0] = data.start_bandages; // the starter loadout grants five bandages (healable 0)
         let cooldown_until = vec![0.; data.healables.len()];
-        Arms { data, policy, selected: 0, quickbar: [Some(QuickbarItem::Pickaxe), Some(QuickbarItem::Gun(0)), Some(QuickbarItem::Gun(1)), Some(QuickbarItem::Gun(2)), Some(QuickbarItem::Healable), None], health: 100., shield: 0., mags, reserve, slot_stack: [0, 0, 0, 0, stock[0], 0], slot_heal: [0; SLOT_COUNT], stash: vec![], prev_selected: None, drops: vec![], stock, slot5: 0, cooldown_until, effects: vec![], clock: 0., firing_loop: None, queued: false, refire: None, interrupt_retry: None, last_fire: vec![-10.; n], fire_t: None, fire_prev: false, aiming: false, act: Act::None, last_transfer: f32::NEG_INFINITY, burst: None, auto_reload: None, events: vec![], sounds: vec![], particles: vec![], shots: vec![0; n], fades: vec![], blueprint: false, interact: None }
+        Arms { data, policy, selected: 0, quickbar: [Some(QuickbarItem::Pickaxe), Some(QuickbarItem::Gun(0)), Some(QuickbarItem::Gun(1)), Some(QuickbarItem::Gun(2)), Some(QuickbarItem::Healable), None], health: 100., shield: 0., mags, reserve, loose_ammo: vec![], slot_stack: [0, 0, 0, 0, stock[0], 0], slot_heal: [0; SLOT_COUNT], stash: vec![], prev_selected: None, drops: vec![], stock, slot5: 0, cooldown_until, effects: vec![], clock: 0., firing_loop: None, queued: false, refire: None, interrupt_retry: None, last_fire: vec![-10.; n], fire_t: None, fire_prev: false, aiming: false, act: Act::None, last_transfer: f32::NEG_INFINITY, burst: None, auto_reload: None, events: vec![], sounds: vec![], particles: vec![], throws: vec![], shots: vec![0; n], fades: vec![], blueprint: false, interact: None, interact_use: None }
     }
     pub fn gun_index(&self) -> Option<usize> { match self.quickbar.get(self.selected).copied().flatten() { Some(QuickbarItem::Gun(g)) => Some(g), _ => None } }
     /// Called after the recovered camera targeting driver resolves its state for this frame.
     pub fn set_aiming(&mut self, aiming: bool) { self.aiming = aiming; }
     /// Quickbar slot 5 holds the consumable.
     pub fn consumable_selected(&self) -> bool { self.quickbar.get(self.selected).copied().flatten() == Some(QuickbarItem::Healable) }
+    pub fn throwable_selected(&self) -> bool { self.consumable_selected() && self.data.healables.get(self.slot5).is_some_and(|h| matches!(h.rule, fn_pose::loadout_stats::HealRule::Throw { .. })) }
     pub fn pickaxe_selected(&self) -> bool { self.quickbar.get(self.selected).copied().flatten() == Some(QuickbarItem::Pickaxe) }
     /// Appends a firearm installed after start-up (gun index = the previous `data.guns.len()`): a full magazine, the ammo stack its ammo type already has (firearms sharing an ammo item share
     /// the stack) or the starting count, and the ammo-stack rules. Does NOT put it on the quickbar (see [`Arms::give_gun`]).
     pub fn add_gun(&mut self, gun: GunData, max_stack: u32, drop_count: u32, starting: u32) -> usize {
         let g = self.data.guns.len();
-        let shared = self.data.guns.iter().position(|o| o.def.ammo == gun.def.ammo).map(|h| self.reserve[h]);
+        let shared = self.data.guns.iter().position(|o| o.def.ammo == gun.def.ammo).map(|h| self.reserve[h]).or_else(|| self.take_loose_ammo(&gun.def.ammo).map(|n| n.min(max_stack)));
         self.mags.push(gun.def.clip_size);
         self.reserve.push(shared.unwrap_or(starting.min(max_stack)));
         self.shots.push(0); self.last_fire.push(-10.);
@@ -410,6 +422,7 @@ impl Arms {
     pub fn take_events(&mut self) -> Vec<String> { std::mem::take(&mut self.events) }
     pub fn take_sounds(&mut self) -> Vec<ArmsSound> { std::mem::take(&mut self.sounds) }
     pub fn take_particles(&mut self) -> Vec<fn_anim::sequence::ParticleNotify> { std::mem::take(&mut self.particles) }
+    pub fn take_throws(&mut self) -> Vec<usize> { std::mem::take(&mut self.throws) }
     /// Emits the sound notifies in `fx` (a montage's) that lie in the montage-time window `(from, to]`.
     fn emit_fx(&mut self, gun: Option<usize>, fx: &[FxNotify], from: f32, to: f32) {
         for n in fx {
@@ -483,7 +496,28 @@ impl Arms {
         if t < a + d { t } else { a + (t - a).rem_euclid(d) }
     }
     fn blend_in_weight(m: &MontageData, t: f32) -> f32 { if m.blend_in.0 <= 1e-6 { 1. } else { MontageData::ease(m.blend_in.1, t / m.blend_in.0) } }
-    pub fn mask_right_arm(&self) -> f32 { self.search_montage().map_or(0., |m| m.weight) }
+    pub fn play_interact_use(&mut self) {
+        if self.data.door.is_none() || self.interact_use.is_some() { return; }
+        self.interact_use = Some(0.);
+        self.log("interact: DoorOpen montage starts".into());
+    }
+    fn interact_use_montage(&self) -> Option<Montage> {
+        let (m, t) = (self.data.door.as_ref()?, self.interact_use?);
+        let (clip, time) = m.sample(t.min(m.length))?;
+        let w = m.weight(t);
+        (w > 0.).then_some(Montage { slot: m.slot, clip, time, weight: w, blend: m.blend })
+    }
+    pub fn interact_curve(&self, name: &str) -> Option<(f32, f32)> {
+        let mut acc: Option<(f32, f32)> = None;
+        let mut add = |i: usize, t: f32, w: f32| {
+            let Some((_, keys)) = self.data.interact_curves[i].iter().find(|(n, _)| n == name) else { return };
+            let (s, ws) = acc.unwrap_or((0., 0.)); acc = Some((s + crate::build_anim::curve_at(keys, t) * w, ws + w));
+        };
+        if let (Some(m), Some((t, _))) = (self.data.search.as_ref(), self.interact) { if let Some(w) = self.search_montage().map(|x| x.weight) { add(0, Self::search_time(m, t), w); } }
+        if let Some(t) = self.interact_use { if let Some(w) = self.interact_use_montage().map(|x| x.weight) { add(1, t, w); } }
+        acc
+    }
+    pub fn mask_right_arm(&self) -> f32 { self.interact_curve("MaskRightArm").map_or(0., |(s, _)| s) }
     fn search_montage(&self) -> Option<Montage> {
         let (m, (t, stop)) = (self.data.search.as_ref()?, self.interact?);
         let mt = Self::search_time(m, t);
@@ -625,6 +659,7 @@ impl Arms {
             let stop = stop.map(|(e, w)| (e + dt, w));
             self.interact = if stop.is_some_and(|(e, _)| e >= m.blend_out.0) { None } else { Some((t2, stop)) };
         }
+        if let (Some(m), Some(t)) = (self.data.door.as_ref(), self.interact_use) { self.interact_use = (t + dt < m.length).then_some(t + dt); }
         if let Some(h) = inp.set_health { self.health = h.clamp(0., MAX_HEALTH); let s = format!("health set to {}", self.health); self.log(s); }
         if let Some(sh) = inp.set_shield { self.shield = sh.clamp(0., MAX_SHIELD); let s = format!("shield set to {}", self.shield); self.log(s); }
         if let Some((idx, n)) = inp.give { if idx < self.stock.len() { self.set_consumable_slot(idx, n); let s = format!("[dev] slot 5 = {} x{n}", self.data.healables[idx].name); self.log(s); } }
@@ -686,7 +721,7 @@ impl Arms {
             HealRule::Bandage { healing_cap, .. } => recovered_healing::bandage_health_gate(self.health, *healing_cap),
             HealRule::Medkit { .. } => (self.health.ceil()) < MAX_HEALTH,
             HealRule::Shield { .. } => (self.shield.ceil()) < MAX_SHIELD,
-            HealRule::Purple => true,
+            HealRule::Purple | HealRule::Throw { .. } => true,
         };
         if ok { Ok(()) } else { Err(format!("{} refused: Athena.Ability.Failed.Consumable (health {} shield {})", h.name, self.health, self.shield)) }
     }
@@ -698,6 +733,7 @@ impl Arms {
             HealRule::Medkit { healing_amount } => *healing_amount as i32,
             HealRule::Shield { shielding_amount } => (MAX_SHIELD - self.shield).clamp(0., *shielding_amount).trunc() as i32,
             HealRule::Purple => 1,
+            HealRule::Throw { .. } => 0,
         }
     }
     fn apply_mod(&mut self, attribute: &str, amount: f32) {
@@ -750,12 +786,20 @@ impl Arms {
                 self.emit_fx(None, &h.montage.fx, t0, t.min(h.montage.length));
                 let cue = if committed { cue } else { cue + dt };
                 let notify = h.montage.notify("TriggerAbility").unwrap_or(h.montage.length);
+                let mut return_throw = false;
                 if !committed && t >= notify {
                     committed = true; // K2_CommitAbility, then BP_ApplyGameplayEffectToOwner, then K2_RemoveGameplayCue(Equipping)
                     if self.stock[idx] >= h.cost {
                         self.stock[idx] -= h.cost;
                         self.consume_from_held_stack(idx, h.cost); // INVENTORY HOOK: the held slot's stack pays the cost
                         if let Some(c) = h.cooldown { self.cooldown_until[idx] = self.clock + c; }
+                        if matches!(h.rule, fn_pose::loadout_stats::HealRule::Throw { .. }) {
+                            self.throws.push(idx);
+                            let left = self.stock[idx];
+                            self.log(format!("{} TriggerAbility notify at montage {notify:.4}: commit (-{} item, {left} left), projectile spawned", h.name, h.cost));
+                            return_throw = true;
+                        }
+                        if !return_throw {
                         let stacks = self.stacks(idx);
                         let (hb, sb) = (self.health, self.shield);
                         let mods: Vec<(String, f32)> = h.effect.mods.iter().map(|m| (m.attribute.clone(), m.magnitude * stacks as f32)).collect();
@@ -765,6 +809,7 @@ impl Arms {
                         }
                         let left = self.stock[idx];
                         self.log(format!("{} TriggerAbility notify at montage {notify:.4}: commit (-{} item, {left} left), effect {} x{stacks} stacks: health {hb} -> {}, shield {sb} -> {}; cue removed after {:.2}s of {}s", h.name, h.cost, h.effect.class.rsplit('/').next().unwrap_or_default(), self.health, self.shield, cue, h.trigger_duration));
+                        }
                     }
                 }
                 if t >= h.montage.length { let n = h.name.clone(); self.log(format!("{n} use finished")); Act::None } else { Act::Heal { idx, t, cue, committed } }
@@ -801,6 +846,7 @@ impl Arms {
         if let Act::Heal { idx, t, .. } = &self.act { out.extend(mk(&self.data.healables[*idx].montage, *t)); }
         out.extend(self.fade_montages()); // BUILD ANIM HOOK
         out.extend(self.search_montage()); // CONTAINERS: GA_DefaultPlayer_InteractSearch's Search montage
+        out.extend(self.interact_use_montage());
         out
     }
     /// Maps the player reload montage time onto the weapon's own reload montage by section (same section index, same offset inside it).
@@ -847,7 +893,7 @@ impl Arms {
     /// `AthenaEquipProgress` (`HUD.Athena.EquipProgress`): while a consumable ability runs and its `GameplayCue.Athena.Equipping` cue is up (added at activation with
     /// `RawMagnitude = TriggerDuration`, removed when the ability triggers or ends): (seconds since the cue started, duration).
     pub fn equip_progress(&self) -> Option<(f32, f32)> {
-        match &self.act { Act::Heal { idx, cue, committed: false, .. } => Some((*cue, self.data.healables[*idx].trigger_duration)), _ => None }
+        match &self.act { Act::Heal { idx, cue, committed: false, .. } if self.data.healables[*idx].trigger_duration > 0. => Some((*cue, self.data.healables[*idx].trigger_duration)), _ => None }
     }
     /// WIDGETS3 HOOK, `QuickbarSlotCooldown` feed: the running cooldown of each primary quickbar slot's item. A reloading firearm is a `WeaponReloading` cooldown whose time left
     /// comes from the recovered native `AFortWeapon::GetReloadProgress` (`fn_weapons::recovered_reload`); a consumable under its cooldown GameplayEffect (PurpleStuff) is an
@@ -892,7 +938,7 @@ pub(crate) mod tests {
         let shotgun_reload = m("UpperBody", 2.733, vec![seg("intro", 0., 0., 0.7, 1., 1), seg("loop", 0.7, 0., 0.7333, 1., 1), seg("outro", 1.4333, 0., 1.3, 1., 1)], vec![("TriggerAbility", 0.6744), ("TriggerAbility", 1.4031)]);
         let sg = gun(def("SG", 5, 0.7, 4.84, true, Trigger::NATIVE_DEFAULT), 104, shotgun_reload);
         let sn = gun(def("SN", 1, 0.33, 3.0, false, Trigger::NATIVE_DEFAULT), 102, m("UpperBody", 3., vec![seg("rl3", 0., 0., 3., 1., 1)], vec![("TriggerAbility", 2.2)]));
-        ArmsData { guns: vec![ar, sg, sn], healables: healables(), start_bandages: 5, ammo: AmmoRules::default(), consumable_core: "TrapPlacement", search: None }
+        ArmsData { guns: vec![ar, sg, sn], healables: healables(), start_bandages: 5, ammo: AmmoRules::default(), consumable_core: "TrapPlacement", search: None, door: None, interact_curves: Default::default(), death: None }
     }
     /// The four 1.8 healables with the numbers the data holds (bandage 75 / 15, medkit 100, shields 50, purple 24 x 1 per second + a 26 s cooldown effect).
     fn healables() -> Vec<HealableData> {
@@ -904,6 +950,7 @@ pub(crate) mod tests {
             mk("Medkit", HealRule::Medkit { healing_amount: 100. }, 10., 9.5, 10.5, fx("GE_Bandage", &[("Healing", 1.)], None, None), None),
             mk("Shields", HealRule::Shield { shielding_amount: 50. }, 5., 4.5, 5.2, fx("GE_Shields", &[("CurrentShield", 1.)], None, None), None),
             mk("Purple", HealRule::Purple, 2., 1.9, 2.4, fx("GE_Purple", &[("Healing", 1.), ("CurrentShield", 1.)], Some(24.), Some(1.)), Some(26.)),
+            mk("Grenade", HealRule::Throw { initial_speed: 4000., gravity_scale: 0.7, projectile: "B_Prj_Athena_Grenade".into(), activation_sound: None }, 0., 0.42, 1.2, fx("", &[], None, None), None),
         ]
     }
     fn run(a: &mut Arms, secs: f32, inp: ArmsInput) { let n = (secs * 60.).round() as u32; for _ in 0..n { a.update(1. / 60., &inp); } }
@@ -913,12 +960,39 @@ pub(crate) mod tests {
     /// Picks up `n` rounds for each firearm (the three ammo items: medium bullets, shells, heavy bullets).
     fn stocked(a: &mut Arms, n: [u32; 3]) { for g in 0..3 { a.update(0., &ArmsInput { give_ammo: Some((g, n[g])), ..NONE }); } }
 
+    #[test] fn a_tap_interaction_plays_door_open_once_and_its_curves_release_the_hand_ik() {
+        let mut d = data();
+        d.door = Some(MontageData { blend_out: (0.25, 2), blend_in: (0.15, 2), ..m("UpperBody", 0.8, vec![seg("DoorOpen", 0., 0., 0.8, 1., 1)], vec![]) });
+        d.interact_curves[1] = vec![("BothHandFK".into(), vec![(0., 1.)]), ("MaskRightArm".into(), vec![(0., 1.)])];
+        let mut a = Arms::new(d, ASSUMED);
+        assert_eq!(a.interact_curve("BothHandFK"), None);
+        a.play_interact_use();
+        run(&mut a, 0.4, NONE);
+        let (s, w) = a.interact_curve("BothHandFK").unwrap();
+        assert!((s - 1.).abs() < 1e-4 && (w - 1.).abs() < 1e-4, "{s} {w}");
+        assert!(a.mask_right_arm() > 0.99);
+        assert!(a.montages().iter().any(|x| x.clip == "DoorOpen"));
+        a.play_interact_use();
+        run(&mut a, 0.45, NONE);
+        assert_eq!(a.interact_curve("BothHandFK"), None, "the retap did not restart it: it ended at 0.8 s");
+        assert_eq!(a.mask_right_arm(), 0.);
+    }
     #[test] fn default_policy_leaves_unrecovered_behaviour_out() {
         let mut a = Arms::new(data(), Policy::default()); assert_eq!(a.reserve, [0, 0, 0], "no ammo is granted by the starter loadout");
         a.update(1. / 60., &ArmsInput { select: Some(2), ..NONE }); run(&mut a, 0.8, NONE); run(&mut a, 0.2, FIRE); assert_eq!(a.shots[1], 1, "TriggerType not serialized = native default OnPress: exactly one shot per press, held fire does not repeat");
         a.mags[1] = 2; a.update(1. / 60., &ArmsInput { reload_press: true, ..NONE }); assert!(!a.is_reloading()); assert_eq!(a.mags[1], 2);
         a.update(1. / 60., &ArmsInput { select: Some(1), ..NONE }); run(&mut a, 2.0, FIRE); assert!(a.shots[0] >= 2, "the serialized Automatic AR fires (after the shotgun's 1/0.7 s shared cooldown)");
         a.update(1. / 60., &ArmsInput { select: Some(4), set_health: Some(40.), ..NONE }); run(&mut a, 0.1, FIRE); run(&mut a, 5.0, NONE); assert_eq!((a.health, a.stock[0]), (55., 4), "the bandage heal needs no switch: Blueprint stacks x GE magnitude 1.0");
+    }
+    #[test] fn grenade_throws_once_at_the_trigger_notify_and_pays_one_without_a_progress_ring() {
+        let mut a = Arms::new(data(), Policy::default());
+        a.update(0., &ArmsInput { give: Some((4, 3)), ..NONE });
+        a.update(1. / 60., &ArmsInput { select: Some(4), set_health: Some(50.), ..NONE });
+        a.update(1. / 60., &FIRE);
+        assert!(a.is_healing() && a.equip_progress().is_none());
+        run(&mut a, 0.3, NONE); assert!(a.take_throws().is_empty() && a.stock[4] == 3);
+        run(&mut a, 0.2, NONE); assert_eq!((a.take_throws(), a.stock[4], a.health), (vec![4], 2, 50.));
+        run(&mut a, 1.0, NONE); assert!(!a.is_healing() && a.take_throws().is_empty());
     }
     #[test] fn starter_state_is_full_magazines_and_five_bandages() {
         let a = Arms::new(data(), ASSUMED); assert_eq!((a.mags.clone(), a.reserve.clone(), a.stock[0], a.selected), (vec![30, 5, 1], vec![0, 0, 0], 5, 0), "the game mode's StartingItems grant no ammo");
@@ -1064,6 +1138,24 @@ pub(crate) mod tests {
         assert!(a.take_events().iter().any(|e| e.contains("NoInventoryAmmo")));
         stocked(&mut a, [7, 0, 0]); a.update(1. / 60., &ArmsInput { reload_press: true, ..NONE }); assert!(a.is_reloading());
         run(&mut a, 2.5, NONE); assert_eq!((a.mags[0], a.reserve[0]), (10, 0), "a short stack moves what exists");
+    }
+    #[test] fn ammo_without_a_firearm_goes_to_the_pool_and_joins_a_later_firearm() {
+        let mut a = Arms::new(data(), ASSUMED);
+        let light = "/Game/Athena/Items/Ammo/AthenaAmmoDataBulletsLight";
+        assert_eq!(a.pickup_ammo_item(light, 999, 60), (60, 0));
+        assert_eq!(a.pickup_ammo_item(light, 999, 990), (939, 51));
+        assert_eq!(a.ammo_count(light), 999);
+        assert_eq!(a.pickup_ammo_item(light, 999, 5), (0, 5));
+        let mut g = a.data.guns[0].clone(); g.def.ammo = format!("{light}.AthenaAmmoDataBulletsLight");
+        let idx = a.add_gun(g, 999, 30, 0);
+        assert_eq!(a.reserve[idx], 999);
+        assert!(a.loose_ammo.is_empty());
+        assert_eq!(a.pickup_ammo_item("ammo-AR", 999, 7).0, 7);
+        assert_eq!(a.reserve[0], 7);
+        let mut a = Arms::new(data(), ASSUMED);
+        a.pickup_ammo_item(light, 999, 40);
+        assert_eq!(a.drop_loose_ammo(0, 15), Ok(15));
+        assert_eq!(a.ammo_count(light), 25);
     }
     #[test] fn ammo_pickups_are_capped_at_the_item_max_stack() {
         let mut d = data(); d.ammo = AmmoRules { max_stack: vec![999; 3], drop_count: vec![12, 4, 4], starting: vec![0; 3] };

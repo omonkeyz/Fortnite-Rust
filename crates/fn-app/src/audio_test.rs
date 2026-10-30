@@ -157,8 +157,8 @@ fn rows(e: &SoundEvent) -> Vec<&'static str> {
         SoundEvent::PropDeath { .. } => vec![], // BUILDING: the prop's own DeathSound path, no events::TABLE row
         SoundEvent::Weapon { id, .. } | SoundEvent::WeaponLoop { id, .. } => vec![*id], // WEAPON AUDIO HOOK
         SoundEvent::WeaponLoopStop { .. } | SoundEvent::PickupCue { .. } => vec![],
-        SoundEvent::BuildingCue { .. } | SoundEvent::BuildingLoop { .. } | SoundEvent::BuildingLoopStop { .. } => vec![], // BUILDING HOOK: direct cue paths, no events::TABLE row
-        SoundEvent::ContainerLoop { .. } | SoundEvent::ContainerLoopStop { .. } | SoundEvent::LoopMove { .. } => vec![], // CONTAINERS: direct cue paths (chest_hook.rs)
+        SoundEvent::BuildingCue { .. } | SoundEvent::CueVolume { .. } | SoundEvent::BuildingLoop { .. } | SoundEvent::BuildingLoopStop { .. } => vec![], // BUILDING HOOK: direct cue paths, no events::TABLE row
+        SoundEvent::ContainerLoop { .. } | SoundEvent::ContainerLoopStop { .. } | SoundEvent::ContainerLoopFadeIn { .. } | SoundEvent::LoopMove { .. } | SoundEvent::LoopGain { .. } | SoundEvent::ParamLoopFadeIn { .. } | SoundEvent::LoopParam { .. } => vec![], // CONTAINERS: direct cue paths (chest_hook.rs)
         // Front-end button sounds (lobby / top bar / locker): played from the widgets' own serialized overrides, no events::TABLE row.
         SoundEvent::TopBarHover | SoundEvent::TopBarPress | SoundEvent::LobbyPlayHover | SoundEvent::LobbyPlayPress | SoundEvent::LockerItemHover | SoundEvent::LockerItemPress => vec![],
     }

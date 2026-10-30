@@ -22,7 +22,7 @@ pub struct ShadowScalability {
     pub shadow_quality: i32,
     /// `r.Shadow.CSM.MaxCascades` (-> `View.MaxShadowCascades`, SceneRendering.cpp:485).
     pub csm_max_cascades: i32,
-    /// `r.Shadow.MaxResolution`: per-object / spot / point shadows only; this renderer has none, so nothing reads it.
+    /// `r.Shadow.MaxResolution`: per-object / spot / point shadows only; the local lights are unshadowed here (local_lights.rs), so nothing reads it.
     pub max_resolution: u32,
     /// `r.Shadow.MaxCSMResolution`: the CSM shadow buffer edge (ShadowSetup.cpp:2648).
     pub max_csm_resolution: u32,
@@ -42,7 +42,7 @@ pub struct ShadowScalability {
     /// `r.VolumetricFog.GridPixelSize` / `r.VolumetricFog.GridSizeZ`; @0 / @1 do not set them (cvar defaults 16 / 64, `fog::engine`), and the fog is off there.
     pub volumetric_fog_grid_pixel_size: u32,
     pub volumetric_fog_grid_size_z: u32,
-    /// `r.LightMaxDrawDistanceScale`: point / spot lights only (SceneVisibility.cpp:2714); this renderer has none, so nothing reads it.
+    /// `r.LightMaxDrawDistanceScale`: point / spot lights only (SceneVisibility.cpp:2714, ShadowRendering.cpp:123); read by local_lights.rs.
     pub light_max_draw_distance_scale: f32,
     /// `r.SimpleForwardShading` (needs `r.SupportSimpleForwardShading` = 1, CookedIniVersion.txt:978): a whole-renderer lighting-path switch of the Low
     /// level; this renderer has no simple-forward path, so nothing reads it (at @0 dynamic shadows are off anyway).
@@ -298,12 +298,24 @@ pub fn post_flags(level: u32) -> (bool, bool, bool) { let p = PostProcessScalabi
 pub struct EffectsScalability {
     /// `r.SSR.Quality` (0 = off).
     pub ssr_quality: i32,
+    pub sss_scale: f32,
+    pub sss_sample_set: u32,
+    pub sss_quality: i32,
+    pub sss_half_res: bool,
+    pub scene_color_format: u32,
 }
 impl EffectsScalability {
     /// `level` 0..3 = Low..Epic, 4 = Cine.
     pub const fn level(level: u32) -> EffectsScalability {
-        match level { 0 | 1 => EffectsScalability { ssr_quality: 0 }, 2 => EffectsScalability { ssr_quality: 2 }, 3 => EffectsScalability { ssr_quality: 3 }, _ => EffectsScalability { ssr_quality: 4 } }
+        match level {
+            0 => EffectsScalability { ssr_quality: 0, sss_scale: 0., sss_sample_set: 0, sss_quality: 0, sss_half_res: true, scene_color_format: 3 },
+            1 => EffectsScalability { ssr_quality: 0, sss_scale: 0.75, sss_sample_set: 0, sss_quality: 0, sss_half_res: true, scene_color_format: 3 },
+            2 => EffectsScalability { ssr_quality: 2, sss_scale: 1., sss_sample_set: 1, sss_quality: -1, sss_half_res: true, scene_color_format: 3 },
+            3 => EffectsScalability { ssr_quality: 3, sss_scale: 1., sss_sample_set: 2, sss_quality: 1, sss_half_res: true, scene_color_format: 4 },
+            _ => EffectsScalability { ssr_quality: 4, sss_scale: 1., sss_sample_set: 2, sss_quality: 1, sss_half_res: false, scene_color_format: 4 },
+        }
     }
+    pub fn sss_checkerboard(&self) -> bool { self.scene_color_format != 4 && self.scene_color_format != 5 }
 }
 impl Default for EffectsScalability { fn default() -> Self { EffectsScalability::level(3) } }
 /// The post-process SSR settings of the Athena view: the 1.8 exe `FPostProcessSettings` ctor (crates/fn-exe-defaults/reports/exe-defaults.json); none of the

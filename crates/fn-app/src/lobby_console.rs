@@ -3,7 +3,7 @@
 //! (the 1.8 client has no such command bar); nothing here talks to a server.
 //!
 //! * typing, Backspace / Delete / Left / Right / Home / End, history with Up / Down, Tab autocomplete (command names, item ids / names, slots, amounts) with a
-//!   suggestion list and an argument hint, Enter executes, Esc / F2 closes;
+//!   suggestion list and an argument hint, Enter executes, Esc / ~ closes;
 //! * commands: `help`, `addvbucks <n>`, `setvbucks <n>`, `giveitem <id|name>`, `giveall [outfit|pickaxe|glider]`, `removeitem <id|name>`, `clearitems`, `rotateshop [days|reset]`,
 //!   `setskin <id|name>`, `setpickaxe <id|name>`, `setglider <id|name>`, `equip <slot> <id|name>`, `resetprofile`, `balance`, `owned [category]`, `shop`.
 //!
@@ -126,7 +126,7 @@ pub fn execute(line: &str, env: &mut Env) -> Effects {
     match sp.name {
         "help" => {
             if rest.is_empty() {
-                fx.say(LineKind::Info, "commands (Tab completes, Up / Down = history, Esc / F2 closes):");
+                fx.say(LineKind::Info, "commands (Tab completes, Up / Down = history, Esc / ~ closes):");
                 for c in COMMANDS.iter() { fx.say(LineKind::Info, format!("  {} {}  - {}", c.name, c.args, c.help)); }
             } else if let Some(c) = spec(rest) {
                 fx.say(LineKind::Info, format!("{} {}", c.name, c.args));
@@ -329,7 +329,7 @@ pub enum Key { Char(char), Backspace, Delete, Left, Right, Home, End, Up, Down, 
 /// Keys of a winit key press: F2 toggles; named editing keys; printable text (`event.text`) becomes `Char`s.
 pub fn keys_from_winit(event: &winit::event::KeyEvent, shift: bool) -> Vec<Key> {
     use winit::keyboard::{Key as WKey, KeyCode, NamedKey, PhysicalKey};
-    if let PhysicalKey::Code(KeyCode::F2) = event.physical_key { return vec![Key::ToggleConsole]; }
+    if let PhysicalKey::Code(KeyCode::Backquote) = event.physical_key { return vec![Key::ToggleConsole]; }
     if let WKey::Named(n) = &event.logical_key {
         let k = match n {
             NamedKey::Backspace => Key::Backspace, NamedKey::Delete => Key::Delete, NamedKey::ArrowLeft => Key::Left, NamedKey::ArrowRight => Key::Right,
@@ -364,7 +364,7 @@ pub struct Console {
 impl Console {
     pub fn new() -> Console {
         let mut c = Console::default();
-        c.log.push((LineKind::Info, "Offline command bar (F2 closes). Type help, or press Tab to complete.".into()));
+        c.log.push((LineKind::Info, "Offline command bar (~ closes). Type help, or press Tab to complete.".into()));
         c
     }
     pub fn is_open(&self) -> bool { self.open }

@@ -25,6 +25,16 @@ use fn_render::fx::*;
 use glam::{DVec3, Vec3};
 use std::collections::{HashMap, HashSet};
 
+static PKG_JSON: std::sync::Mutex<Option<HashMap<String, std::sync::Arc<fn_fx::data::PackageJson>>>> = std::sync::Mutex::new(None);
+pub fn package_json(set: &PakSet, path: &str) -> Option<std::sync::Arc<fn_fx::data::PackageJson>> {
+    if let Some(p) = PKG_JSON.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(path).cloned())) { return Some(p); }
+    let p = std::sync::Arc::new(fn_fx::data::PackageJson::load(set, path).ok()?);
+    if let Ok(mut g) = PKG_JSON.lock() { g.get_or_insert_with(HashMap::new).insert(path.to_owned(), p.clone()); }
+    Some(p)
+}
+#[path = "lobby_ghosts.rs"]
+pub mod ghosts;
+
 /// Shader type names of the unlit translucent / additive base pass without a lightmap (`TBasePassVSFNoLightMapPolicy` / `...PS...`): the permutation the shader maps of all the
 /// pickup-effect materials carry for their particle vertex factories (`pickupmat` listing).
 pub const BASEPASS_VS: &str = "TBasePassVSFNoLightMapPolicy";
@@ -38,12 +48,13 @@ pub const ROTATE_Z_BIAS: f32 = std::f32::consts::FRAC_PI_2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind { Sprite, Mesh, HoloLocal, HoloSkin, /// STATIC ITEM: a section material of a `PickupStaticMesh` (the item's own cooked material, `FLocalVertexFactory`).
-    StaticItem }
+    StaticItem, Ribbon }
 
 struct Entry { path: String, mat: Material, gpu: MaterialGpu, kind: Kind }
 struct Slot { prim: FxBufId, sprite_vf: FxBufId, mat: FxBufId }
 
 pub struct Dxbc {
+    black_hole_checked: HashSet<String>,
     set: PakSet,
     cache: TextureCache,
     shared: SharedBuffers,
@@ -55,8 +66,10 @@ pub struct Dxbc {
     index: HashMap<(String, Kind), Result<usize, String>>,
     meshes: HashMap<String, Result<MeshGpu, String>>,
     holo: HashMap<String, Result<HoloMesh, String>>,
+    holo_normals: HashMap<String, Vec<String>>,
     /// `"<system>/<emitter>"` of the emitters whose `EmitterRenderMode` draws no particles (`ERM_LightsOnly`, `ERM_None`: P_Pickup's `Light` emitter only casts the particle light).
     no_draw: HashSet<String>,
+    render_checked: HashSet<String>,
     pool: Vec<Slot>,
     used: usize,
     binds: HashMap<(usize, usize), Vec<(u32, FxBindId)>>,
@@ -78,6 +91,9 @@ pub struct Dxbc {
     default_mat: Option<Option<Material>>,
     static_dfs: HashMap<String, Option<std::sync::Arc<fn_render::distance_field::MeshDistanceField>>>,
     static_shadow_written: HashSet<usize>,
+    pub no_shadows: bool,
+    beam_vf: FxBufId,
+    key_buf: String,
 }
 
 fn put(b: &mut Vec<u8>, xs: &[f32]) { for x in xs { b.extend(x.to_le_bytes()); } }
@@ -92,6 +108,7 @@ impl Dxbc {
         fx.write_buffer(sprite_vf, &bytes(&sprite_vf_buffer()));
         let prim = fx.create_buffer("pickup primitive (shared)", 32 * 16);
         let fade_buf = fx.create_buffer("pickup PrimitiveFade", 16);
+        let beam_vf = fx.create_buffer("pickup BeamTrailVF", 3 * 16);
         fx.write_buffer(fade_buf, &bytes(&fn_matshader::frame::fade_buffer()));
         let shared = SharedBuffers { view: view_buf, primitive: prim, sprite_vf, light: light_buf };
         let mut no_draw = HashSet::new();
@@ -103,17 +120,51 @@ impl Dxbc {
                 if mode != "ERM_Normal" { no_draw.insert(format!("{sys}/{}", e.props.get("EmitterName").and_then(|v| v.as_str()).unwrap_or(""))); }
             }
         }
-        Ok(Dxbc { fade_buf, no_draw, set, cache: TextureCache::default(), shared, view_buf, light_buf, entries: vec![], index: HashMap::new(), meshes: HashMap::new(), holo: HashMap::new(), pool: vec![], used: 0, binds: HashMap::new(), touched: HashSet::new(), frame: FxFrame::default(), view: None, time: 0., log: vec![],
-            static_ok: HashMap::new(), static_shadows: HashMap::new(), static_vs: HashMap::new(), static_binds: HashMap::new(), static_shadow_binds: HashMap::new(), default_mat: None, static_dfs: HashMap::new(), static_shadow_written: HashSet::new() })
+        Ok(Dxbc { black_hole_checked: HashSet::new(), fade_buf, no_draw, render_checked: HashSet::new(), set, cache: TextureCache::deferred(), shared, view_buf, light_buf, entries: vec![], index: HashMap::new(), meshes: HashMap::new(), holo: HashMap::new(), holo_normals: HashMap::new(), pool: vec![], used: 0, binds: HashMap::new(), touched: HashSet::new(), frame: FxFrame::default(), view: None, time: 0., log: vec![],
+            static_ok: HashMap::new(), static_shadows: HashMap::new(), static_vs: HashMap::new(), static_binds: HashMap::new(), static_shadow_binds: HashMap::new(), default_mat: None, static_dfs: HashMap::new(), static_shadow_written: HashSet::new(), no_shadows: false, beam_vf, key_buf: String::new() })
     }
     pub fn set(&self) -> &PakSet { &self.set }
+    pub fn prefetch_packages(&self, paths: Vec<String>) {
+        let set = self.set.clone();
+        let _ = std::thread::Builder::new().name("emitter packages".into()).spawn(move || { for p in paths { let _ = package_json(&set, &p); } });
+    }
     pub fn skip_non_normal_emitters(&mut self, pkg_path: &str) -> usize {
-        let Ok(pkg) = fn_fx::data::PackageJson::load(&self.set, pkg_path) else { return 0 };
+        let Some(pkg) = package_json(&self.set, pkg_path) else { return 0 };
         let sys = pkg_path.rsplit('/').next().unwrap_or(pkg_path).to_owned();
         let mut n = 0;
         for e in pkg.exports.iter().filter(|e| e.class.starts_with("Particle") && e.class.ends_with("Emitter")) {
             let mode = e.props.get("EmitterRenderMode").and_then(|v| v.as_str()).unwrap_or("ERM_Normal");
             if mode != "ERM_Normal" { self.no_draw.insert(format!("{sys}/{}", e.props.get("EmitterName").and_then(|v| v.as_str()).unwrap_or(""))); n += 1; }
+        }
+        n
+    }
+    pub fn warm_ribbon_materials(&mut self, fx: &mut FxRenderer, pkg_path: &str) -> usize {
+        let Some(pkg) = package_json(&self.set, pkg_path) else { return 0 };
+        let leaf = |v: &serde_json::Value| v.as_str().map(|s| s.rsplit([':', '.']).next().unwrap_or(s).to_owned());
+        let mut mats = vec![];
+        for e in pkg.exports.iter().filter(|e| e.class.starts_with("Particle") && e.class.ends_with("Emitter")) {
+            for l in e.props.get("LODLevels").and_then(|v| v.as_array()).into_iter().flatten().filter_map(leaf) {
+                let Some(lod) = pkg.exports.iter().find(|x| x.name == l) else { continue };
+                let td = lod.props.get("TypeDataModule").and_then(leaf).and_then(|t| pkg.exports.iter().find(|x| x.name == t)).map(|t| t.class.clone()).unwrap_or_default();
+                if !td.contains("TypeDataRibbon") { continue; }
+                let mat = lod.props.get("RequiredModule").and_then(leaf).and_then(|r| pkg.exports.iter().find(|x| x.name == r)).and_then(|r| r.props.get("Material")).and_then(|m| m.as_str()).map(str::to_owned);
+                if let Some(m) = mat { if !mats.contains(&m) { mats.push(m); } }
+            }
+        }
+        let mut n = 0;
+        for m in mats { match self.material(fx, &m, Kind::Ribbon, 0) { Ok(_) => n += 1, Err(e) => { let line = format!("{pkg_path}: ribbon material {m}: {e}"); eprintln!("[pickups-fx] {line}"); self.log.push(line); } } }
+        n
+    }
+    pub fn skip_trail_emitters(&mut self, pkg_path: &str) -> usize {
+        let Some(pkg) = package_json(&self.set, pkg_path) else { return 0 };
+        let sys = pkg_path.rsplit('/').next().unwrap_or(pkg_path).to_owned();
+        let mut n = 0;
+        for e in pkg.exports.iter().filter(|e| e.class.starts_with("Particle") && e.class.ends_with("Emitter")) {
+            let leaf = |v: &serde_json::Value| v.as_str().map(|s| s.rsplit([':', '.']).next().unwrap_or(s).to_owned());
+            let td = e.props.get("LODLevels").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(leaf)
+                .and_then(|l| pkg.exports.iter().find(|x| x.name == l)).and_then(|l| l.props.get("TypeDataModule")).and_then(leaf)
+                .and_then(|t| pkg.exports.iter().find(|x| x.name == t)).map(|t| t.class.clone()).unwrap_or_default();
+            if td.contains("TypeDataBeam") || td.contains("TypeDataAnimTrail") { self.no_draw.insert(format!("{sys}/{}", e.props.get("EmitterName").and_then(|v| v.as_str()).unwrap_or(""))); n += 1; }
         }
         n
     }
@@ -128,6 +179,9 @@ impl Dxbc {
         self.frame = FxFrame::default();
         self.frame.buffer_writes.push((self.view_buf, bytes(&view.view_buffer())));
         self.frame.buffer_writes.push((self.light_buf, bytes(&fn_render::sky_light::fx_light_block()))); // SKY LIGHT: sun + View.SkyIrradianceEnvironmentMap
+        let (f, u) = (Vec3::new(view.forward.x, view.forward.z, view.forward.y), Vec3::new(view.up.x, view.up.z, view.up.y));
+        let r = u.cross(f).normalize_or_zero();
+        self.frame.buffer_writes.push((self.beam_vf, bytes(&[[r.x, r.y, r.z, 0.0], [u.x, u.y, u.z, 0.0], [0.0; 4]])));
     }
 
     pub fn override_light(&mut self, block: &[[f32; 4]; 10]) { self.frame.buffer_writes.push((self.light_buf, bytes(block))); }
@@ -138,7 +192,7 @@ impl Dxbc {
         if let Some(r) = self.index.get(&key) { return r.clone(); }
         let r = (|| -> Result<usize, String> {
             let mat = Material::load(&self.set, path)?;
-            let (vf, layout, instanced) = match kind { Kind::Sprite => (Vf::Sprite, Some(sprite_vertex_buffers_dyn()), false), Kind::Mesh => (Vf::MeshParticle, Some(vertex_buffers(Vf::MeshParticle, num_uv, true)), true), Kind::HoloLocal | Kind::HoloSkin | Kind::StaticItem => return Err("hologram / static item materials are built by holo_entry / static_entry".into()) };
+            let (vf, layout, instanced) = match kind { Kind::Sprite => (Vf::Sprite, Some(sprite_vertex_buffers_dyn()), false), Kind::Mesh => (Vf::MeshParticle, Some(vertex_buffers(Vf::MeshParticle, num_uv, true)), true), Kind::Ribbon => (Vf::BeamTrail, Some(vertex_buffers(Vf::BeamTrail, 0, false)), false), Kind::HoloLocal | Kind::HoloSkin | Kind::StaticItem => return Err("hologram / static item materials are built by holo_entry / static_entry".into()) };
             // PARTICLE LIT PATH (2026-10-05): a lit particle material (the building debris M_Wood_Chips / M_Chunks_Base / M_PropRocks_shards_01, MSM_DefaultLit) takes the
             // sky-light permutation of its particle vertex factory, `TBasePassPSFNoLightMapPolicySkylight` (cooked in their shader maps; a lit material in a scene
             // with a sky light, `TBasePassPS<LightMapPolicyType, bEnableSkyLight>`, UE4.16 BasePassRendering.h:826), resolved by the FX pass' sun + sky term like the building pieces
@@ -150,7 +204,7 @@ impl Dxbc {
             let ps = if mat.flags.shading == "MSM_Unlit" { BASEPASS_PS } else {
                 order.into_iter().find(|ps| mat.cooked.find(vf.type_name(), ps).is_some()).ok_or_else(|| format!("{path}: shading model {}: no {} / {:?} program", mat.flags.shading, vf.type_name(), crate::building_render::PS_TYPES))?
             };
-            let gpu = build_material_layout(&self.set, fx, &mut self.cache, &mat, vf, BASEPASS_VS, ps, num_uv, instanced, self.shared, &[("PrimitiveFade", self.fade_buf)], fn_fx::gpu::LayoutOpts { vertex_layout: layout, ..Default::default() })?;
+            let gpu = build_material_layout(&self.set, fx, &mut self.cache, &mat, vf, BASEPASS_VS, ps, num_uv, instanced, self.shared, &[("PrimitiveFade", self.fade_buf), ("BeamTrailVF", self.beam_vf)], fn_fx::gpu::LayoutOpts { vertex_layout: layout, ..Default::default() })?;
             let line = format!("{} on {}: {} / {} blend {} shading {} two-sided {} depth-test {} ; vertex inputs {:?}, {} varyings, cooked uniform expression set {} vectors / {} scalars / {} textures, per-frame globals {}",
                 path.rsplit('.').next().unwrap_or(path), vf.type_name(), BASEPASS_VS, ps, mat.flags.blend, mat.flags.shading, mat.flags.two_sided, !mat.flags.disable_depth_test,
                 gpu.assembled.vs_inputs.iter().map(|i| i.attribute).collect::<Vec<_>>(), gpu.assembled.varyings.len(), mat.uniform.vectors.len(), mat.uniform.scalars.len(), mat.uniform.textures2d.len(), gpu.per_frame.is_some());
@@ -223,9 +277,16 @@ impl Dxbc {
     /// `particles::instance_bounds`) with its original material. `Err` = not drawn (nothing is faked).
     pub fn draw_emitter(&mut self, fx: &mut FxRenderer, d: &EmitterDraw, xf: &Transform, bounds: &fn_render::primitive_ub::BoxSphereBounds, dt: f32) -> Result<(), String> {
         if d.particles.is_empty() { return Ok(()); }
-        if self.no_draw.contains(&format!("{}/{}", d.system, d.emitter)) { return Ok(()); }
+        if !d.package.is_empty() && !self.render_checked.contains(&d.package) { self.render_checked.insert(d.package.clone()); self.skip_non_normal_emitters(&d.package); self.warm_ribbon_materials(fx, &d.package); }
+        if !self.no_draw.is_empty() {
+            let mut k = std::mem::take(&mut self.key_buf);
+            k.clear(); k.push_str(&d.system); k.push('/'); k.push_str(&d.emitter);
+            let skip = self.no_draw.contains(&k);
+            self.key_buf = k;
+            if skip { return Ok(()); }
+        }
         let sort = self.sort(bounds.origin)?;
-        match d.kind { DrawKind::Sprite => self.draw_sprites(fx, d, xf, bounds, sort, dt), DrawKind::Mesh => self.draw_meshes(fx, d, xf, bounds, sort, dt) }
+        match d.kind { DrawKind::Sprite => self.draw_sprites(fx, d, xf, bounds, sort, dt), DrawKind::Mesh => self.draw_meshes(fx, d, xf, bounds, sort, dt), DrawKind::Ribbon => self.draw_ribbon(fx, d, xf, bounds, sort) }
     }
 
     fn draw_sprites(&mut self, fx: &mut FxRenderer, d: &EmitterDraw, xf: &Transform, bounds: &fn_render::primitive_ub::BoxSphereBounds, sort: FxSort, dt: f32) -> Result<(), String> {
@@ -255,6 +316,31 @@ impl Dxbc {
         let binds = self.binds_for(fx, m, slot);
         self.touched.insert(m);
         self.frame.push(FxDraw { pipe: self.entries[m].gpu.pipe, binds, geom: FxGeom::Dynamic { vertices: vb, indices: ib }, instances: None, sort });
+        Ok(())
+    }
+
+    fn draw_ribbon(&mut self, fx: &mut FxRenderer, d: &EmitterDraw, xf: &Transform, bounds: &fn_render::primitive_ub::BoxSphereBounds, sort: FxSort) -> Result<(), String> {
+        if d.ribbon_indices.is_empty() { return Ok(()); }
+        let m = self.material(fx, &d.material, Kind::Ribbon, 0)?;
+        let mut k = std::mem::take(&mut self.key_buf);
+        k.clear(); k.push_str("ribbon "); k.push_str(&d.system); k.push('/'); k.push_str(&d.emitter);
+        let first = !self.render_checked.contains(&k);
+        if first { self.render_checked.insert(k.clone()); }
+        self.key_buf = k;
+        if first {
+            let v = &d.ribbon_vertices;
+            let n = v.len() / fn_particles::sim::RIBBON_VERTEX_FLOATS;
+            let w = (0..n).map(|i| v[i * fn_particles::sim::RIBBON_VERTEX_FLOATS + 8]).fold(0f32, f32::max);
+            let line = format!("ribbon {}/{}: {} particles, {} vertices, max half width {:.2} cm, head at ({:.0}, {:.0}, {:.0})", d.system, d.emitter, d.particles.len(), n, w, v[0], v[1], v[2]);
+            eprintln!("[pickups-fx] {line}"); self.log.push(line);
+        }
+        let mut vb = Vec::with_capacity(d.ribbon_vertices.len() * 4);
+        put(&mut vb, &d.ribbon_vertices);
+        let slot = self.slot(fx);
+        self.frame.buffer_writes.push((self.pool[slot].prim, bytes(&Self::component_primitive(xf, false, bounds))));
+        let binds = self.binds_for(fx, m, slot);
+        self.touched.insert(m);
+        self.frame.push(FxDraw { pipe: self.entries[m].gpu.pipe, binds, geom: FxGeom::Dynamic { vertices: vb, indices: d.ribbon_indices.clone() }, instances: None, sort });
         Ok(())
     }
 
@@ -389,15 +475,18 @@ impl Dxbc {
 
     /// `Normals` texture of the item material in each slot (CreateHologramMIDs: the item's material instance's `Normals` texture parameter, `Empty Normal` when it has none).
     pub fn holo_normals(&mut self, path: &str) -> Vec<String> {
+        if let Some(n) = self.holo_normals.get(path) { return n.clone(); }
         let Some(Ok(m)) = self.holo.get(path) else { return vec![] };
         let slots = m.slot_paths.clone();
-        slots.iter().map(|p| {
+        let n: Vec<String> = slots.iter().map(|p| {
             let found = p.as_ref().and_then(|p| Material::load(&self.set, p).ok()).and_then(|mat| {
                 if let Some(t) = mat.texture_overrides.get("Normals") { return Some(t.clone()); }
                 mat.uniform.textures2d.iter().find_map(|e| if let fn_fx::uniform::Expr::TextureParameter { name, index, .. } = e { if name == "Normals" { mat.referenced_textures.get(*index as usize).cloned() } else { None } } else { None })
             });
             found.unwrap_or_else(|| EMPTY_NORMAL.to_owned())
-        }).collect()
+        }).collect();
+        self.holo_normals.insert(path.to_owned(), n.clone());
+        n
     }
 
     fn holo_entry(&mut self, fx: &mut FxRenderer, mesh_path: &str, skin: bool, normals: &str, bones: Option<FxBufId>, vs_globals: Option<FxBufId>, num_uv: usize) -> Result<usize, String> {
@@ -540,7 +629,7 @@ impl Dxbc {
             for (slot_i, _, _) in sections {
                 let p = slots.get(slot_i).cloned().flatten().ok_or_else(|| format!("{mesh_path}: section material slot {slot_i} has no material"))?;
                 let e = self.static_entry(fx, &p, num_uv)?;
-                if !self.entries[e].gpu.translucent { self.static_shadow(fx, e, num_uv); }
+                if !self.entries[e].gpu.translucent && !self.no_shadows { self.static_shadow(fx, e, num_uv); }
             }
             Ok(())
         })();
@@ -551,7 +640,16 @@ impl Dxbc {
         r
     }
     /// Draws one static item (see the section comment): `pos_ue` = actor location (UE cm), `rot` = actor rotation, `origin_cm` = the mesh's `Bounds.Origin`.
-    pub fn draw_static_item(&mut self, fx: &mut FxRenderer, mesh_path: &str, pos_ue: Vec3, rot: glam::Mat3, origin_cm: [f32; 3]) -> Result<(), String> {
+    pub fn draw_static_item(&mut self, fx: &mut FxRenderer, mesh_path: &str, pos_ue: Vec3, rot: glam::Mat3, origin_cm: [f32; 3]) -> Result<(), String> { self.draw_static_item_with(fx, mesh_path, pos_ue, rot, origin_cm, None) }
+    pub fn static_item_df(&mut self, mesh_path: &str, pos_ue: Vec3, rot: glam::Mat3, origin_cm: [f32; 3]) {
+        if self.no_shadows { return; }
+        let has_df = matches!(self.holo.get(mesh_path), Some(Ok(m)) if m.has_df);
+        if !has_df { return; }
+        let Some(Some(df)) = self.static_dfs.get(mesh_path).cloned() else { return };
+        let l2w = glam::Mat4::from_translation(pos_ue - rot * Vec3::from(origin_cm)) * glam::Mat4::from_mat3(rot);
+        self.frame.distance_field_objects.push(FxDfInstance { mesh: df, local_to_world: l2w });
+    }
+    pub fn draw_static_item_with(&mut self, fx: &mut FxRenderer, mesh_path: &str, pos_ue: Vec3, rot: glam::Mat3, origin_cm: [f32; 3], black_hole: Option<[f32; 4]>) -> Result<(), String> {
         self.static_ready(fx, mesh_path)?;
         let (mesh, num_uv, sections, slot_paths, sphere, bounds, has_df) = match self.holo.get(mesh_path) { Some(Ok(m)) => (m.mesh, m.num_uv, m.sections.clone(), m.slot_paths.clone(), m.sphere, m.bounds, m.has_df), _ => return Err("mesh not loaded".into()) };
         let Some(view) = self.view else { return Err("no view (begin was not called)".into()) };
@@ -564,7 +662,20 @@ impl Dxbc {
         for (slot_i, first, count) in sections {
             let Some(path) = slot_paths.get(slot_i).cloned().flatten() else { continue };
             let e = self.static_entry(fx, &path, num_uv)?;
-            let packed = fn_fx::uniform::evaluate(&self.entries[e].mat.uniform, &self.entries[e].mat.overrides, self.time);
+            let packed = match black_hole {
+                None => fn_fx::uniform::evaluate(&self.entries[e].mat.uniform, &self.entries[e].mat.overrides, self.time),
+                Some(v) => {
+                    let mut ov = fn_fx::uniform::Overrides { vectors: self.entries[e].mat.overrides.vectors.clone(), scalars: self.entries[e].mat.overrides.scalars.clone() };
+                    ov.vectors.insert(crate::pickup_orig::BLACK_HOLE_PARAM.to_owned(), v);
+                    let with = fn_fx::uniform::evaluate(&self.entries[e].mat.uniform, &ov, self.time);
+                    if self.black_hole_checked.insert(path.clone()) {
+                        let without = fn_fx::uniform::evaluate(&self.entries[e].mat.uniform, &self.entries[e].mat.overrides, self.time);
+                        let line = format!("[pickups-fx] static item material {path}: {} {}", crate::pickup_orig::BLACK_HOLE_PARAM, if with.cb != without.cb { "read by the cooked program (backpack shrink drawn)" } else { "NOT a parameter of this material (1.8 reparents it to BackPackShrinkingEffect; not ported: no shrink)" });
+                        eprintln!("{line}"); self.log.push(line);
+                    }
+                    with
+                }
+            };
             let s = self.slot(fx);
             let (pb, mb) = (self.pool[s].prim, self.pool[s].mat);
             self.frame.buffer_writes.push((pb, bytes(&prim)));
@@ -583,7 +694,7 @@ impl Dxbc {
             let binds = match self.static_binds.get(&(e, s)) { Some(b) => b.clone(), None => { let b = self.entries[e].gpu.bind_variant_globals(fx, pb, Some(mb), vs); self.static_binds.insert((e, s), b.clone()); b } };
             self.frame.push(FxDraw { pipe: self.entries[e].gpu.pipe, binds, geom: FxGeom::MeshRange { mesh, first_index: first, index_count: count }, instances: None, sort });
             // shadow casting into the CSM cascades (same Primitive / Material buffers)
-            if self.entries[e].gpu.translucent { continue; }
+            if self.entries[e].gpu.translucent || self.no_shadows { continue; }
             let Some(Some((sg, own))) = self.static_shadows.get(&e) else { continue };
             let (pipe, own) = (sg.pipe, *own);
             if self.static_shadow_written.insert(e) {
@@ -595,24 +706,41 @@ impl Dxbc {
             self.frame.shadow_draws.push(FxShadowDraw { pipe, binds: sb, geom: FxGeom::MeshRange { mesh, first_index: first, index_count: count }, bounds: None, instances: None });
         }
         // the distance-field scene (DF shadows, DFAO), once per placed item
-        if has_df {
+        if has_df && !self.no_shadows {
             if !self.static_dfs.contains_key(mesh_path) {
-                let r = fn_fx::gpu::load_mesh_distance_field(&self.set, mesh_path, true);
-                if let Err(err) = &r { let m = format!("{mesh_path}: no distance field ({err})"); eprintln!("[pickups] {m}"); self.log.push(m); }
-                self.static_dfs.insert(mesh_path.to_owned(), r.ok().map(std::sync::Arc::new));
+                let done = STATIC_DF_DONE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(mesh_path).cloned()));
+                match done {
+                    Some(r) => {
+                        if let Err(err) = &r { let m = format!("{mesh_path}: no distance field ({err})"); eprintln!("[pickups] {m}"); self.log.push(m); }
+                        self.static_dfs.insert(mesh_path.to_owned(), r.ok());
+                    }
+                    None => {
+                        if STATIC_DF_STARTED.lock().ok().is_some_and(|mut g| g.get_or_insert_with(HashSet::new).insert(mesh_path.to_owned())) {
+                            let (set, path) = (self.set.clone(), mesh_path.to_owned());
+                            let spawned = std::thread::Builder::new().name("pickup df".into()).spawn(move || {
+                                let r = fn_fx::gpu::load_mesh_distance_field(&set, &path, true).map(std::sync::Arc::new);
+                                if let Ok(mut g) = STATIC_DF_DONE.lock() { g.get_or_insert_with(HashMap::new).insert(path, r); }
+                            });
+                            if spawned.is_err() { let r = fn_fx::gpu::load_mesh_distance_field(&self.set, mesh_path, true); self.static_dfs.insert(mesh_path.to_owned(), r.ok().map(std::sync::Arc::new)); }
+                        }
+                    }
+                }
             }
-            if let Some(df) = self.static_dfs[mesh_path].clone() { self.frame.distance_field_objects.push(FxDfInstance { mesh: df, local_to_world: l2w }); }
+            if let Some(df) = self.static_dfs.get(mesh_path).cloned().flatten() { self.frame.distance_field_objects.push(FxDfInstance { mesh: df, local_to_world: l2w }); }
         }
         Ok(())
     }
 }
 
+static STATIC_DF_DONE: std::sync::Mutex<Option<HashMap<String, Result<std::sync::Arc<fn_render::distance_field::MeshDistanceField>, String>>>> = std::sync::Mutex::new(None);
+static STATIC_DF_STARTED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn draw(align: Alignment, lock: AxisLock) -> EmitterDraw {
-        EmitterDraw { system: String::new(), emitter: String::new(), emitter_index: 0, kind: DrawKind::Sprite, material: String::new(), material_override: vec![], mesh: String::new(), sub_images: (4, 2), interpolation: SubUvInterp::None, alignment: align, sort: fn_particles::model::SortMode::None,
-            pivot_offset: [0.0, 0.5], axis_lock: lock, axis_lock_axes: lock.locked_axes().map(|_| ([0., 0., 1.], [1., 0., 0.])), use_local_space: true, mesh_override_material: false, lod_level: 0, particles: vec![] }
+        EmitterDraw { system: String::new(), package: String::new(), emitter: String::new(), emitter_index: 0, kind: DrawKind::Sprite, material: String::new(), material_override: vec![], mesh: String::new(), sub_images: (4, 2), interpolation: SubUvInterp::None, alignment: align, sort: fn_particles::model::SortMode::None,
+            pivot_offset: [0.0, 0.5], axis_lock: lock, axis_lock_axes: lock.locked_axes().map(|_| ([0., 0., 1.], [1., 0., 0.])), use_local_space: true, mesh_override_material: false, lod_level: 0, particles: vec![], ribbon_vertices: vec![], ribbon_indices: vec![] }
     }
     #[test] fn the_sprite_uniform_follows_the_engine_rules() {
         let v = Dxbc::sprite_uniform(&draw(Alignment::Square, AxisLock::None), 1.0 / 30.0);

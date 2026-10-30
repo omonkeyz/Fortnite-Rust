@@ -60,6 +60,7 @@ pub(crate) struct Gpu {
     missing: std::collections::BTreeSet<String>,
     /// FIRST USE: [`warm_catalog`] ran for this state.
     warmed: bool,
+    warm_at: usize,
 }
 
 /// HURT HOOK: puts a material built from its compiled shader (not the catalog `Look` heuristic) into a state's cache, so `batches` uses it for `ue_path`.
@@ -74,10 +75,12 @@ pub(crate) fn preset_material(renderer: &mut Renderer, cat: &Catalog, gpu: &mut 
 /// FIRST USE (2026-10-06): builds every material (PNG decode + particle material) and mesh of a catalog's systems into `gpu`, the caches `batches` uses, so
 /// that no first spawn decodes on the UI thread (the impact / harvest effects cost 21-25 ms at their first spawn, verification/load_time/normal_warm2.log).
 /// Once per state; returns (materials, meshes) built.
-pub(crate) fn warm_catalog(renderer: &mut Renderer, cat: &Catalog, gpu: &mut Gpu) -> (usize, usize) {
-    if gpu.warmed || !crate::building_render::warm_enabled() { return (0, 0); }
-    gpu.warmed = true;
-    for sys in cat.systems() {
+pub(crate) fn warm_catalog(renderer: &mut Renderer, cat: &Catalog, gpu: &mut Gpu) -> Option<(usize, usize)> {
+    if gpu.warmed || !crate::building_render::warm_enabled() { return Some((0, 0)); }
+    let t = std::time::Instant::now();
+    for sys in cat.systems().skip(gpu.warm_at) {
+        if t.elapsed().as_secs_f32() > 0.012 { return None; }
+        gpu.warm_at += 1;
         for e in &sys.emitters {
             for l in &e.lods {
                 if !l.required.material.is_empty() { let _ = material_id(renderer, cat, gpu, &l.required.material); }
@@ -87,17 +90,19 @@ pub(crate) fn warm_catalog(renderer: &mut Renderer, cat: &Catalog, gpu: &mut Gpu
             }
         }
     }
-    (gpu.materials.len(), gpu.meshes.len())
+    gpu.warmed = true;
+    Some((gpu.materials.len(), gpu.meshes.len()))
 }
 
 /// FIRST USE: [`warm_catalog`] for the harvest / impact / death systems (called under the loading screen, `App::finishing_frame`).
-pub fn prebuild(renderer: &mut Renderer) {
-    let Ok(mut g) = HOST.lock() else { return };
-    let Some(h) = g.as_mut() else { return };
+pub fn prebuild(renderer: &mut Renderer) -> bool {
+    let Ok(mut g) = HOST.lock() else { return true };
+    let Some(h) = g.as_mut() else { return true };
     let cat = h.catalog.clone();
     let t = std::time::Instant::now();
-    let (m, s) = warm_catalog(renderer, &cat, &mut h.gpu);
+    let Some((m, s)) = warm_catalog(renderer, &cat, &mut h.gpu) else { return false };
     if m + s > 0 { eprintln!("[particles] warm-up: {m} materials, {s} meshes built in {:.0} ms (before the first harvest / impact)", t.elapsed().as_secs_f32() * 1000.); }
+    true
 }
 
 struct Host {
@@ -247,6 +252,18 @@ pub(crate) fn instance_bounds(inst: &Instance, cat: &Catalog) -> fn_render::prim
     let (mn, mx) = inst.bounds_box(&|m| mesh_extent_cm(cat, m));
     fn_render::primitive_ub::BoxSphereBounds::from_box(mn, mx)
 }
+pub(crate) fn camera_sees(center: Vec3, r: f32, camera: &CameraParams) -> bool {
+    let (tx, ty) = camera.tan_half();
+    let fwd = camera.forward.normalize_or_zero();
+    let right = fwd.cross(camera.up).normalize_or_zero();
+    let up = right.cross(fwd).normalize_or_zero();
+    let c = center - camera.eye;
+    let (z, x, y) = (c.dot(fwd), c.dot(right), c.dot(up));
+    z >= -r && x.abs() <= z * tx + r * (1. + tx * tx).sqrt() && y.abs() <= z * ty + r * (1. + ty * ty).sqrt()
+}
+pub(crate) fn camera_sees_ue(b: &fn_render::primitive_ub::BoxSphereBounds, margin_m: f32, camera: &CameraParams) -> bool {
+    camera_sees(Vec3::from(fn_particles::sim::ue_to_game(Vec3::from(b.origin))), b.radius * 0.01 + margin_m, camera)
+}
 /// `CalculateTranslucentSortKey` for a bounds origin (UE cm) seen from the port camera, priority 0 (see [`instance_sort`]).
 pub(crate) fn camera_sort(origin: [f32; 3], camera: &CameraParams) -> fn_render::fx::FxSort {
     let eye = fn_particles::sim::game_to_ue([camera.eye.x, camera.eye.y, camera.eye.z]);
@@ -272,6 +289,7 @@ pub(crate) fn batches(renderer: &mut Renderer, cat: &Catalog, gpu: &mut Gpu, d: 
                 frame.meshes.push(MeshBatch { mesh, first_index: first, index_count: count, material, instances: instances.clone(), sort });
             }
         }
+        DrawKind::Ribbon => {}
     }
 }
 

@@ -313,7 +313,15 @@ pub struct PostSettings {
     pub contrast_shadows: f32,
     pub gamma_midtones: f32,
     pub ao_intensity: f32,
+    pub contrast_global: f32,
+    pub scene_tint: [f32; 3],
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicPp { pub weight: f32, pub scene_color_tint: Option<[f32; 3]>, pub color_contrast: Option<f32> }
+static DYNAMIC_PP: std::sync::Mutex<Vec<DynamicPp>> = std::sync::Mutex::new(Vec::new());
+pub fn set_dynamic_pp(list: Vec<DynamicPp>) { *DYNAMIC_PP.lock().unwrap_or_else(|p| p.into_inner()) = list; }
+pub fn dynamic_pp() -> Vec<DynamicPp> { DYNAMIC_PP.lock().unwrap_or_else(|p| p.into_inner()).clone() }
 const NF: usize = 14;
 /// One phase component: `Some(v)` = `bOverride_X` true with value `v` (tagged, or the exe ctor default when flagged but untagged),
 /// `None` = not overridden (the value of the layer below is kept).
@@ -324,7 +332,7 @@ impl PostSettings {
     /// FilmShoulder 0.26, AutoExposureMin 0.03 / Max 2 / Bias 0 / LowPercent 80, saturation/contrast/gamma 1, AmbientOcclusionIntensity 0.5.
     pub const EXE_DEFAULT: PostSettings = PostSettings {
         white_temp: 6500., film_slope: 0.88, film_toe: 0.55, film_shoulder: 0.26, ae_min: 0.03, ae_max: 2.0, ae_bias: 0.0, ae_low_percent: 80.,
-        sat_shadows: 1., sat_midtones: 1., sat_global: 1., contrast_shadows: 1., gamma_midtones: 1., ao_intensity: 0.5,
+        sat_shadows: 1., sat_midtones: 1., sat_global: 1., contrast_shadows: 1., gamma_midtones: 1., ao_intensity: 0.5, contrast_global: 1., scene_tint: [1.; 3],
     };
     fn fields_mut(&mut self) -> [&mut f32; NF] {
         [&mut self.white_temp, &mut self.film_slope, &mut self.film_toe, &mut self.film_shoulder, &mut self.ae_min, &mut self.ae_max, &mut self.ae_bias,
@@ -345,7 +353,7 @@ impl PostSettings {
     pub const DAY: PostSettings = PostSettings {
         white_temp: WHITE_TEMP as f32, film_slope: FILM_SLOPE, film_toe: FILM_TOE, film_shoulder: FILM_SHOULDER, ae_min: AUTO_EXPOSURE_MIN, ae_max: AUTO_EXPOSURE_MAX,
         ae_bias: AUTO_EXPOSURE_BIAS, ae_low_percent: 80., sat_shadows: COLOR_SATURATION_SHADOWS, sat_midtones: COLOR_SATURATION_MIDTONES, sat_global: 1.,
-        contrast_shadows: 1., gamma_midtones: 1., ao_intensity: AO_INTENSITY,
+        contrast_shadows: 1., gamma_midtones: 1., ao_intensity: AO_INTENSITY, contrast_global: 1., scene_tint: [1.; 3],
     };
     /// The TOD post-process stack for the blend (`from`, `to`, `t`) of `time_of_day::blend_at`, exactly as UE 4.16 builds it (exe-verified, see
     /// `time_of_day::pp_components`): on top of the exe defaults, the seven unbound components in `PostProcessVolumes` order (Day / Evening / Night
@@ -367,10 +375,20 @@ impl PostSettings {
     }
     /// Saturation per region [shadows, midtones, highlights] = region value * global `ColorSaturation`.
     pub fn grade_sat(&self) -> [f32; 3] { [self.sat_shadows * self.sat_global, self.sat_midtones * self.sat_global, self.sat_global] }
-    pub fn grade_contrast(&self) -> [f32; 3] { [self.contrast_shadows, 1., 1.] }
+    pub fn grade_contrast(&self) -> [f32; 3] { [self.contrast_shadows * self.contrast_global, self.contrast_global, self.contrast_global] }
+    pub fn with_overrides(mut self, list: &[DynamicPp]) -> PostSettings {
+        for d in list {
+            if !(d.weight > 0.) { continue; }
+            let w = d.weight.min(1.);
+            if let Some(t) = d.scene_color_tint { for i in 0..3 { self.scene_tint[i] += (t[i] - self.scene_tint[i]) * w; } }
+            if let Some(c) = d.color_contrast { self.contrast_global += (c - self.contrast_global) * w; }
+        }
+        self
+    }
+    pub fn with_dynamic(self) -> PostSettings { self.with_overrides(&dynamic_pp()) }
     pub fn grade_gamma(&self) -> [f32; 3] { [1., self.gamma_midtones, 1.] }
     /// True when contrast / gamma differ from identity (skips the pow() work in the shader).
-    pub fn grade_needs_pow(&self) -> bool { self.contrast_shadows != 1. || self.gamma_midtones != 1. }
+    pub fn grade_needs_pow(&self) -> bool { self.contrast_shadows != 1. || self.gamma_midtones != 1. || self.contrast_global != 1. }
     /// GPU block of the post pass for these settings. `proj` = (tan half fov x, tan half fov y, near, far).
     pub fn post_params(&self, bloom_on: bool, vignette_on: bool, ao_on: bool, proj: [f32; 4], view: [f32; 4], backdrop: [f32; 4]) -> PostParams {
         let (s, c, g) = (self.grade_sat(), self.grade_contrast(), self.grade_gamma());
@@ -388,6 +406,7 @@ impl PostSettings {
             grade_range: [COLOR_CORRECTION_SHADOWS_MAX, COLOR_CORRECTION_HIGHLIGHTS_MIN, self.grade_needs_pow() as u32 as f32, LUT_OUTPUT_SCALE],
             tonemap_ext: [0.; 4],
             fringe: [1., 1., 0., 0.],
+            scene_tint: [self.scene_tint[0], self.scene_tint[1], self.scene_tint[2], 1.],
         }
     }
     /// GPU block of the exposure pass.
@@ -445,6 +464,7 @@ pub struct PostParams {
     /// POSTFX SETTINGS: scene colour fringe (USE_COLOR_FRINGE): xy = FringeUVParams (G, R sample scale about the view centre), z = 1 when on
     /// (`effect_settings::EffectSettings::fringe_on`); the renderer fills it.
     pub fringe: [f32; 4],
+    pub scene_tint: [f32; 4],
 }
 /// GPU parameter block of the exposure compute pass (struct MeterParams in meter.wgsl).
 #[repr(C)]

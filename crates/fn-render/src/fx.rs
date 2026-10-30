@@ -315,8 +315,33 @@ impl FxFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TItem { Fx(usize), Particle(usize) }
 
-struct GpuTex { tex: wgpu::Texture, view: wgpu::TextureView, dim: FxTexDim }
-struct GpuMesh { vb: wgpu::Buffer, ib: wgpu::Buffer, index_count: u32 }
+struct GpuTex { tex: wgpu::Texture, view: wgpu::TextureView, dim: FxTexDim, layer: Option<(usize, u32)> }
+type PoolKey = (wgpu::TextureFormat, u32, u32, u32);
+struct TexPool { tex: Option<wgpu::Texture>, free: Vec<u32>, live: u32, layers: u32, bytes: u64 }
+#[derive(Default)]
+struct TexPools { on: bool, pools: Vec<TexPool>, by_key: HashMap<PoolKey, Vec<usize>>, loose: HashMap<PoolKey, Vec<usize>>, freeing: Vec<(usize, u32)> }
+const POOL_MAX_BYTES: u64 = 4 << 20;
+fn pools_enabled() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| fn_live::var("FN_FX_TEX_POOLS").is_ok_and(|v| v == "1")) }
+fn dawn_slot(s: u64) -> u64 { let a = s.max(1).div_ceil(65536) * 65536; if a <= POOL_MAX_BYTES { a.next_power_of_two() } else { a } }
+fn mip_chain_bytes(format: wgpu::TextureFormat, w: u32, h: u32, levels: u32) -> u64 {
+    let (bw, bh) = format.block_dimensions();
+    let bs = format.block_copy_size(None).unwrap_or(4) as u64;
+    (0..levels).map(|m| (w >> m).max(1).div_ceil(bw) as u64 * (h >> m).max(1).div_ceil(bh) as u64 * bs).sum()
+}
+fn pool_capacity(s: u64, max_layers: u32) -> Option<u32> {
+    if s == 0 || s > POOL_MAX_BYTES || dawn_slot(s) * 100 <= s * 112 { return None; }
+    let mut c = 2u64;
+    while c < max_layers as u64 && dawn_slot(c * s) * 100 > c * s * 112 { c += 1; }
+    (c >= 2 && c <= max_layers as u64).then_some(c as u32)
+}
+fn layer_view(tex: &wgpu::Texture, layer: u32) -> wgpu::TextureView {
+    tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() })
+}
+struct GpuMesh { vb: wgpu::Buffer, ib: wgpu::Buffer, index_count: u32, vr: (u64, u64), ir: (u64, u64) }
+impl GpuMesh {
+    fn vbs(&self) -> wgpu::BufferSlice<'_> { self.vb.slice(self.vr.0..self.vr.0 + self.vr.1) }
+    fn ibs(&self) -> wgpu::BufferSlice<'_> { self.ib.slice(self.ir.0..self.ir.0 + self.ir.1) }
+}
 struct GpuPipe { pipe: wgpu::RenderPipeline, layouts: Vec<wgpu::BindGroupLayout>, desc_groups: Vec<Vec<FxLayoutEntry>>, translucent: bool, instanced: bool, separate: bool, /** FX SHADOW: a depth-only cascade pipeline */ shadow: bool,
     /** FX RECEIVE: an opaque / masked lit pipeline drawn in the renderer's scene pass with the globals at [`FX_SCENE_GROUP`] ([`FxRenderer::create_scene_lit_pipeline`]) */ scene_lit: bool }
 
@@ -345,6 +370,30 @@ const COMPOSITE_WGSL: &str = "
 @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> { return textureLoad(sep, vec2<i32>(pos.xy), 0); }
 ";
 /// `built` = (scene depth generation, translucency volume generation) it was built with + the group; rebuilt when a resource it uses changed.
+#[derive(Default)]
+struct TexResidency { frame: u32, bind_used: Vec<u32>, state: Vec<u8>, wanted: Vec<usize>, evicted: usize, evicted_bytes: u64, restored: usize, pressured: usize, pressure_bytes: u64, full_bytes: u64 }
+static FRAME_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLUSH_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const UPLOAD_FLUSH_BYTES: u64 = 48 << 20;
+pub fn frame_upload_bytes() -> u64 { FRAME_UPLOAD.load(std::sync::atomic::Ordering::Relaxed) }
+fn note_upload(queue: &wgpu::Queue, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    FRAME_UPLOAD.fetch_add(bytes, Relaxed);
+    if FLUSH_UPLOAD.fetch_add(bytes, Relaxed) + bytes >= UPLOAD_FLUSH_BYTES { FLUSH_UPLOAD.store(0, Relaxed); queue.submit(None); }
+}
+const RES_SCAN_FRAMES: u32 = 60;
+const RES_AGE_FRAMES: u32 = 1200;
+const RES_MIN_BYTES: u64 = 256 << 10;
+const RES_KEEP_PX: u32 = 64;
+const RES_PRESSURE_IDLE_FRAMES: u32 = 240;
+const RES_PRESSURE_MAX: usize = 48;
+const RES_SHRINK_PER_SCAN: usize = 6;
+const RES_LOG_FRAMES: u32 = 1200;
+fn res_budget_bytes() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| fn_live::var("FN_TEX_RES_BUDGET_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(if cfg!(target_arch = "wasm32") { 512 } else { 0 }) << 20)
+}
+
 struct BindGroupRec { pipe: FxPipeId, group: u32, entries: Vec<FxBindEntry>, built: Option<((u64, u64), wgpu::BindGroup)>, uses_depth: bool, uses_volume: bool }
 
 /// BROWSER PORT (wasm32): FX pipelines through createRenderPipelineAsync (fx_async.rs).
@@ -353,18 +402,25 @@ struct BindGroupRec { pipe: FxPipeId, group: u32, entries: Vec<FxBindEntry>, bui
 mod fx_async;
 #[path = "fx_pso.rs"]
 mod fx_pso;
+pub fn pso_prefetch() { fx_pso::prefetch() }
 pub use fx_pso::{pso_recording, pso_recorded};
 
 pub struct FxRenderer {
+    instance: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     hdr_format: wgpu::TextureFormat,
     depth_format: wgpu::TextureFormat,
     textures: Vec<GpuTex>,
-    buffers: Vec<wgpu::Buffer>,
+    buffers: Vec<FxBuf>,
+    buf_slab: Option<(wgpu::Buffer, u64)>,
+    mesh_slab: Option<(wgpu::Buffer, u64)>,
     meshes: Vec<GpuMesh>,
     pipes: Vec<GpuPipe>,
     binds: Vec<BindGroupRec>,
+    bind_pending: Vec<u32>,
+    bind_dep: Vec<u32>,
+    tex_binds: HashMap<usize, Vec<u32>, crate::distance_field::FxBuild>,
     samplers: HashMap<FxSamplerDesc, wgpu::Sampler>,
     depth_sampler: wgpu::Sampler,
     /// Frame data (set by `set_frame`, consumed by the passes).
@@ -378,6 +434,7 @@ pub struct FxRenderer {
     placed: Vec<Placed>,
     /// INSTANCING: per shadow draw with instances, per cascade (offset in `inst_vb`, instance count) of the ids that pass that cascade (`prepare`).
     shadow_placed: Vec<Vec<(u64, u32)>>,
+    shadow_ids: Vec<u32>,
     depth_gen: u64,
     /// Last error text of a failed pipeline / bind group creation (also returned by the create calls).
     pub last_error: Option<String>,
@@ -404,6 +461,12 @@ pub struct FxRenderer {
     /// the `View` buffers of the FX programs, this frame's values ([`Self::set_view_fog`]), the integrated scattering volume (+ the volfog volume serial it came
     /// from) and the white cube. Written over the frame's own buffer writes in [`Self::prepare`].
     fog_targets: HashMap<FxBufId, Vec<FxFogSlot>>,
+    fog_last: Option<[[f32; 4]; FX_FOG_FIELDS]>,
+    fog_patched: Vec<bool>,
+    fog_flags: Vec<u8>,
+    fog_gen: u32,
+    bind_fog: Vec<(u32, Vec<FxBufId>)>,
+    fog_dirty: std::sync::Mutex<Vec<FxBufId>>,
     fog_views: std::collections::HashSet<FxBufId>,
     /// VELOCITY (2026-10-05): velocity twins of the scene-lit pipelines (by pipe index) and the previous-view history of the `View` buffers (`fog_views`).
     velocity_pipes: HashMap<usize, wgpu::RenderPipeline>,
@@ -425,7 +488,7 @@ pub struct FxRenderer {
     /// `buffer_writes`). [`Self::prepare`] skips a frame write identical to what the buffer holds (static props re-send unchanged primitive / material /
     /// velocity constants every frame, and every `queue.write_buffer` costs a staging copy at submit). Buffers that also get partial writes in `prepare`
     /// (the fog slots, the View history patch) are never skipped.
-    uploaded: std::sync::Mutex<HashMap<usize, Vec<u8>>>,
+    uploaded: std::sync::Mutex<Vec<Vec<u8>>>,
     upload_skipped: usize,
     /// PERF (2026-10-06, frame-time spikes): with [`Self::set_staged_uploads`] (the renderer), [`Self::prepare`] stages the frame's writes (whole-buffer, fog
     /// slots, dynamic geometry, instances) in ONE mapped buffer and [`Self::encode_uploads`] records the copies at the start of the frame's command encoder,
@@ -435,6 +498,10 @@ pub struct FxRenderer {
     stage_bytes: Vec<u8>,
     stage_copies: Vec<(wgpu::Buffer, u64, u64, u64)>,
     stage_buf: Option<wgpu::Buffer>,
+    stage_ready: bool,
+    retired: Vec<wgpu::Texture>,
+    tex_pools: TexPools,
+    res: TexResidency,
     /// TEXTURE MEMORY (2026-10-06): BC textures are uploaded as blocks ([`FxTexFormat`]); `FN_DEBUG_NO_BC=1` (debug-only A/B switch) decodes them like before.
     bc: bool,
     /// Textures created so far per GPU format: (count, bytes of all levels), BC blocks rejected by `create_texture` (never expected, see there),
@@ -458,6 +525,7 @@ pub struct FxRenderer {
     /// Several first-use builds make byte-identical programs (a pickup hologram per weapon mesh, the blueprint MID per piece class, mirrored and
     /// unmirrored variants with the same cull); FX pipelines are never destroyed and bind groups are made against the pipe's layouts, so they share it.
     pipe_cache: HashMap<(u8, u64, u64), FxPipeId>,
+    module_cache: HashMap<(u64, u64, usize), wgpu::ShaderModule>,
     pipe_cache_hits: usize,
     pso_warm: Option<fx_pso::Warm>,
 }
@@ -475,6 +543,15 @@ const DYN_CAPACITY: u64 = 1 << 20;
 /// INSTANCING (2026-10-07): the per-frame instance buffer: the grass (up to 768 KB per draw, grass_render.rs) + the statics' instance ids (scene + per-cascade shadow lists, ~20-40 KB) + the mesh particles.
 const INST_CAPACITY: u64 = 2 << 20;
 
+struct FxBuf { buf: wgpu::Buffer, off: u64, size: u64 }
+impl FxBuf {
+    fn size(&self) -> u64 { self.size }
+    fn binding(&self) -> wgpu::BindingResource<'_> { wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.buf, offset: self.off, size: std::num::NonZeroU64::new(self.size) }) }
+}
+const BUF_SLAB_BYTES: u64 = 1 << 20;
+const BUF_SLAB_MAX: u64 = 16 << 10;
+const MESH_SLAB_BYTES: u64 = 4 << 20;
+const MESH_SLAB_MAX: u64 = 256 << 10;
 fn buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer { device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false }) }
 
 impl FxRenderer {
@@ -493,27 +570,29 @@ impl FxRenderer {
         // TEXTURE MEMORY (2026-10-06): BC blocks go to the GPU as they are when the device has TEXTURE_COMPRESSION_BC (fn-render gpu.rs requests it when the
         // adapter has it); `FN_DEBUG_NO_BC=1` (debug-only A/B switch) keeps the CPU decode to RGBA8 for every texture
         let bc = set_bc_native_hint(device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC));
+        static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         FxRenderer {
-            fog_targets: HashMap::new(), fog_views: Default::default(), view_fog: FxViewFog::default(), fog_volume: None, white_cube,
+            instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            fog_targets: Default::default(), fog_last: None, fog_patched: Default::default(), fog_flags: Default::default(), fog_gen: 1, bind_fog: Default::default(), fog_dirty: Default::default(), fog_views: Default::default(), view_fog: FxViewFog::default(), fog_volume: None, white_cube,
             velocity_pipes: HashMap::new(), view_history: Default::default(), view_jitter: [0.0; 2], view_size: (0, 0), // VELOCITY
             depth_pipes: HashMap::new(), // PREPASS
             responsive_pipes: HashMap::new(), // STORM TAA
             backdrop_pipes: Default::default(), building_backdrop: false, // BACKDROP REAL
             #[cfg(target_arch = "wasm32")] web: Default::default(), // BROWSER PORT: async pipelines
-            pipe_cache: HashMap::new(), pipe_cache_hits: 0, pso_warm: None, // PIPELINE DEDUP
+            pipe_cache: HashMap::new(), module_cache: HashMap::new(), pipe_cache_hits: 0, pso_warm: None, // PIPELINE DEDUP
             collections: HashMap::new(), // MATERIAL PARAMETERS
             uploaded: Default::default(), upload_skipped: 0, shadow_cull: vec![], shadow_small: None, // PERF
-            staged: false, stage_bytes: vec![], stage_copies: vec![], stage_buf: None, // PERF: staged frame uploads
+            staged: false, stage_bytes: vec![], stage_copies: vec![], stage_buf: None, stage_ready: false, retired: vec![], tex_pools: TexPools { on: pools_enabled(), ..Default::default() }, res: TexResidency::default(), // PERF: staged frame uploads
             bc, tex_stats: HashMap::new(), tex_bc_rejected: 0, tex_bc_srgb_linear: 0, // TEXTURE MEMORY
             bgl_shadow_vp, shadow_vp_bgs: vec![], base_shadow: (0, 0), scene: None,
             volume: None, volume_gen: 0, volume_black,
             device: device.clone(), queue: queue.clone(), hdr_format, depth_format,
-            textures: vec![], buffers: vec![], meshes: vec![], pipes: vec![], binds: vec![], samplers: HashMap::new(), depth_sampler,
+            textures: vec![], buffers: vec![], buf_slab: None, mesh_slab: None, meshes: vec![], pipes: vec![], binds: vec![], bind_pending: vec![], bind_dep: vec![], tex_binds: Default::default(), samplers: HashMap::new(), depth_sampler,
             frame: FxFrame::default(), base_len: (0, 0),
             dyn_vb: buffer(device, "fx dynamic vertices", DYN_CAPACITY, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST),
             dyn_ib: buffer(device, "fx dynamic indices", DYN_CAPACITY, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST),
             inst_vb: buffer(device, "fx instances", INST_CAPACITY, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST),
-            placed: vec![], shadow_placed: vec![], depth_gen: 0, last_error: None,
+            placed: vec![], shadow_placed: vec![], shadow_ids: vec![], depth_gen: 0, last_error: None,
             order_standard: vec![], order_separate: vec![], merged_standard: vec![], merged_separate: vec![], separate_target: None, composite: None,
         }
     }
@@ -537,6 +616,7 @@ impl FxRenderer {
         let parts: Vec<String> = v.iter().map(|(f, n, b)| format!("{f:?} {n} ({:.1} MB)", *b as f64 / 1048576.)).collect();
         format!("fx textures {:.1} MB: {} | BC passthrough {}, BC rejected {rejected}, BC4/BC5 flagged sRGB (sampled linear) {srgb_linear}", total as f64 / 1048576., parts.join(", "), if self.bc { "on" } else { "off" })
     }
+    pub fn instance(&self) -> u64 { self.instance }
     pub fn create_texture(&mut self, d: &FxTextureDesc) -> FxTexId {
         // TEXTURE MEMORY: BC blocks this device cannot take (no BC feature, not 2D, level 0 not a multiple of 4, short level data) never come here (the
         // producer decodes them first, fn-fx TextureCache::load); if they do, a 1x1 black texture instead of a wgpu validation panic, counted in the report
@@ -553,7 +633,12 @@ impl FxRenderer {
         let l0 = &d.levels[0];
         let (dimension, depth_or_layers, view_dim) = match d.dim { FxTexDim::D2 => (wgpu::TextureDimension::D2, 1, wgpu::TextureViewDimension::D2), FxTexDim::D3 => (wgpu::TextureDimension::D3, l0.depth.max(1), wgpu::TextureViewDimension::D3), FxTexDim::Cube => (wgpu::TextureDimension::D2, 6, wgpu::TextureViewDimension::Cube) };
         let format = d.format.wgpu(d.srgb);
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor { label: Some(&d.label), size: wgpu::Extent3d { width: l0.width, height: l0.height, depth_or_array_layers: depth_or_layers }, mip_level_count: d.levels.len() as u32, sample_count: 1, dimension, format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[] });
+        let mut enc = None;
+        let (tex, layer, loose) = if d.dim == FxTexDim::D2 { self.place_d2(&d.label, format, l0.width, l0.height, d.levels.len() as u32, &mut enc) } else {
+            (self.device.create_texture(&wgpu::TextureDescriptor { label: Some(&d.label), size: wgpu::Extent3d { width: l0.width, height: l0.height, depth_or_array_layers: depth_or_layers }, mip_level_count: d.levels.len() as u32, sample_count: 1, dimension, format, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC, view_formats: &[] }), None, None)
+        };
+        if let Some(e) = enc { self.queue.submit(Some(e.finish())); }
+        let origin = wgpu::Origin3d { x: 0, y: 0, z: layer.map_or(0, |l| l.1) };
         let mut bytes = 0u64;
         for (i, l) in d.levels.iter().enumerate() {
             let layers = match d.dim { FxTexDim::D2 => 1, FxTexDim::D3 => l.depth.max(1), FxTexDim::Cube => 6 };
@@ -561,40 +646,229 @@ impl FxRenderer {
                 // whole 4x4 blocks: rows of ceil(w / 4) blocks, ceil(h / 4) block rows, the copy covering the level's physical (block-rounded) size
                 let (bw, bh) = (l.width.div_ceil(4), l.height.div_ceil(4));
                 let n = d.format.level_bytes(l.width, l.height);
-                self.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, &l.rgba8[..n], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bw * d.format.unit_bytes() as u32), rows_per_image: Some(bh) }, wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 });
+                self.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: i as u32, origin, aspect: wgpu::TextureAspect::All }, &l.rgba8[..n], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bw * d.format.unit_bytes() as u32), rows_per_image: Some(bh) }, wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 });
                 bytes += n as u64;
             } else {
-                self.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, &l.rgba8, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * l.width), rows_per_image: Some(l.height) }, wgpu::Extent3d { width: l.width, height: l.height, depth_or_array_layers: layers });
+                self.queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: i as u32, origin, aspect: wgpu::TextureAspect::All }, &l.rgba8, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * l.width), rows_per_image: Some(l.height) }, wgpu::Extent3d { width: l.width, height: l.height, depth_or_array_layers: layers });
                 bytes += (4 * l.width * l.height * layers) as u64;
             }
         }
         let e = self.tex_stats.entry(d.format).or_insert((0, 0)); e.0 += 1; e.1 += bytes;
-        let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(view_dim), ..Default::default() });
-        self.textures.push(GpuTex { tex, view, dim: d.dim });
-        FxTexId(self.textures.len() - 1)
+        note_upload(&self.queue, bytes);
+        let view = match layer { Some((_, l)) => layer_view(&tex, l), None => tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(view_dim), ..Default::default() }) };
+        self.textures.push(GpuTex { tex, view, dim: d.dim, layer });
+        let id = self.textures.len() - 1;
+        if let Some(k) = loose { self.tex_pools.loose.entry(k).or_default().push(id); }
+        FxTexId(id)
+    }
+    fn take_layer(&mut self, key: &PoolKey) -> Option<(usize, u32)> {
+        let ps = self.tex_pools.by_key.get(key)?;
+        for &p in ps {
+            let pool = &mut self.tex_pools.pools[p];
+            if pool.tex.is_none() { continue; }
+            if let Some(l) = pool.free.pop() { pool.live += 1; return Some((p, l)); }
+        }
+        None
+    }
+    fn place_d2(&mut self, label: &str, format: wgpu::TextureFormat, w: u32, h: u32, levels: u32, enc: &mut Option<wgpu::CommandEncoder>) -> (wgpu::Texture, Option<(usize, u32)>, Option<PoolKey>) {
+        let key = (format, w, h, levels);
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
+        let cap = if self.tex_pools.on { pool_capacity(mip_chain_bytes(format, w, h, levels), self.device.limits().max_texture_array_layers.min(256)) } else { None };
+        if let Some(cap) = cap {
+            if let Some((p, l)) = self.take_layer(&key) { return (self.tex_pools.pools[p].tex.clone().unwrap(), Some((p, l)), None); }
+            if self.tex_pools.loose.get(&key).map_or(0, |v| v.len()) + 1 >= cap as usize {
+                let p = self.tex_pools.pools.len();
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor { label: Some("fx tex pool"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: cap }, mip_level_count: levels, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+                self.tex_pools.pools.push(TexPool { tex: Some(tex.clone()), free: (0..cap).rev().collect(), live: 0, layers: cap, bytes: mip_chain_bytes(format, w, h, levels) * cap as u64 });
+                self.tex_pools.by_key.entry(key).or_default().push(p);
+                let moved = self.tex_pools.loose.remove(&key).unwrap_or_default();
+                let (bw, bh) = format.block_dimensions();
+                for id in moved {
+                    let Some((_, l)) = self.take_layer(&key) else { self.tex_pools.loose.entry(key).or_default().push(id); continue };
+                    let e = enc.get_or_insert_with(|| self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fx tex pool fill") }));
+                    for m in 0..levels {
+                        let (cw, ch) = ((w >> m).max(1).next_multiple_of(bw), (h >> m).max(1).next_multiple_of(bh));
+                        e.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo { texture: &self.textures[id].tex, mip_level: m, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: m, origin: wgpu::Origin3d { x: 0, y: 0, z: l }, aspect: wgpu::TextureAspect::All },
+                            wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                        );
+                    }
+                    let view = layer_view(&tex, l);
+                    let old = std::mem::replace(&mut self.textures[id], GpuTex { tex: tex.clone(), view, dim: FxTexDim::D2, layer: Some((p, l)) });
+                    self.retired.push(old.tex);
+                    self.invalidate_binds(id);
+                }
+                if let Some((p, l)) = self.take_layer(&key) { return (tex, Some((p, l)), None); }
+            }
+        }
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: levels, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
+        (tex, None, cap.map(|_| key))
+    }
+    fn unloose(&mut self, id: usize) {
+        let Some(g) = self.textures.get(id) else { return };
+        if g.layer.is_some() || g.dim != FxTexDim::D2 { return; }
+        let k = (g.tex.format(), g.tex.width(), g.tex.height(), g.tex.mip_level_count());
+        if let Some(v) = self.tex_pools.loose.get_mut(&k) { v.retain(|&x| x != id); }
+    }
+    fn release_tex(&mut self, g: GpuTex) {
+        match g.layer { Some(l) => self.tex_pools.freeing.push(l), None => self.retired.push(g.tex) }
+    }
+    fn invalidate_binds(&mut self, id: usize) {
+        if let Some(v) = self.tex_binds.get(&id) { for &i in v { if let Some(b) = self.binds.get_mut(i as usize) { b.built = None; self.bind_pending.push(i); } } }
+    }
+    fn drain_pool_frees(&mut self) {
+        for (p, l) in std::mem::take(&mut self.tex_pools.freeing) {
+            let pool = &mut self.tex_pools.pools[p];
+            pool.free.push(l);
+            pool.live = pool.live.saturating_sub(1);
+            if pool.live == 0 { if let Some(t) = pool.tex.take() { pool.free.clear(); self.retired.push(t); } }
+        }
+    }
+    pub fn pool_stats(&self) -> (usize, u64, u32, u32, usize) {
+        let live: Vec<&TexPool> = self.tex_pools.pools.iter().filter(|p| p.tex.is_some()).collect();
+        (live.len(), live.iter().map(|p| p.bytes).sum(), live.iter().map(|p| p.live).sum(), live.iter().map(|p| p.layers).sum(), self.tex_pools.loose.values().map(|v| v.len()).sum())
     }
     pub fn replace_texture(&mut self, id: FxTexId, d: &FxTextureDesc) -> bool {
         if id.0 >= self.textures.len() { return false; }
+        self.unloose(id.0);
         let new = self.create_texture(d);
         let Some(g) = self.textures.pop() else { return false };
         debug_assert_eq!(new.0, self.textures.len());
-        self.textures[id.0] = g;
-        for b in &mut self.binds {
-            if b.built.is_some() && b.entries.iter().any(|e| matches!(e.res, FxRes::Texture(t) if t == id)) { b.built = None; }
+        if g.layer.is_none() && g.dim == FxTexDim::D2 {
+            let k = (g.tex.format(), g.tex.width(), g.tex.height(), g.tex.mip_level_count());
+            if let Some(v) = self.tex_pools.loose.get_mut(&k) { for x in v.iter_mut() { if *x == new.0 { *x = id.0; } } }
         }
+        let old = std::mem::replace(&mut self.textures[id.0], g);
+        self.release_tex(old);
+        self.invalidate_binds(id.0);
+        if let Some(st) = self.res.state.get_mut(id.0) { if *st >= 2 { *st = 1; self.res.restored += 1; } }
+        true
+    }
+    pub fn set_evictable(&mut self, id: FxTexId) {
+        if self.res.state.len() <= id.0 { self.res.state.resize(id.0 + 1, 0); }
+        if self.res.state[id.0] == 0 { self.res.state[id.0] = 1; }
+    }
+    pub fn touch_binds(&mut self, binds: &[(u32, FxBindId)]) {
+        let f = self.res.frame;
+        for (_, b) in binds { if let Some(u) = self.res.bind_used.get_mut(b.0) { *u = f; } }
+    }
+    pub fn take_wanted_textures(&mut self) -> Vec<FxTexId> { std::mem::take(&mut self.res.wanted).into_iter().map(FxTexId).collect() }
+    pub fn residency_stats(&self) -> (usize, u64, usize) { (self.res.evicted, self.res.evicted_bytes, self.res.restored) }
+    fn residency_mark(&mut self) {
+        self.res.frame += 1;
+        let f = self.res.frame;
+        if self.res.bind_used.len() < self.binds.len() { self.res.bind_used.resize(self.binds.len(), f); }
+        if f % 4 != 0 { return; }
+        let used = &mut self.res.bind_used;
+        for d in &self.frame.draws { for (_, b) in &d.binds { if let Some(u) = used.get_mut(b.0) { *u = f; } } }
+        for d in &self.frame.shadow_draws { for (_, b) in &d.binds { if let Some(u) = used.get_mut(b.0) { *u = f; } } }
+        if f % RES_SCAN_FRAMES != 0 { return; }
+        let mut shrink = vec![];
+        let mut idle: Vec<(u32, u64, usize)> = vec![];
+        let mut full = 0u64;
+        for t in 0..self.res.state.len() {
+            let st = self.res.state[t];
+            if st == 0 { continue; }
+            let Some(bs) = self.tex_binds.get(&t) else { continue };
+            let last = bs.iter().filter_map(|&b| self.res.bind_used.get(b as usize).copied()).max().unwrap_or(f);
+            match st {
+                1 if f.saturating_sub(last) > RES_AGE_FRAMES => shrink.push(t),
+                1 => if let Some((_, bytes, _)) = self.shrink_plan(t) {
+                    full += bytes;
+                    if f.saturating_sub(last) >= RES_PRESSURE_IDLE_FRAMES { idle.push((last, bytes, t)); }
+                },
+                2 if f.saturating_sub(last) < RES_SCAN_FRAMES => { self.res.state[t] = 3; self.res.wanted.push(t); }
+                _ => {}
+            }
+        }
+        let budget = res_budget_bytes();
+        if budget > 0 && full > budget && !idle.is_empty() {
+            idle.sort_unstable_by_key(|e| e.0);
+            let target = budget - budget / 8;
+            for (_, bytes, t) in idle.into_iter().take(RES_PRESSURE_MAX) {
+                if full <= target { break; }
+                shrink.push(t);
+                full -= bytes;
+                self.res.pressured += 1;
+                self.res.pressure_bytes += bytes;
+            }
+        }
+        self.res.full_bytes = full;
+        shrink.truncate(RES_SHRINK_PER_SCAN);
+        let mut enc = None;
+        for t in shrink { if self.shrink_texture(t, &mut enc) { self.res.state[t] = 2; } }
+        if let Some(e) = enc { self.queue.submit(Some(e.finish())); }
+        if cfg!(target_arch = "wasm32") && f % RES_LOG_FRAMES == 0 {
+            let mb = |b: u64| b as f64 / 1048576.;
+            let (np, pb, pl, pt, nl) = self.pool_stats();
+            eprintln!("[tex residency] full-res evictable {:.0} MB (budget {:.0} MB); shrunk {} ({:.0} MB), {} of them for the budget ({:.0} MB); restored {}; pools {np} ({:.0} MB, {pl}/{pt} layers used), {nl} poolable outside pools", mb(full), mb(budget), self.res.evicted, mb(self.res.evicted_bytes), self.res.pressured, mb(self.res.pressure_bytes), self.res.restored, mb(pb));
+        }
+    }
+    fn shrink_plan(&self, t: usize) -> Option<(u32, u64, u64)> {
+        let g = self.textures.get(t)?;
+        if g.dim != FxTexDim::D2 || (g.layer.is_none() && g.tex.depth_or_array_layers() != 1) { return None; }
+        let (w, h, levels, format) = (g.tex.width(), g.tex.height(), g.tex.mip_level_count(), g.tex.format());
+        let (bw, bh) = format.block_dimensions();
+        let bytes_of = |w: u32, h: u32, n: u32| -> u64 { (0..n).map(|m| { let (mw, mh) = ((w >> m).max(1).div_ceil(bw) as u64, (h >> m).max(1).div_ceil(bh) as u64); mw * mh * format.block_copy_size(None).unwrap_or(4) as u64 }).sum() };
+        let full = bytes_of(w, h, levels);
+        if full < RES_MIN_BYTES { return None; }
+        let mut k = 0;
+        while k + 1 < levels && (w >> k).max(h >> k) > RES_KEEP_PX { k += 1; }
+        while k > 0 && ((w >> k) % bw != 0 || (h >> k) % bh != 0 || (w >> k) == 0 || (h >> k) == 0) { k -= 1; }
+        if k == 0 { return None; }
+        Some((k, full, bytes_of(w >> k, h >> k, levels - k)))
+    }
+    fn shrink_texture(&mut self, t: usize, enc: &mut Option<wgpu::CommandEncoder>) -> bool {
+        let Some((k, full, low)) = self.shrink_plan(t) else { return false };
+        let (src, sz) = { let g = &self.textures[t]; (g.tex.clone(), g.layer.map_or(0, |l| l.1)) };
+        let (w, h, levels, format) = (src.width(), src.height(), src.mip_level_count(), src.format());
+        let (bw, bh) = format.block_dimensions();
+        let (nw, nh, nl) = (w >> k, h >> k, levels - k);
+        self.unloose(t);
+        let (new, layer, loose) = self.place_d2("fx tex (resident low mips)", format, nw, nh, nl, enc);
+        let dz = layer.map_or(0, |l| l.1);
+        let e = enc.get_or_insert_with(|| self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fx tex shrink") }));
+        for m in 0..nl {
+            let (mw, mh) = ((w >> (k + m)).max(1), (h >> (k + m)).max(1));
+            let (cw, ch) = (mw.next_multiple_of(bw), mh.next_multiple_of(bh));
+            e.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src, mip_level: k + m, origin: wgpu::Origin3d { x: 0, y: 0, z: sz }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &new, mip_level: m, origin: wgpu::Origin3d { x: 0, y: 0, z: dz }, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+            );
+        }
+        let view = match layer { Some((_, l)) => layer_view(&new, l), None => new.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), ..Default::default() }) };
+        let old = std::mem::replace(&mut self.textures[t], GpuTex { tex: new, view, dim: FxTexDim::D2, layer });
+        if let Some(key) = loose { self.tex_pools.loose.entry(key).or_default().push(t); }
+        self.release_tex(old);
+        self.invalidate_binds(t);
+        self.res.evicted += 1;
+        self.res.evicted_bytes += full - low;
         true
     }
     /// A uniform buffer of `size` bytes (rounded up to 16; WGSL arrays of vec4 need no more).
     pub fn create_buffer(&mut self, label: &str, size: usize) -> FxBufId {
-        self.buffers.push(buffer(&self.device, label, (size.max(16).div_ceil(16) * 16) as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST));
+        let size = (size.max(16).div_ceil(16) * 16) as u64;
+        let usage = wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let b = if size <= BUF_SLAB_MAX {
+            let slot = size.div_ceil(256) * 256;
+            if self.buf_slab.as_ref().is_none_or(|(_, at)| at + slot > BUF_SLAB_BYTES) { self.buf_slab = Some((buffer(&self.device, "fx uniform slab", BUF_SLAB_BYTES, usage), 0)); }
+            let (slab, at) = self.buf_slab.as_mut().unwrap();
+            let off = *at;
+            *at += slot;
+            FxBuf { buf: slab.clone(), off, size }
+        } else { FxBuf { buf: buffer(&self.device, label, size, usage), off: 0, size } };
+        self.buffers.push(b);
         FxBufId(self.buffers.len() - 1)
     }
     /// Writes a uniform buffer right away (static contents such as a material's constant buffer).
     pub fn write_buffer(&self, b: FxBufId, bytes: &[u8]) {
         if let Some(buf) = self.buffers.get(b.0) {
             let n = (bytes.len() as u64).min(buf.size()) as usize;
-            self.queue.write_buffer(buf, 0, &bytes[..n]);
-            if let Ok(mut u) = self.uploaded.lock() { let e = u.entry(b.0).or_default(); e.clear(); e.extend_from_slice(&bytes[..n]); } // PERF
+            self.queue.write_buffer(&buf.buf, buf.off, &bytes[..n]);
+            if self.fog_flag(b) & 1 != 0 { if let Ok(mut d) = self.fog_dirty.lock() { d.push(b); } }
+            if let Ok(mut u) = self.uploaded.lock() { if u.len() <= b.0 { u.resize(b.0 + 1, Vec::new()); } let e = &mut u[b.0]; e.clear(); e.extend_from_slice(&bytes[..n]); } // PERF
         }
     }
     /// INSTANCING (2026-10-07): writes `bytes` at `offset` of a buffer right away (a part of a large static buffer, e.g. one placement's `Primitive` in the
@@ -603,16 +877,28 @@ impl FxRenderer {
         if let Some(buf) = self.buffers.get(b.0) {
             if offset >= buf.size() { return; }
             let n = (bytes.len() as u64).min(buf.size() - offset) as usize & !3;
-            if n > 0 { self.queue.write_buffer(buf, offset, &bytes[..n]); }
-            if let Ok(mut u) = self.uploaded.lock() { u.remove(&b.0); }
+            if n > 0 { self.queue.write_buffer(&buf.buf, buf.off + offset, &bytes[..n]); }
+            if self.fog_flag(b) & 1 != 0 { if let Ok(mut d) = self.fog_dirty.lock() { d.push(b); } }
+            if let Ok(mut u) = self.uploaded.lock() { if let Some(e) = u.get_mut(b.0) { *e = Vec::new(); } }
         }
     }
+    fn mesh_space(&mut self, label: &str, len: u64, usage: wgpu::BufferUsages) -> (wgpu::Buffer, u64) {
+        if len > MESH_SLAB_MAX { return (buffer(&self.device, label, len, usage | wgpu::BufferUsages::COPY_DST), 0); }
+        let slot = len.div_ceil(256) * 256;
+        if self.mesh_slab.as_ref().is_none_or(|(_, at)| at + slot > MESH_SLAB_BYTES) { self.mesh_slab = Some((buffer(&self.device, "fx mesh slab", MESH_SLAB_BYTES, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST), 0)); }
+        let (slab, at) = self.mesh_slab.as_mut().unwrap();
+        let off = *at;
+        *at += slot;
+        (slab.clone(), off)
+    }
     pub fn create_mesh(&mut self, d: &FxMeshDesc) -> FxMeshId {
-        let vb = buffer(&self.device, &d.label, d.vertices.len().max(4) as u64, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
-        self.queue.write_buffer(&vb, 0, &d.vertices);
-        let ib = buffer(&self.device, &d.label, (d.indices.len() * 4).max(4) as u64, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST);
-        self.queue.write_buffer(&ib, 0, bytemuck::cast_slice(&d.indices));
-        self.meshes.push(GpuMesh { vb, ib, index_count: d.indices.len() as u32 });
+        let (vlen, ilen) = (d.vertices.len().max(4) as u64, (d.indices.len() * 4).max(4) as u64);
+        let (vb, vo) = self.mesh_space(&d.label, vlen, wgpu::BufferUsages::VERTEX);
+        self.queue.write_buffer(&vb, vo, &d.vertices);
+        let (ib, io) = self.mesh_space(&d.label, ilen, wgpu::BufferUsages::INDEX);
+        self.queue.write_buffer(&ib, io, bytemuck::cast_slice(&d.indices));
+        note_upload(&self.queue, (d.vertices.len() + d.indices.len() * 4) as u64);
+        self.meshes.push(GpuMesh { vb, ib, index_count: d.indices.len() as u32, vr: (vo, vlen), ir: (io, ilen) });
         FxMeshId(self.meshes.len() - 1)
     }
     /// A pipeline of the program being created (it gets pipe index `self.pipes.len()`). BROWSER PORT: on wasm32 through createRenderPipelineAsync, a
@@ -624,14 +910,18 @@ impl FxRenderer {
         { let _ = slot; self.device.create_render_pipeline(desc) }
     }
     /// PIPELINE DEDUP: the cache key of `d` for pipeline kind `kind` (0 FX pass, 1 scene-lit, 2 shadow): two 64-bit hashes of everything but the label.
+    fn module_for(&mut self, label: &str, src: &str) -> wgpu::ShaderModule {
+        let k = (fast_hash(0x51ed_27a3, src.as_bytes()), fast_hash(0x9d1f_c3b5, src.as_bytes()), src.len());
+        if let Some(m) = self.module_cache.get(&k) { return m.clone(); }
+        let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        self.module_cache.insert(k, m.clone());
+        m
+    }
     fn pipe_key(kind: u8, d: &FxPipelineDesc) -> (u8, u64, u64) {
-        use std::hash::{Hash, Hasher};
         let small = format!("{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}", d.vs_entry, d.fs_entry, d.vertex_buffers, d.groups, d.blend, d.depth, d.cull, d.translucent, d.separate_translucency, d.responsive_aa);
-        let mut a = std::collections::hash_map::DefaultHasher::new();
-        (0u8, &small, &d.wgsl).hash(&mut a);
-        let mut b = std::collections::hash_map::DefaultHasher::new();
-        (1u8, &d.wgsl, &small).hash(&mut b);
-        (kind, a.finish(), b.finish())
+        let (w0, w1) = (fast_hash(0x2545_f491, d.wgsl.as_bytes()), fast_hash(0x6a09_e667, d.wgsl.as_bytes()));
+        let (s0, s1) = (fast_hash(0x3c6e_f372, small.as_bytes()), fast_hash(0xa54f_f53a, small.as_bytes()));
+        (kind, mix64(w0 ^ mix64(s0 ^ d.wgsl.len() as u64)), mix64(s1 ^ mix64(w1.rotate_left(17) ^ small.len() as u64)))
     }
     /// PIPELINE DEDUP: the pipe already made from `key`, counted as a reuse.
     fn cached_pipe(&mut self, key: &(u8, u64, u64)) -> Option<FxPipeId> {
@@ -646,6 +936,12 @@ impl FxRenderer {
     }
     /// BROWSER PORT: FX pipelines the browser is still compiling (always 0 natively, where they are created synchronously). Installs the finished
     /// ones first (the loading screen polls this while no scene frame runs [`Self::prepare`]).
+    pub fn pipe_pending(&self, id: FxPipeId) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        { return self.web.is_pending(id.0); }
+        #[cfg(not(target_arch = "wasm32"))]
+        { let _ = id; false }
+    }
     pub fn pending_pipelines(&mut self) -> usize {
         #[cfg(target_arch = "wasm32")]
         { self.web_poll(); return self.web.pending_count(); }
@@ -670,7 +966,7 @@ impl FxRenderer {
         let responsive = d.responsive_aa && d.translucent;
         let mask_fs = if responsive && !d.wgsl.contains("discard") { Some(RESPONSIVE_AA_FS) } else if responsive { Some(d.fs_entry.as_str()) } else { None };
         let src: std::borrow::Cow<str> = if mask_fs == Some(RESPONSIVE_AA_FS) { format!("{}\n@fragment fn {RESPONSIVE_AA_FS}() -> @location(0) vec4<f32> {{ return vec4<f32>(0.0); }}\n", d.wgsl).into() } else { d.wgsl.as_str().into() };
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&d.label), source: wgpu::ShaderSource::Wgsl(src) });
+        let module = self.module_for(&d.label, &src);
         let layouts: Vec<wgpu::BindGroupLayout> = d.groups.iter().map(|g| {
             let entries: Vec<wgpu::BindGroupLayoutEntry> = g.iter().map(|e| {
                 let mut vis = wgpu::ShaderStages::empty();
@@ -761,7 +1057,7 @@ impl FxRenderer {
         if let Some(id) = self.cached_pipe(&key) { return Ok(id); }
         #[cfg(target_arch = "wasm32")] self.web_stage_limits(d, Some(FX_SCENE_GROUP))?; // BROWSER PORT
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&d.label), source: wgpu::ShaderSource::Wgsl(d.wgsl.as_str().into()) });
+        let module = self.module_for(&d.label, &d.wgsl);
         let mut layouts: Vec<wgpu::BindGroupLayout> = d.groups.iter().map(|g| self.group_layout(&d.label, g)).collect();
         while layouts.len() < FX_SCENE_GROUP as usize { layouts.push(self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("fx scene-lit empty"), entries: &[] })); }
         let mut layout_refs: Vec<Option<&wgpu::BindGroupLayout>> = layouts.iter().map(Some).collect();
@@ -942,7 +1238,7 @@ impl FxRenderer {
         if let Some(id) = self.cached_pipe(&key) { return Ok(id); }
         #[cfg(target_arch = "wasm32")] self.web_stage_limits(d, None)?; // BROWSER PORT
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(&d.label), source: wgpu::ShaderSource::Wgsl(d.wgsl.as_str().into()) });
+        let module = self.module_for(&d.label, &d.wgsl);
         let mut layouts: Vec<wgpu::BindGroupLayout> = d.groups.iter().map(|g| {
             let entries: Vec<wgpu::BindGroupLayoutEntry> = g.iter().map(|e| {
                 let mut vis = wgpu::ShaderStages::empty();
@@ -1055,7 +1351,7 @@ impl FxRenderer {
             }
             for (g, id, bg) in bgs { let gi = g as usize; if gi < st.binds.len() && st.binds[gi] == id + 1 { continue; } pass.set_bind_group(g, bg, &[]); if gi < st.binds.len() { st.binds[gi] = id + 1; } if g == FX_SHADOW_GROUP { st.globals = 0; } }
             let (first, count) = range.unwrap_or((0, m.index_count));
-            if st.mesh != mesh.0 + 1 { pass.set_vertex_buffer(0, m.vb.slice(..)); pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32); st.mesh = mesh.0 + 1; }
+            if st.mesh != mesh.0 + 1 { pass.set_vertex_buffer(0, m.vbs()); pass.set_index_buffer(m.ibs(), wgpu::IndexFormat::Uint32); st.mesh = mesh.0 + 1; }
             let instances = match inst { Some((at, k)) => { pass.set_vertex_buffer(1, self.inst_vb.slice(at..at + 4 * k as u64)); k } None => 1 };
             pass.draw_indexed(first..(first + count).min(m.index_count), 0, 0..instances);
         }
@@ -1064,7 +1360,11 @@ impl FxRenderer {
     pub fn create_bind_group(&mut self, pipe: FxPipeId, group: u32, entries: Vec<FxBindEntry>) -> FxBindId {
         let uses_depth = entries.iter().any(|e| matches!(e.res, FxRes::SceneDepth));
         let uses_volume = entries.iter().any(|e| matches!(e.res, FxRes::TranslucencyVolume(_) | FxRes::FogVolume)); // FOG INPUTS: shares the volume generation
+        let bi = self.binds.len() as u32;
+        for e in &entries { if let FxRes::Texture(t) = e.res { let v = self.tex_binds.entry(t.0).or_default(); if v.last() != Some(&bi) { v.push(bi); } } }
         self.binds.push(BindGroupRec { pipe, group, entries, built: None, uses_depth, uses_volume });
+        self.bind_pending.push(bi);
+        if uses_depth || uses_volume { self.bind_dep.push(bi); }
         FxBindId(self.binds.len() - 1)
     }
     /// TRANSLUCENCY VOLUME: this frame's volume textures (`crate::translucent_lighting`, [`FxRes::TranslucencyVolume`] order); bind groups that read them are rebuilt
@@ -1078,10 +1378,15 @@ impl FxRenderer {
     pub fn register_height_fog(&mut self, buf: FxBufId, slots: Vec<FxFogSlot>) {
         if slots.is_empty() { return; }
         if self.fog_targets.is_empty() { eprintln!("[fx] height-fog inputs bound: first $Globals buffer with {} fog values (FogRendering.h:26 Set)", slots.len()); }
+        if let Some(p) = self.fog_patched.get_mut(buf.0) { *p = false; }
         self.fog_targets.insert(buf, slots);
+        self.set_fog_flag(buf, 1);
+        self.fog_gen += 1;
     }
+    fn fog_flag(&self, b: FxBufId) -> u8 { self.fog_flags.get(b.0).copied().unwrap_or(0) }
+    fn set_fog_flag(&mut self, b: FxBufId, bit: u8) { if self.fog_flags.len() <= b.0 { self.fog_flags.resize(b.0 + 1, 0); } self.fog_flags[b.0] |= bit; }
     /// FOG INPUTS: a `View` uniform buffer of FX programs: [`Self::prepare`] writes its volumetric-fog slots ([`VIEW_VOLUMETRIC_FOG_SLOT`]..+3).
-    pub fn register_view_buffer(&mut self, buf: FxBufId) { self.fog_views.insert(buf); }
+    pub fn register_view_buffer(&mut self, buf: FxBufId) { self.fog_views.insert(buf); self.set_fog_flag(buf, 2); }
     /// MATERIAL PARAMETERS: the shared uniform buffer of the parameter collection `path` (object path), if one exists.
     pub fn collection_buffer(&self, path: &str) -> Option<FxBufId> { self.collections.get(path).copied() }
     /// MATERIAL PARAMETERS: makes `buf` the shared uniform buffer of the parameter collection `path` (a caller that writes the collection itself, e.g. the storm's
@@ -1128,12 +1433,17 @@ impl FxRenderer {
         self.web_poll(); // BROWSER PORT: install the pipelines that finished compiling
         let mut frame = std::mem::take(&mut self.frame);
         // VELOCITY: the View buffers' PrevTranslatedWorldToClip / PrevPreViewTranslation = last frame's own TranslatedWorldToClip / PreViewTranslation (taa.rs ViewHistory)
-        for (b, bytes) in frame.buffer_writes.iter_mut() { if self.fog_views.contains(b) { crate::taa::apply_view_size(bytes, self.view_size); crate::taa::apply_view_jitter(bytes, self.view_jitter); self.view_history.patch(b.0, bytes); } } // GRASS MOTION: jitter first (the history keeps jittered matrices)
+        let flags = std::mem::take(&mut self.fog_flags);
+        let flag = |b: &FxBufId| flags.get(b.0).copied().unwrap_or(0);
+        for (b, bytes) in frame.buffer_writes.iter_mut() { if flag(b) & 2 != 0 { crate::taa::apply_view_size(bytes, self.view_size); crate::taa::apply_view_jitter(bytes, self.view_jitter); self.view_history.patch(b.0, bytes); } } // GRASS MOTION: jitter first (the history keeps jittered matrices)
         // PERF (2026-10-06): every write below goes through `put`: queue.write_buffer, or (staged uploads, the renderer) appended to this frame's one staging
         // buffer and copied by `encode_uploads` in the same order
         self.stage_bytes.clear();
         self.stage_copies.clear();
-        self.stage_buf = None;
+        self.stage_ready = false;
+        for t in self.retired.drain(..) { t.destroy(); }
+        self.drain_pool_frees();
+        FRAME_UPLOAD.store(0, std::sync::atomic::Ordering::Relaxed);
         let (staged, queue, stage_bytes, stage_copies) = (self.staged, &self.queue, &mut self.stage_bytes, &mut self.stage_copies);
         let mut put = |dst: &wgpu::Buffer, offset: u64, data: &[u8]| {
             if data.is_empty() { return; }
@@ -1145,30 +1455,67 @@ impl FxRenderer {
         };
         // PERF: a whole-buffer write identical to what the buffer already holds is skipped (see `uploaded`)
         self.upload_skipped = 0;
+        // FOG INPUTS: the height-fog values and the View volumetric-fog slots over the frame's whole-buffer writes (queue order)
+        if self.fog_last.as_ref() != Some(&self.view_fog.values) { self.fog_patched.fill(false); self.fog_last = Some(self.view_fog.values); }
+        if self.fog_patched.len() < self.buffers.len() { self.fog_patched.resize(self.buffers.len(), false); }
+        if let Ok(mut d) = self.fog_dirty.lock() { for b in d.drain(..) { if let Some(p) = self.fog_patched.get_mut(b.0) { *p = false; } } }
+        let fog_values = self.view_fog.values;
+        let patch_fog = |bytes: &mut [u8], base: usize, slots: &[FxFogSlot]| {
+            for s in slots {
+                let n = (s.num_bytes as usize / 4).min(4);
+                let Some(o) = (s.byte_offset as usize).checked_sub(base) else { continue };
+                if o + 4 * n > bytes.len() { continue; }
+                bytes[o..o + 4 * n].copy_from_slice(bytemuck::cast_slice(&fog_values[s.field as usize][..n]));
+            }
+        };
         {
             let mut uploaded = self.uploaded.lock().unwrap_or_else(|e| e.into_inner());
+            if uploaded.len() < self.buffers.len() { uploaded.resize(self.buffers.len(), Vec::new()); }
             for (b, bytes) in &frame.buffer_writes {
                 let Some(buf) = self.buffers.get(b.0) else { continue };
                 let n = (bytes.len() as u64).min(buf.size()) as usize;
-                let patched = self.fog_targets.contains_key(b) || self.fog_views.contains(b);
-                if !patched && uploaded.get(&b.0).map_or(false, |prev| prev.as_slice() == &bytes[..n]) { self.upload_skipped += 1; continue; }
-                put(buf, 0, &bytes[..n]);
-                if !patched { let e = uploaded.entry(b.0).or_default(); e.clear(); e.extend_from_slice(&bytes[..n]); }
+                let fl = flag(b);
+                let fog = if fl & 1 != 0 { self.fog_targets.get(b) } else { None };
+                let patched = fl != 0;
+                if !patched && uploaded.get(b.0).map_or(false, |prev| !prev.is_empty() && prev.as_slice() == &bytes[..n]) { self.upload_skipped += 1; continue; }
+                match fog {
+                    Some(slots) => { let mut v = bytes[..n].to_vec(); patch_fog(&mut v, 0, slots); put(&buf.buf, buf.off, &v); if let Some(p) = self.fog_patched.get_mut(b.0) { *p = true; } }
+                    None => put(&buf.buf, buf.off, &bytes[..n]),
+                }
+                if let Some(e) = uploaded.get_mut(b.0) { e.clear(); e.extend_from_slice(&bytes[..n]); }
+            }
+            let mut want: Vec<FxBufId> = vec![];
+            if self.bind_fog.len() < self.binds.len() { self.bind_fog.resize(self.binds.len(), (0, Vec::new())); }
+            let gen = self.fog_gen;
+            for binds in frame.draws.iter().map(|d| &d.binds).chain(frame.shadow_draws.iter().map(|d| &d.binds)) {
+                for (_, id) in binds {
+                    let Some(rec) = self.binds.get(id.0) else { continue };
+                    let bf = &mut self.bind_fog[id.0];
+                    if bf.0 != gen { bf.1.clear(); for e in &rec.entries { if let FxRes::Buffer(b) = e.res { if flag(&b) & 1 != 0 { bf.1.push(b); } } } bf.0 = gen; }
+                    for &b in &bf.1 { if self.fog_patched.get_mut(b.0).is_some_and(|p| !std::mem::replace(p, true)) { want.push(b); } }
+                }
+            }
+            for b in want {
+                let (Some(buf), Some(slots)) = (self.buffers.get(b.0), self.fog_targets.get(&b)) else { continue };
+                let fits = |s: &FxFogSlot| s.byte_offset as u64 + 4 * (s.num_bytes as u64 / 4).min(4) <= buf.size();
+                let lo = slots.iter().filter(|s| fits(s)).map(|s| s.byte_offset as usize).min().unwrap_or(0);
+                let hi = slots.iter().filter(|s| fits(s)).map(|s| s.byte_offset as usize + 4 * (s.num_bytes as usize / 4).min(4)).max().unwrap_or(0);
+                if hi <= lo { continue; }
+                match uploaded.get(b.0).filter(|c| c.len() >= hi) {
+                    Some(c) => { let mut v = c[lo..hi].to_vec(); patch_fog(&mut v, lo, slots); put(&buf.buf, buf.off + lo as u64, &v); }
+                    None => {
+                        for s in slots.iter().filter(|s| fits(s)) {
+                            let n = (s.num_bytes as usize / 4).min(4);
+                            put(&buf.buf, buf.off + s.byte_offset as u64, bytemuck::cast_slice(&fog_values[s.field as usize][..n]));
+                        }
+                    }
+                }
             }
         }
-        // FOG INPUTS: the height-fog values and the View volumetric-fog slots over the frame's whole-buffer writes (queue order)
-        for (b, slots) in &self.fog_targets {
-            let Some(buf) = self.buffers.get(b.0) else { continue };
-            for s in slots {
-                let v = self.view_fog.values[s.field as usize];
-                let n = (s.num_bytes as usize / 4).min(4);
-                if s.byte_offset as u64 + 4 * n as u64 > buf.size() { continue; }
-                put(buf, s.byte_offset as u64, bytemuck::cast_slice(&v[..n]));
-            }
-        }
+        self.fog_flags = flags;
         for b in &self.fog_views {
             let Some(buf) = self.buffers.get(b.0) else { continue };
-            if ((VIEW_VOLUMETRIC_FOG_SLOT + 3) * 16) as u64 <= buf.size() { put(buf, (VIEW_VOLUMETRIC_FOG_SLOT * 16) as u64, bytemuck::cast_slice(&self.view_fog.view)); }
+            if ((VIEW_VOLUMETRIC_FOG_SLOT + 3) * 16) as u64 <= buf.size() { put(&buf.buf, buf.off + (VIEW_VOLUMETRIC_FOG_SLOT * 16) as u64, bytemuck::cast_slice(&self.view_fog.view)); }
         }
         // dynamic geometry / instances
         self.placed.clear();
@@ -1191,34 +1538,49 @@ impl FxRenderer {
         // INSTANCING (2026-10-07): per instanced shadow draw and cascade, the ids of the instances that pass that cascade's caster test (the same test a draw
         // per placement gets, `sphere_in_cascade`), each list after the other in `inst_vb`
         let mut shadow_placed = std::mem::take(&mut self.shadow_placed);
-        shadow_placed.clear();
         let (cull, small) = (&self.shadow_cull, self.shadow_small);
         let ncasc = cull.len().max(1);
+        let mut ids: Vec<u32> = std::mem::take(&mut self.shadow_ids);
+        let mut used = 0usize;
         for d in &frame.shadow_draws {
-            let mut per = vec![];
+            if shadow_placed.len() <= used { shadow_placed.push(vec![]); }
+            let per = &mut shadow_placed[used];
+            used += 1;
+            per.clear();
             if let Some(si) = &d.instances {
                 for c in 0..ncasc {
                     let start = inst_at;
                     let mut k = 0u32;
-                    let mut ids: Vec<u32> = Vec::with_capacity(si.ids.len());
+                    ids.clear();
                     for (id, b) in si.ids.iter().zip(&si.bounds) { if sphere_in_cascade_of(cull, small, *b, c) { ids.push(*id); k += 1; } }
                     let n = 4 * k as u64;
                     if k > 0 && start + n <= INST_CAPACITY { put(&self.inst_vb, start, bytemuck::cast_slice(&ids)); inst_at += (n + 15) / 16 * 16; per.push((start, k)); } else { per.push((0, 0)); }
                 }
             }
-            shadow_placed.push(per);
         }
+        shadow_placed.truncate(used);
+        self.shadow_ids = ids;
         self.shadow_placed = shadow_placed;
         // PERF (2026-10-06): the frame's staged bytes in one mapped upload buffer (copied by `encode_uploads`)
+        if self.stage_copies.len() > 1 {
+            let mut merged: Vec<(wgpu::Buffer, u64, u64, u64)> = Vec::with_capacity(self.stage_copies.len());
+            for c in self.stage_copies.drain(..) {
+                if let Some(l) = merged.last_mut() { if l.0 == c.0 && l.1 + l.3 == c.1 && l.2 + l.3 == c.2 { l.3 += c.3; continue; } }
+                merged.push(c);
+            }
+            self.stage_copies = merged;
+        }
         if !self.stage_copies.is_empty() {
             let size = (self.stage_bytes.len() as u64).div_ceil(wgpu::COPY_BUFFER_ALIGNMENT) * wgpu::COPY_BUFFER_ALIGNMENT;
-            let b = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("fx frame uploads"), size, usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: true });
-            let mapped = match b.slice(..).get_mapped_range_mut() { Ok(mut m) => { m.slice(..self.stage_bytes.len()).copy_from_slice(&self.stage_bytes); true } Err(_) => false };
-            b.unmap();
-            if mapped { self.stage_buf = Some(b); } else {
-                // not mapped (never expected for mapped_at_creation): the direct writes, same order
-                for (dst, src, off, size) in &self.stage_copies { self.queue.write_buffer(dst, *off, &self.stage_bytes[*src as usize..(*src + *size) as usize]); }
-                self.stage_copies.clear();
+            if self.stage_buf.as_ref().is_none_or(|b| b.size() < size) {
+                if let Some(b) = self.stage_buf.take() { b.destroy(); }
+                let cap = size.next_power_of_two().max(256 << 10);
+                self.stage_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("fx frame uploads"), size: cap, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }));
+            }
+            if let Some(b) = &self.stage_buf {
+                self.stage_bytes.resize(size as usize, 0);
+                self.queue.write_buffer(b, 0, &self.stage_bytes);
+                self.stage_ready = true;
             }
         }
         // PERF (FPS investigation 2026-10-06): `FN_FX_UPLOAD_STATS=1` prints the frame's queue.write_buffer count / bytes every 120 frames
@@ -1228,9 +1590,10 @@ impl FxRenderer {
             let full = frame.buffer_writes.len(); let full_bytes: usize = frame.buffer_writes.iter().map(|(_, b)| b.len()).sum();
             let fog: usize = self.fog_targets.values().map(|s| s.len()).sum::<usize>() + self.fog_views.len();
             let distinct = frame.buffer_writes.iter().map(|(b, _)| b.0).collect::<std::collections::HashSet<_>>().len();
-            eprintln!("[fx upload] full writes {full} ({distinct} distinct buffers, {:.1} KB; {} skipped as unchanged), fog slot writes {fog}, draws {}, dynamic/instance writes {} | totals: {} buffers, {} bind groups, {} pipelines, {} meshes, {} textures", full_bytes as f32 / 1024., self.upload_skipped, frame.draws.len(), self.placed.iter().filter(|p| p.index_count > 0 || p.inst > 0).count(), self.buffers.len(), self.binds.len(), self.pipes.len(), self.meshes.len(), self.textures.len());
+            eprintln!("[fx upload] staged copies {}, full writes {full} ({distinct} distinct buffers, {:.1} KB; {} skipped as unchanged), fog slot writes {fog}, draws {}, dynamic/instance writes {} | totals: {} buffers, {} bind groups, {} pipelines, {} meshes, {} textures", self.stage_copies.len(), full_bytes as f32 / 1024., self.upload_skipped, frame.draws.len(), self.placed.iter().filter(|p| p.index_count > 0 || p.inst > 0).count(), self.buffers.len(), self.binds.len(), self.pipes.len(), self.meshes.len(), self.textures.len());
         }
         self.frame = frame;
+        self.residency_mark();
         // translucent draw order: FCompareFTranslucentSortedPrim (SceneRendering.h:395), per pass: priority ascending, then the sort key descending (back to front);
         // a stable sort keeps the elements of one primitive (equal keys) in submission order (RenderPrimitive draws a primitive's mesh batches in order)
         self.order_standard.clear(); self.order_separate.clear();
@@ -1247,17 +1610,22 @@ impl FxRenderer {
         // bind groups
         self.depth_gen = depth_gen;
         let volume_gen = self.volume_gen;
-        for i in 0..self.binds.len() {
-            let needs = { let b = &self.binds[i]; match &b.built { None => true, Some(((g, v), _)) => (b.uses_depth && *g != depth_gen) || (b.uses_volume && *v != volume_gen) } };
+        let mut check = std::mem::take(&mut self.bind_pending);
+        check.extend_from_slice(&self.bind_dep);
+        let mut retry: Vec<u32> = vec![];
+        for &ci in &check {
+            let i = ci as usize;
+            let Some(b) = self.binds.get(i) else { continue };
+            let needs = match &b.built { None => true, Some(((g, v), _)) => (b.uses_depth && *g != depth_gen) || (b.uses_volume && *v != volume_gen) };
             if !needs { continue; }
             let (pipe, group, entries) = { let b = &self.binds[i]; (b.pipe, b.group, b.entries.clone()) };
-            if self.pipes.get(pipe.0).is_none() { continue; }
+            if self.pipes.get(pipe.0).is_none() { retry.push(ci); continue; }
             // sampler objects must outlive the entry list: resolve them first
             for e in &entries { if let FxRes::Sampler(s) = e.res { let _ = self.sampler(s); } }
             let mut bge: Vec<wgpu::BindGroupEntry> = vec![];
             for e in &entries {
                 let resource = match e.res {
-                    FxRes::Buffer(b) => self.buffers[b.0].as_entire_binding(),
+                    FxRes::Buffer(b) => self.buffers[b.0].binding(),
                     FxRes::Texture(t) => wgpu::BindingResource::TextureView(&self.textures[t.0].view),
                     FxRes::Sampler(s) => wgpu::BindingResource::Sampler(self.samplers.get(&s).unwrap()),
                     FxRes::SceneDepth => wgpu::BindingResource::TextureView(depth_view),
@@ -1270,17 +1638,19 @@ impl FxRenderer {
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("fx bind group"), layout: &self.pipes[pipe.0].layouts[group as usize], entries: &bge });
             self.binds[i].built = Some(((depth_gen, volume_gen), bg));
         }
+        check.clear();
+        self.bind_pending = if retry.is_empty() { check } else { retry };
     }
 
     /// PERF (2026-10-06, frame-time spikes): stage [`Self::prepare`]'s writes and copy them with [`Self::encode_uploads`] instead of `queue.write_buffer`
     /// (the renderer; tools that never call `encode_uploads` keep the direct writes).
     pub fn set_staged_uploads(&mut self, on: bool) { self.staged = on; }
     /// This frame's staged uploads exist (see [`Self::set_staged_uploads`]).
-    pub fn has_uploads(&self) -> bool { self.stage_buf.is_some() }
+    pub fn has_uploads(&self) -> bool { self.stage_ready }
     /// Records this frame's staged uploads (the copies `prepare` would have queued with `queue.write_buffer`, same bytes, destinations and order). Call
     /// once, on the frame's encoder, before any pass that reads the FX buffers.
     pub fn encode_uploads(&self, enc: &mut wgpu::CommandEncoder) {
-        let Some(src) = &self.stage_buf else { return };
+        let Some(src) = self.stage_buf.as_ref().filter(|_| self.stage_ready) else { return };
         for (dst, src_off, dst_off, size) in &self.stage_copies { enc.copy_buffer_to_buffer(src, *src_off, dst, *dst_off, Some(*size)); }
     }
 
@@ -1381,8 +1751,8 @@ impl FxRenderer {
             if !ok { return; }
             let instances = match &d.instances { Some(i) => { if p.instanced { pass.set_vertex_buffer(1, self.inst_vb.slice(placed.inst..placed.inst + i.bytes.len() as u64)); } i.count } None => 1 };
             match &d.geom {
-                FxGeom::MeshRange { mesh, first_index, index_count } => { let Some(m) = self.meshes.get(mesh.0) else { return }; if st.mesh != mesh.0 + 1 { pass.set_vertex_buffer(0, m.vb.slice(..)); pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32); st.mesh = mesh.0 + 1; } pass.draw_indexed(*first_index..(first_index + index_count).min(m.index_count), 0, 0..instances); }
-                FxGeom::Mesh(m) => { let Some(mm) = self.meshes.get(m.0) else { return }; if st.mesh != m.0 + 1 { pass.set_vertex_buffer(0, mm.vb.slice(..)); pass.set_index_buffer(mm.ib.slice(..), wgpu::IndexFormat::Uint32); st.mesh = m.0 + 1; } pass.draw_indexed(0..mm.index_count, 0, 0..instances); }
+                FxGeom::MeshRange { mesh, first_index, index_count } => { let Some(m) = self.meshes.get(mesh.0) else { return }; if st.mesh != mesh.0 + 1 { pass.set_vertex_buffer(0, m.vbs()); pass.set_index_buffer(m.ibs(), wgpu::IndexFormat::Uint32); st.mesh = mesh.0 + 1; } pass.draw_indexed(*first_index..(first_index + index_count).min(m.index_count), 0, 0..instances); }
+                FxGeom::Mesh(m) => { let Some(mm) = self.meshes.get(m.0) else { return }; if st.mesh != m.0 + 1 { pass.set_vertex_buffer(0, mm.vbs()); pass.set_index_buffer(mm.ibs(), wgpu::IndexFormat::Uint32); st.mesh = m.0 + 1; } pass.draw_indexed(0..mm.index_count, 0, 0..instances); }
                 FxGeom::Dynamic { vertices, indices } => { if placed.index_count == 0 { return; } st.mesh = 0; pass.set_vertex_buffer(0, self.dyn_vb.slice(placed.vb..placed.vb + vertices.len() as u64)); pass.set_index_buffer(self.dyn_ib.slice(placed.ib..placed.ib + (indices.len() * 4) as u64), wgpu::IndexFormat::Uint32); pass.draw_indexed(0..placed.index_count, 0, 0..instances); }
             }
         }
@@ -1415,7 +1785,59 @@ mod tests {
         v.sort_by(sort_order);
         assert_eq!(v, vec![wall, beam, late]);
     }
+
+    fn chain(w: u32, h: u32, seed: u8) -> Vec<FxLevel> {
+        let n = 32 - w.max(h).leading_zeros();
+        (0..n).map(|m| { let (mw, mh) = ((w >> m).max(1), (h >> m).max(1)); FxLevel { width: mw, height: mh, depth: 1, rgba8: (0..mw * mh * 4).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed).wrapping_add(m as u8 * 17)).collect() } }).collect()
+    }
+    fn read_level(fx: &FxRenderer, id: FxTexId, mip: u32) -> Vec<u8> {
+        let g = &fx.textures[id.0];
+        let (w, h) = ((g.tex.width() >> mip).max(1), (g.tex.height() >> mip).max(1));
+        let row = (w * 4).next_multiple_of(256);
+        let buf = fx.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = fx.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture: &g.tex, mip_level: mip, origin: wgpu::Origin3d { x: 0, y: 0, z: g.layer.map_or(0, |l| l.1) }, aspect: wgpu::TextureAspect::All }, wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+        fx.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        fx.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().unwrap();
+        (0..h).flat_map(|y| data[(y * row) as usize..(y * row + w * 4) as usize].to_vec()).collect()
+    }
+    #[test] fn pooled_textures_keep_their_pixels_through_migration_shrink_and_replace() {
+        let Ok(g) = crate::gpu::Gpu::headless() else { eprintln!("no GPU: skipped"); return };
+        let mut fx = FxRenderer::new(&g.device, &g.queue, wgpu::TextureFormat::Rgba16Float, wgpu::TextureFormat::Depth32Float);
+        fx.tex_pools.on = true;
+        let desc = |w: u32, seed: u8| FxTextureDesc { label: format!("t{seed}"), dim: FxTexDim::D2, srgb: false, levels: chain(w, w, seed), format: FxTexFormat::Rgba8 };
+        let mut want: Vec<(FxTexId, Vec<FxLevel>)> = vec![];
+        for s in 0..14u8 { let d = desc(256, s); want.push((fx.create_texture(&d), d.levels)); }
+        for s in 20..27u8 { let d = desc(64, s); want.push((fx.create_texture(&d), d.levels)); }
+        let (pools, _, used, _, _) = fx.pool_stats();
+        assert!(pools >= 2 && used >= 12, "pools {pools}, layers used {used}");
+        assert!(fx.textures[want[0].0 .0].layer.is_some() && fx.textures[want[15].0 .0].layer.is_some());
+        let mut enc = None;
+        assert!(fx.shrink_texture(want[3].0 .0, &mut enc));
+        if let Some(e) = enc { fx.queue.submit(Some(e.finish())); }
+        let shrunk = want[3].1.split_off(2);
+        want[3].1 = shrunk;
+        let d = desc(128, 99);
+        assert!(fx.replace_texture(want[5].0, &d));
+        want[5].1 = d.levels;
+        fx.drain_pool_frees();
+        let d = desc(256, 77);
+        want.push((fx.create_texture(&d), d.levels));
+        for (id, levels) in &want { for (m, l) in levels.iter().enumerate() { assert_eq!(read_level(&fx, *id, m as u32), l.rgba8, "texture {} mip {m}", id.0); } }
+    }
 }
 
 
 
+
+fn mix64(mut x: u64) -> u64 { x ^= x >> 33; x = x.wrapping_mul(0xff51_afd7_ed55_8ccd); x ^= x >> 33; x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53); x ^ (x >> 33) }
+fn fast_hash(seed: u64, b: &[u8]) -> u64 {
+    let mut h = mix64(seed ^ b.len() as u64);
+    let mut c = b.chunks_exact(8);
+    for w in &mut c { let v = u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]); h = (h ^ mix64(v ^ seed)).rotate_left(27).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(0x52dc_e729); }
+    let mut t = [0u8; 8]; t[..c.remainder().len()].copy_from_slice(c.remainder());
+    mix64(h ^ u64::from_le_bytes(t) ^ 0x8ebc_6af0_9c88_c6e3)
+}

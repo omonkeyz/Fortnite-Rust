@@ -141,6 +141,8 @@ enum LitTail<'a> {
 }
 
 fn assemble_tail(vs: &Program, ps: &Program, tail: LitTail, clip: Option<&Program>) -> Result<Assembled, String> {
+    let (vs, ps, clip) = (vs.full(), ps.full(), clip.map(Program::full));
+    let (vs, ps, clip) = (&*vs, &*ps, clip.as_deref());
     let lit = !matches!(tail, LitTail::Unlit | LitTail::SceneUnlit(_));
     if vs.shader.program_type != ProgramType::Vertex || ps.shader.program_type != ProgramType::Pixel { return Err("assemble needs a vertex and a pixel program".into()); }
     let vsw = translated_function_wgsl(&vs.shader, "vs_fx")?;
@@ -265,7 +267,7 @@ fn assemble_tail(vs: &Program, ps: &Program, tail: LitTail, clip: Option<&Progra
     s.push_str(&setup);
     s.push_str(&clip_body);
     let shade_at = s.len();
-    s.push_str("    let o = ps_fx(v);\n");
+    s.push_str(if pin.is_some() { "    let o = ps_fx(v);\n" } else { "    let o = ps_fx();\n" });
     if matches!(tail, LitTail::Scene(_)) {
         // FX RECEIVE: GBufferA normal (UE axes -> renderer (x, z, y)), scene colour = emissive, GBufferC = base colour + GBufferAO, GBufferB = metallic / specular /
         // roughness (DeferredShadingCommon.usf:417-442, r.AllowStaticLighting 0), resolved by fn-render fx_resolve.wgsl `fx_scene_lit`
@@ -326,7 +328,7 @@ fn assemble_tail(vs: &Program, ps: &Program, tail: LitTail, clip: Option<&Progra
         s.push_str("@fragment fn fs_velocity(in: FsIn) -> @location(0) vec4<f32> {\n");
         s.push_str(&setup);
         s.push_str(&clip_body);
-        let _ = write!(s, "    let o = ps_fx(v);\n    return vec4<f32>(round(clamp(o[{GBUFFER_VELOCITY_TARGET}].xy, vec2<f32>(0.0), vec2<f32>(1.0)) * 65535.0) / 65535.0, 0.0, 0.0);\n}}\n");
+        let _ = write!(s, "    let o = {};\n    return vec4<f32>(round(clamp(o[{GBUFFER_VELOCITY_TARGET}].xy, vec2<f32>(0.0), vec2<f32>(1.0)) * 65535.0) / 65535.0, 0.0, 0.0);\n}}\n", if pin.is_some() { "ps_fx(v)" } else { "ps_fx()" });
     }
     let _ = (vout, pout);
     Ok(Assembled { wgsl: s, resources, vs_inputs, varyings, targets, ps_uses_position: uses_pos })
@@ -337,6 +339,8 @@ fn assemble_tail(vs: &Program, ps: &Program, tail: LitTail, clip: Option<&Progra
 /// `fx_shadow_depth_outputs`, defined by `prelude` (the renderer's `fn_render::fx::FX_SHADOW_WGSL`); `fs_main` (only with a pixel program) runs the program for its `discard`
 /// (`GetMaterialClippingShadowDepth`, ShadowDepthPixelShader.usf) and writes no colour (`OutColor = 0` goes to no target in a depth-only pass).
 pub fn assemble_shadow(vs: &Program, ps: Option<&Program>, prelude: &str) -> Result<Assembled, String> {
+    let (vs, ps) = (vs.full(), ps.map(Program::full));
+    let (vs, ps) = (&*vs, ps.as_deref());
     if vs.shader.program_type != ProgramType::Vertex || ps.map_or(false, |p| p.shader.program_type != ProgramType::Pixel) { return Err("assemble_shadow needs a vertex (and optionally a pixel) program".into()); }
     let mut resources = vec![];
     let vsw = rebind(&rename_resources(&translated_function_wgsl(&vs.shader, "vs_fx")?, "v"), Stage::Vertex, 0, &mut resources)?.replace("diagnostic(off, derivative_uniformity);\n", "");

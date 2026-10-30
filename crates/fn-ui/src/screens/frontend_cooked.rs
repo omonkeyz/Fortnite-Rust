@@ -168,12 +168,14 @@ impl CookedPicker {
         list
     }
     /// Rasters the background at every `bGameMode` step once (the CPU raster is slow; the switch animation then only picks textures).
-    pub fn warm(&mut self, uic: &mut UiContext, w: f32, h: f32) {
-        for k in 0..=MODE_STEPS {
-            let mut p = Picker::new();
-            p.game_mode = k as f32 / MODE_STEPS as f32;
-            let _ = self.draw(uic, w, h, &p);
-        }
+    pub fn warm(&mut self, uic: &mut UiContext, w: f32, h: f32) { for k in 0..=MODE_STEPS { self.warm_step(uic, w, h, k); } }
+    pub fn warm_step(&mut self, uic: &mut UiContext, w: f32, h: f32, k: usize) -> Option<bool> {
+        if k > MODE_STEPS { return Some(true); }
+        let mut p = Picker::new();
+        p.game_mode = k as f32 / MODE_STEPS as f32;
+        let _ = crate::screens::athena_lobby::paint::with_raster_budget(25, || self.draw(uic, w, h, &p));
+        if crate::screens::athena_lobby::paint::raster_pending() { return None; }
+        Some(k >= MODE_STEPS)
     }
     /// Pixel layout of the buttons after the last draw (the picker state machine's hit test).
     pub fn layout(&self, w: f32, h: f32) -> Layout {
@@ -250,7 +252,14 @@ impl MaxOr for Rect { fn max_or(self, d: Rect) -> Rect { if self.w > 0. && self.
 
 /// Both screens, composed from one store (opened once; a failed load leaves the old screens in place).
 pub struct FrontEnd { pub login: Option<CookedLogin>, pub picker: Option<CookedPicker>, pub sign_in: Option<CookedSignIn>, pub note: Option<String> }
+fn mats_bytes(m: &Mats) -> usize { m.values().flatten().filter(|r| Rc::strong_count(r) == 1).map(|r| r.tex.iter().flatten().map(|t| t.rgba.len()).sum::<usize>()).sum() }
 impl FrontEnd {
+    pub fn release_materials(&mut self) -> (usize, usize) {
+        let mut n = 0;
+        let mut bytes = 0;
+        for m in [self.login.as_mut().map(|c| &mut c.mats), self.picker.as_mut().map(|c| &mut c.mats), self.sign_in.as_mut().map(|c| &mut c.mats)].into_iter().flatten() { n += m.len(); bytes += mats_bytes(m); m.clear(); }
+        (n, bytes)
+    }
     pub fn load(install: &Path) -> FrontEnd {
         let store = match Store::open(install) { Ok(s) => Rc::new(s), Err(e) => return FrontEnd { login: None, picker: None, sign_in: None, note: Some(e) } };
         let mut note = None;

@@ -234,6 +234,37 @@ pub fn eval_vec(e: &Expr, ov: &Overrides, time: f32) -> [f32; 4] {
     }
 }
 
+pub fn eval_vec_by(e: &Expr, v: &dyn Fn(&str) -> Option<[f32; 4]>, sc: &dyn Fn(&str) -> Option<f32>, time: f32) -> [f32; 4] {
+    match e {
+        Expr::VectorParameter { name, default } => v(name).unwrap_or(*default),
+        Expr::ScalarParameter { name, default } => { let s = sc(name).unwrap_or(*default); [s; 4] }
+        Expr::Constant { value, .. } => *value,
+        Expr::ComponentSwizzle { e, idx, .. } => { let x = eval_vec_by(e, v, sc, time); std::array::from_fn(|k| if idx[k] >= 0 { x[idx[k] as usize & 3] } else { 0.0 }) }
+        Expr::AppendVector { a, b, num_a } => {
+            let (a, b) = (eval_vec_by(a, v, sc, time), eval_vec_by(b, v, sc, time));
+            std::array::from_fn(|k| if (k as u32) < *num_a { a[k] } else { b.get(k - *num_a as usize).copied().unwrap_or(0.0) })
+        }
+        Expr::FoldedMath { a, b, op, .. } => {
+            let (a, b) = (eval_vec_by(a, v, sc, time), eval_vec_by(b, v, sc, time));
+            if *op == 4 { let s = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]; return [s; 4]; }
+            std::array::from_fn(|k| match op { 0 => a[k] + b[k], 1 => a[k] - b[k], 2 => a[k] * b[k], _ => if b[k] == 0.0 { 0.0 } else { a[k] / b[k] } })
+        }
+        Expr::Max { a, b } => { let (a, b) = (eval_vec_by(a, v, sc, time), eval_vec_by(b, v, sc, time)); std::array::from_fn(|k| a[k].max(b[k])) }
+        Expr::TrigMath { x, op, .. } => { let x = eval_vec_by(x, v, sc, time); x.map(|x| match op { 0 => x.sin(), 1 => x.cos(), _ => x.tan() }) }
+        Expr::Time | Expr::RealTime => [time; 4],
+        Expr::Texture { .. } | Expr::TextureParameter { .. } => [0.0; 4],
+    }
+}
+
+pub fn evaluate_cb_by(set: &UniformSet, v: &dyn Fn(&str) -> Option<[f32; 4]>, sc: &dyn Fn(&str) -> Option<f32>, time: f32, out: &mut Vec<[f32; 4]>) {
+    let nv = set.vectors.len();
+    let regs = nv + set.scalars.len().div_ceil(4);
+    out.clear();
+    out.resize(regs, [0.0; 4]);
+    for (i, e) in set.vectors.iter().enumerate() { out[i] = eval_vec_by(e, v, sc, time); }
+    for (i, e) in set.scalars.iter().enumerate() { out[nv + (i >> 2)][i & 3] = eval_vec_by(e, v, sc, time)[0]; }
+}
+
 fn label(e: &Expr) -> String {
     match e {
         Expr::VectorParameter { name, .. } | Expr::ScalarParameter { name, .. } | Expr::TextureParameter { name, .. } => name.clone(),

@@ -39,7 +39,14 @@ struct BlurParams { dst: [f32; 4], uv_bounds: [f32; 4], texel_dir: [f32; 4], n: 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameStats { pub quads: u32, pub draw_calls: u32, pub gpu_materials: u32, pub baked_materials: u32, pub bake_cache_entries: u32, pub texture_uploads: u32 }
 
+const UI_EVICT_MIN_PX: u64 = 256 * 1024;
+fn pixels<'a>(assets: &UiAssets, id: TextureId, t: &'a fn_ui::assets::Texture) -> Option<std::borrow::Cow<'a, [u8]>> {
+    if t.has_pixels() { return Some(std::borrow::Cow::Borrowed(&t.rgba[..])); }
+    let i = assets.source.image(assets.store.name_of(id)?)?;
+    (i.w == t.w && i.h == t.h && i.rgba.len() >= (t.w * t.h * 4) as usize).then_some(std::borrow::Cow::Owned(i.rgba))
+}
 pub struct UiRenderer {
+    evict_frame: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
@@ -65,6 +72,8 @@ pub struct UiRenderer {
     tex4_bgl: wgpu::BindGroupLayout,
     mat_layout: wgpu::PipelineLayout,
     mat_pipes: HashMap<ShaderId, Option<wgpu::RenderPipeline>>,
+    #[cfg(target_arch = "wasm32")]
+    mat_pending: HashMap<ShaderId, wgpu::PendingRenderPipeline>,
     tex4_cache: HashMap<[TexKey; 4], wgpu::BindGroup>,
     mode: MaterialMode,
     frame: u64,
@@ -76,7 +85,13 @@ pub struct UiRenderer {
     blur_tex: HashMap<(u32, u32, u8), (wgpu::Texture, wgpu::TextureView)>,
     blur_bufs: Vec<wgpu::Buffer>,
     blur_buf_next: usize,
+    prefix: Vec<wgpu::CommandBuffer>,
+    scratch: Scratch,
+    mat_align: usize,
 }
+
+#[derive(Default)]
+struct Scratch { insts: Vec<QuadInst>, ops: Vec<Op>, mat_data: Vec<u8>, clips: Vec<[i32; 4]>, checked: HashSet<u32>, failed: HashSet<u32> }
 
 fn shader(device: &wgpu::Device, label: &str, src: String) -> wgpu::ShaderModule {
     device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(src.into()) })
@@ -158,12 +173,16 @@ impl UiRenderer {
         let inst_cap = 4096u64;
         let inst_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui quad instances"), size: inst_cap * 64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let dummy = make_straight(&device, &queue, "ui dummy", 1, 1, &[0, 0, 0, 0], 0);
+        let mat_align = (device.limits().min_uniform_buffer_offset_alignment as usize).max(16);
         let samplers = Samplers::new(&device);
-        UiRenderer {
+        UiRenderer { evict_frame: 0,
             device, queue, format: target_format, max_dim, adapter_info: None, _instance: None, frame_buf, frame_bg, quad_tex_bgl, quad_pipeline, samplers,
             quad_tex: HashMap::new(), baked: HashMap::new(), straight: HashMap::new(), embedded: (0..UIMAT_TEX.len()).map(|_| None).collect(), dummy,
             inst_buf, inst_cap, mat_buf, mat_cap, mat_bgl, mat_bg, tex4_bgl, mat_layout, mat_pipes: HashMap::new(), tex4_cache: HashMap::new(),
-            mode: MaterialMode::Gpu, frame: 0, stats: FrameStats::default(), blur: None, blur_tex: HashMap::new(), blur_bufs: Vec::new(), blur_buf_next: 0,
+            #[cfg(target_arch = "wasm32")]
+            mat_pending: HashMap::new(),
+            mode: MaterialMode::Gpu, frame: 0, stats: FrameStats::default(), blur: None, blur_tex: HashMap::new(), blur_bufs: Vec::new(), blur_buf_next: 0, prefix: Vec::new(),
+            scratch: Scratch::default(), mat_align,
         }
     }
 
@@ -195,19 +214,22 @@ impl UiRenderer {
     fn ensure_quad_tex(&mut self, id: TextureId, assets: &UiAssets) -> bool {
         let Some(t) = assets.store.get(id) else { return false };
         if let Some(g) = self.quad_tex.get(&id.0) { if g.version == t.version && g.key == sampler_flags(t) { return true; } }
+        let Some(px) = pixels(assets, id, t) else { return false };
         let existing = self.quad_tex.remove(&id.0);
         let (nearest, repeat, mips) = sampler_flags(t);
-        let pm = t.premultiplied();
+        let pm = fn_ui::assets::premultiply_rgba8(&px);
         let up = self.uploader().upload_premult(existing, t.w, t.h, &pm, mips, nearest, repeat, t.version, &format!("ui tex {}", id.0));
         self.stats.texture_uploads += 1;
         match up { Some(g) => { self.quad_tex.insert(id.0, g); true } None => false }
     }
 
+    pub fn prewarm_straight(&mut self, id: TextureId, assets: &UiAssets) { let _ = self.ensure_straight(id.0, assets); }
     fn ensure_straight(&mut self, id: u32, assets: &UiAssets) -> Option<u32> {
         let t = assets.store.get(TextureId(id))?;
         if self.straight.get(&id).map_or(true, |s| s.version != t.version) {
             if t.w > self.max_dim || t.h > self.max_dim { return None; }
-            let s = make_straight(&self.device, &self.queue, "ui straight tex", t.w, t.h, &t.rgba, t.version);
+            let px = pixels(assets, TextureId(id), t)?;
+            let s = make_straight(&self.device, &self.queue, "ui straight tex", t.w, t.h, &px, t.version);
             self.stats.texture_uploads += 1;
             self.straight.insert(id, s);
         }
@@ -240,33 +262,96 @@ impl UiRenderer {
 
     /// Lazily builds (and caches, also failures) the pipeline of a GPU material shader.
     fn ensure_mat_pipeline(&mut self, id: ShaderId) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        self.poll_mat_pending();
         if let Some(p) = self.mat_pipes.get(&id) { return p.is_some(); }
-        let prelude = fn_live::wgsl!("shaders/mat_prelude.wgsl");
-        let src = match id {
-            ShaderId::Uimat(n) => format!("{prelude}\n{}\n{}", UIMAT_PS_WGSL[n as usize], fn_live::wgsl!("shaders/mat_fs_slate.wgsl")),
-            ShaderId::Hud(RADIAL_PROGRESS) => format!("{prelude}\n{}", fn_live::wgsl!("shaders/hud_radial.wgsl")),
-            ShaderId::Hud(MINIMAP_STORMS) => format!("{prelude}\n{}\n{}", fn_live::wgsl!("shaders/hud_minimap_storms.wgsl"), fn_live::wgsl!("shaders/mat_fs_slate.wgsl")),
-            ShaderId::Hud(n) if (PHASE_ICON_BASE..PHASE_ICON_BASE + 4).contains(&n) => {
-                let ps = [fn_live::wgsl!("shaders/hud_phase_blue.wgsl"), fn_live::wgsl!("shaders/hud_phase_jump.wgsl"), fn_live::wgsl!("shaders/hud_phase_holding.wgsl"), fn_live::wgsl!("shaders/hud_phase_moving.wgsl")];
-                format!("{prelude}\n{}\n{}", ps[(n - PHASE_ICON_BASE) as usize], fn_live::wgsl!("shaders/mat_fs_slate.wgsl"))
-            }
-            ShaderId::Hud(n) => format!("{prelude}\n{}\n{}", HUD_WGSL[n as usize], fn_live::wgsl!("shaders/mat_fs_slate.wgsl")),
-            ShaderId::Proc => format!("{prelude}\n{}", fn_live::wgsl!("shaders/proc_fs.wgsl")),
-        };
+        #[cfg(target_arch = "wasm32")]
+        self.mat_pending.remove(&id);
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let sm = shader(&self.device, &format!("ui material {id:?}"), src);
-        let pipe = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ui material pipeline"), layout: Some(&self.mat_layout),
-            vertex: wgpu::VertexState { module: &sm, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: None, multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState { module: &sm, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: self.format, blend: Some(premul_blend()), write_mask: wgpu::ColorWrites::ALL })] }),
-            multiview_mask: None, cache: None,
-        });
+        let sm = shader(&self.device, &format!("ui material {id:?}"), Self::mat_source(id));
+        let targets = [Some(wgpu::ColorTargetState { format: self.format, blend: Some(premul_blend()), write_mask: wgpu::ColorWrites::ALL })];
+        let pipe = self.device.create_render_pipeline(&Self::mat_desc(&self.mat_layout, &sm, &targets));
         let err = fn_render::gpu::pop_error_scope(scope); // BROWSER PORT: non-blocking on the web
         let ok = match err { None => true, Some(e) => { eprintln!("fn-ui-wgpu: WGSL material {id:?} failed ({e}); falling back to CpuBake"); false } };
         self.mat_pipes.insert(id, if ok { Some(pipe) } else { None });
         ok
+    }
+
+    fn mat_source(id: ShaderId) -> String {
+        let prelude = fn_live::wgsl!("shaders/mat_prelude.wgsl");
+        match id {
+            ShaderId::Uimat(n) => format!("{prelude}\n{}\n{}", UIMAT_PS_WGSL[n as usize], fn_live::wgsl!("shaders/mat_fs_slate.wgsl")),
+            ShaderId::Hud(RADIAL_PROGRESS) => format!("{prelude}\n{}", fn_live::wgsl!("shaders/hud_radial.wgsl")),
+            ShaderId::Hud(MINIMAP_STORMS) => format!("{prelude}\n{}\n{}", fn_live::wgsl!("shaders/hud_minimap_storms.wgsl"), fn_live::wgsl!("shaders/mat_fs_slate.wgsl")),
+            ShaderId::Hud(n) if (PHASE_ICON_BASE..PHASE_ICON_BASE + 5).contains(&n) => {
+                let ps = [fn_live::wgsl!("shaders/hud_phase_blue.wgsl"), fn_live::wgsl!("shaders/hud_phase_jump.wgsl"), fn_live::wgsl!("shaders/hud_phase_holding.wgsl"), fn_live::wgsl!("shaders/hud_phase_moving.wgsl"), fn_live::wgsl!("shaders/hud_phase_setup.wgsl")];
+                format!("{prelude}\n{}\n{}", ps[(n - PHASE_ICON_BASE) as usize], fn_live::wgsl!("shaders/mat_fs_slate.wgsl"))
+            }
+            ShaderId::Hud(n) => format!("{prelude}\n{}\n{}", HUD_WGSL[n as usize], fn_live::wgsl!("shaders/mat_fs_slate.wgsl")),
+            ShaderId::Proc => format!("{prelude}\n{}", fn_live::wgsl!("shaders/proc_fs.wgsl")),
+        }
+    }
+
+    fn mat_desc<'a>(layout: &'a wgpu::PipelineLayout, sm: &'a wgpu::ShaderModule, targets: &'a [Option<wgpu::ColorTargetState>]) -> wgpu::RenderPipelineDescriptor<'a> {
+        wgpu::RenderPipelineDescriptor {
+            label: Some("ui material pipeline"), layout: Some(layout),
+            vertex: wgpu::VertexState { module: sm, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: None, multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState { module: sm, entry_point: Some("fs_main"), compilation_options: Default::default(), targets }),
+            multiview_mask: None, cache: None,
+        }
+    }
+
+    pub fn all_material_shaders() -> Vec<ShaderId> {
+        let mut v: Vec<ShaderId> = (0..UIMAT_PS_WGSL.len() as u32).map(ShaderId::Uimat).collect();
+        v.extend((0..HUD_WGSL.len() as u32).map(ShaderId::Hud));
+        v.extend([ShaderId::Hud(RADIAL_PROGRESS), ShaderId::Hud(MINIMAP_STORMS)]);
+        v.extend((PHASE_ICON_BASE..PHASE_ICON_BASE + 5).map(ShaderId::Hud));
+        v.push(ShaderId::Proc);
+        v
+    }
+
+    pub fn prewarm_materials(&mut self) -> usize {
+        if self.mode != MaterialMode::Gpu { return 0; }
+        let mut started = 0;
+        for id in Self::all_material_shaders() {
+            if self.mat_pipes.contains_key(&id) { continue; }
+            #[cfg(target_arch = "wasm32")]
+            {
+                if self.mat_pending.contains_key(&id) { continue; }
+                let sm = shader(&self.device, &format!("ui material {id:?}"), Self::mat_source(id));
+                let targets = [Some(wgpu::ColorTargetState { format: self.format, blend: Some(premul_blend()), write_mask: wgpu::ColorWrites::ALL })];
+                let pending = self.device.fnweb_create_render_pipeline_async(&Self::mat_desc(&self.mat_layout, &sm, &targets));
+                self.mat_pending.insert(id, pending);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            { self.ensure_mat_pipeline(id); }
+            started += 1;
+        }
+        self.ensure_blur();
+        started
+    }
+
+    pub fn prewarm_pending(&mut self) -> usize {
+        #[cfg(target_arch = "wasm32")]
+        { self.poll_mat_pending(); self.mat_pending.len() }
+        #[cfg(not(target_arch = "wasm32"))]
+        0
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn poll_mat_pending(&mut self) {
+        if self.mat_pending.is_empty() { return; }
+        let mut done = vec![];
+        for (id, p) in &self.mat_pending {
+            match p.poll() {
+                Some(Ok(pipe)) => done.push((*id, Some(pipe))),
+                Some(Err(e)) => { eprintln!("fn-ui-wgpu: WGSL material {id:?} failed ({e}); falling back to CpuBake"); done.push((*id, None)); }
+                None => {}
+            }
+        }
+        for (id, pipe) in done { self.mat_pending.remove(&id); self.mat_pipes.entry(id).or_insert(pipe); }
     }
 
     // ------------------------------------------------------------------ CpuBake
@@ -286,6 +371,8 @@ impl UiRenderer {
     /// Draw `list` into `target` (format = the construction format, non-sRGB) at `w` x `h`; `clear` = straight RGBA to clear to first
     /// (stored premultiplied, as the framebuffer holds premultiplied colour).
     /// `Cmd::Blur` needs the target's pixels: it is skipped here (see [`UiRenderer::render_texture`]).
+    pub fn submit_before_next(&mut self, cbs: Vec<wgpu::CommandBuffer>) { self.prefix.extend(cbs); }
+    pub fn flush_pending(&mut self) { if !self.prefix.is_empty() { self.queue.submit(std::mem::take(&mut self.prefix)); } }
     pub fn render(&mut self, list: &RenderList, ctx_assets: &mut UiAssets, target: &wgpu::TextureView, w: u32, h: u32, clear: Option<[f32; 4]>) {
         self.render_impl(list, ctx_assets, target, None, w, h, clear)
     }
@@ -389,15 +476,12 @@ impl UiRenderer {
         self.blur_buf_next = 0;
         if self.blur_tex.len() > 24 { self.blur_tex.clear(); }
         let (wi, hi) = (w as i32, h as i32);
-        let mut insts: Vec<QuadInst> = Vec::new();
-        let mut ops: Vec<Op> = Vec::new();
-        let mut mat_data: Vec<u8> = Vec::new();
-        let align = (self.device.limits().min_uniform_buffer_offset_alignment as usize).max(16);
-        let mut clips: Vec<[i32; 4]> = Vec::new();
+        let mut sc = std::mem::take(&mut self.scratch);
+        sc.insts.clear(); sc.ops.clear(); sc.mat_data.clear(); sc.clips.clear(); sc.checked.clear(); sc.failed.clear();
+        let Scratch { insts, ops, mat_data, clips, checked, failed } = &mut sc;
+        let align = self.mat_align;
         let full = [0i32, 0, wi, hi];
         let mut emitted: [i32; 4] = full; // the pass starts with a full-target scissor
-        let mut checked: HashSet<u32> = HashSet::new();
-        let mut failed: HashSet<u32> = HashSet::new();
         let cur_clip = |clips: &Vec<[i32; 4]>| clips.last().copied().unwrap_or(full);
 
         for cmd in &list.cmds {
@@ -431,7 +515,7 @@ impl UiRenderer {
                         p01: [q.pos[0][0], q.pos[0][1], q.pos[1][0], q.pos[1][1]], p23: [q.pos[2][0], q.pos[2][1], q.pos[3][0], q.pos[3][1]],
                         uv: q.uv, col: [t[0] * t[3], t[1] * t[3], t[2] * t[3], t[3]],
                     };
-                    Self::push_quad(&mut ops, &mut insts, &mut emitted, c, TexRef::Store(q.tex.0), inst);
+                    Self::push_quad(ops, insts, &mut emitted, c, TexRef::Store(q.tex.0), inst);
                     self.stats.quads += 1;
                 }
                 Cmd::Material(m) => {
@@ -472,7 +556,7 @@ impl UiRenderer {
                                 p01: [r.x, r.y, r.x + r.w, r.y], p23: [r.x + r.w, r.y + r.h, r.x, r.y + r.h],
                                 uv, col: [t[0] * t[3], t[1] * t[3], t[2] * t[3], t[3]],
                             };
-                            Self::push_quad(&mut ops, &mut insts, &mut emitted, c, tr, inst);
+                            Self::push_quad(ops, insts, &mut emitted, c, tr, inst);
                             self.stats.baked_materials += 1;
                         }
                     }
@@ -486,14 +570,14 @@ impl UiRenderer {
             self.inst_cap = (insts.len() as u64).next_power_of_two();
             self.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui quad instances"), size: self.inst_cap * 64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         }
-        if !insts.is_empty() { self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&insts)); }
+        if !insts.is_empty() { self.queue.write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(insts.as_slice())); }
         let need = mat_data.len() as u64 + MAT_SLOT;
         if need > self.mat_cap {
             self.mat_cap = need.next_power_of_two();
             self.mat_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("ui mat ubo"), size: self.mat_cap, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             self.mat_bg = Self::make_mat_bg(&self.device, &self.mat_bgl, &self.mat_buf);
         }
-        if !mat_data.is_empty() { mat_data.resize((mat_data.len() + 3) / 4 * 4, 0); self.queue.write_buffer(&self.mat_buf, 0, &mat_data); }
+        if !mat_data.is_empty() { mat_data.resize((mat_data.len() + 3) / 4 * 4, 0); self.queue.write_buffer(&self.mat_buf, 0, mat_data.as_slice()); }
 
         // ---- encode
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fn-ui-wgpu") });
@@ -544,11 +628,33 @@ impl UiRenderer {
             if let (Op::Blur { rect, cmd }, Some(t)) = (&ops[seg_end], target_tex) { self.encode_blur(&mut enc, t, target, *rect, cmd); self.stats.draw_calls += 1; }
             seg_start = seg_end + 1;
         }
-        self.queue.submit([enc.finish()]);
+        let mut cbs = std::mem::take(&mut self.prefix);
+        cbs.push(enc.finish());
+        self.queue.submit(cbs);
+        self.scratch = sc;
 
         // ---- eviction of textures that left the store
         self.quad_tex.retain(|id, _| ctx_assets.store.get(TextureId(*id)).is_some());
         self.straight.retain(|id, _| ctx_assets.store.get(TextureId(*id)).is_some());
+        self.evict_frame = self.evict_frame.wrapping_add(1);
+        if self.evict_frame % 120 == 0 {
+            let ids: Vec<u32> = self.quad_tex.iter().filter(|(id, g)| ctx_assets.store.get(TextureId(**id)).is_some_and(|t| t.version == g.version)).map(|(id, _)| *id).filter(|id| self.straight.get(id).is_none_or(|s| ctx_assets.store.get(TextureId(*id)).is_some_and(|t| t.version == s.version))).collect();
+            let (n, bytes) = ctx_assets.store.evict_pixels(&ids, UI_EVICT_MIN_PX);
+            if n > 0 { eprintln!("[ui] {n} uploaded textures released their CPU pixels ({:.1} MB)", bytes as f64 / 1048576.); }
+            if self.evict_frame % 7200 == 0 {
+                let mut why: std::collections::BTreeMap<&str, (usize, u64)> = Default::default();
+                let mut big: Vec<(u64, String, &str)> = vec![];
+                for (id, t) in ctx_assets.store.iter() {
+                    if !t.has_pixels() || (t.w as u64) * (t.h as u64) < UI_EVICT_MIN_PX { continue; }
+                    let r = if t.cpu.load(std::sync::atomic::Ordering::Relaxed) { "cpu" } else if std::sync::Arc::strong_count(&t.rgba) > 1 { "shared" } else if !self.quad_tex.contains_key(&id.0) { if self.straight.contains_key(&id.0) { "straight only" } else { "not uploaded" } } else { "other" };
+                    let e = why.entry(r).or_default(); e.0 += 1; e.1 += t.rgba.len() as u64;
+                    big.push((t.rgba.len() as u64, ctx_assets.store.name_of(id).unwrap_or("?").to_owned(), r));
+                }
+                big.sort_by(|a, b| b.0.cmp(&a.0));
+                let top: Vec<String> = big.iter().take(8).map(|(b, n, r)| format!("{n} {:.1} MB {r}", *b as f64 / 1048576.)).collect();
+                eprintln!("[ui] resident CPU pixels: {:?}; biggest {}", why.iter().map(|(k, v)| format!("{k} {} ({:.0} MB)", v.0, v.1 as f64 / 1048576.)).collect::<Vec<_>>(), top.join(", "));
+            }
+        }
         // LRU cap of the baked-material cache, applied after submit so nothing recorded this frame can vanish (resources stay alive until the GPU is done)
         if self.baked.len() > BAKE_CACHE_CAP {
             let mut ages: Vec<((u64, u32, u32), u64)> = self.baked.iter().map(|(k, v)| (*k, v.1)).collect();
@@ -570,6 +676,7 @@ impl UiRenderer {
 
     /// Offscreen convenience: returns PREMULTIPLIED RGBA8 (`w*h*4`, row 0 = top). Cleared to transparent black unless `clear` is given.
     pub fn render_to_image(&mut self, list: &RenderList, assets: &mut UiAssets, w: u32, h: u32, clear: Option<[f32; 4]>) -> Vec<u8> {
+        if cfg!(target_arch = "wasm32") { let _ = (list, assets, clear); return vec![0; (w * h * 4) as usize]; }
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("fn-ui-wgpu offscreen"), size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: self.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],

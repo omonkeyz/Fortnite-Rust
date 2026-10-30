@@ -27,7 +27,7 @@ struct State {
     /// Built models per mesh path (one per pickup drawn this frame: every model owns its `Primitive` buffer).
     models: HashMap<String, Result<Vec<GunModel>, String>>,
     /// This frame's draws: (mesh path, gun_to_world).
-    pending: Vec<(String, Mat4)>,
+    pending: Vec<(String, Mat4, Option<[f32; 4]>)>,
     log: Vec<String>,
 }
 
@@ -46,12 +46,13 @@ fn build(orig: &mut OrigGuns, renderer: &mut Renderer, mesh_path: &str) -> Resul
 
 /// Queues the original-material draw of a skeletal pickup this frame. `false` = not available (no original gun pass, a static mesh, or the material could not be
 /// recovered): the caller draws its renderer model instead.
-pub fn draw(renderer: &mut Renderer, orig: Option<&mut OrigGuns>, enabled: bool, mesh_path: &str, skeletal: bool, gun_to_world: Mat4) -> bool {
+pub fn draw(renderer: &mut Renderer, orig: Option<&mut OrigGuns>, enabled: bool, mesh_path: &str, skeletal: bool, gun_to_world: Mat4) -> bool { draw_with(renderer, orig, enabled, mesh_path, skeletal, gun_to_world, None) }
+pub fn draw_with(renderer: &mut Renderer, orig: Option<&mut OrigGuns>, enabled: bool, mesh_path: &str, skeletal: bool, gun_to_world: Mat4, black_hole: Option<[f32; 4]>) -> bool {
     if !enabled || !skeletal { return false; }
     let Some(orig) = orig else { return false };
     let mut g = HOST.lock().unwrap_or_else(|p| p.into_inner());
     let st = g.get_or_insert_with(|| State { models: HashMap::new(), pending: vec![], log: vec![] });
-    let used = st.pending.iter().filter(|(m, _)| m == mesh_path).count();
+    let used = st.pending.iter().filter(|(m, _, _)| m == mesh_path).count();
     let have = match st.models.get(mesh_path) { Some(Ok(v)) => v.len(), Some(Err(_)) => return false, None => 0 };
     if used >= have {
         match build(orig, renderer, mesh_path) {
@@ -67,7 +68,7 @@ pub fn draw(renderer: &mut Renderer, orig: Option<&mut OrigGuns>, enabled: bool,
             }
         }
     }
-    st.pending.push((mesh_path.to_owned(), gun_to_world));
+    st.pending.push((mesh_path.to_owned(), gun_to_world, black_hole));
     true
 }
 
@@ -83,17 +84,32 @@ pub fn submit(renderer: &mut Renderer, camera: &CameraParams, time: f32) {
     let (tx, ty) = camera.tan_half();
     let view = ViewInput { eye: camera.eye, forward: camera.forward, up: camera.up, tan_half: (tx, ty), near_m: camera.near, far_m: camera.far, width: camera.width, height: camera.height, time };
     let mut frame = GunFrame::default();
-    let mut next: HashMap<String, usize> = HashMap::new();
-    for (path, to_world) in st.pending.clone() {
-        let Some(Ok(models)) = st.models.get(&path) else { continue };
-        let i = next.entry(path.clone()).or_insert(0);
+    let mut next: HashMap<&str, usize> = HashMap::new();
+    let fwd = camera.forward.normalize_or_zero();
+    let right = fwd.cross(camera.up).normalize_or_zero();
+    let up = right.cross(fwd).normalize_or_zero();
+    let (kx, ky) = ((1. + tx * tx).sqrt(), (1. + ty * ty).sqrt());
+    for (path, to_world, black_hole) in st.pending.iter() {
+        let Some(Ok(models)) = st.models.get(path) else { continue };
+        let i = next.entry(path.as_str()).or_insert(0);
         let Some(m) = models.get(*i) else { continue };
         *i += 1;
-        let input = FrameInput { view, gun_to_world: to_world, skin: &[], sky_radiance: fn_render::lighting::sky_radiance(), time };
+        let c = to_world.transform_point3(Vec3::from(fn_mesh::gltf::ue_to_gltf_position(m.bounds.origin))) - camera.eye;
+        let r = m.bounds.radius * 0.01 * to_world.x_axis.truncate().length().max(to_world.y_axis.truncate().length()).max(to_world.z_axis.truncate().length()) + PICKUP_CULL_MARGIN_M;
+        let (z, x, y) = (c.dot(fwd), c.dot(right), c.dot(up));
+        if z < -r || x.abs() > z * tx + r * kx || y.abs() > z * ty + r * ky { continue; }
+        let to_world = *to_world;
+        let black_hole = *black_hole;
+        let vectors: Vec<(&str, [f32; 4])> = black_hole.map(|v| (BLACK_HOLE_PARAM, v)).into_iter().collect();
+        let input = FrameInput { view, gun_to_world: to_world, skin: &[], sky_radiance: fn_render::lighting::sky_radiance(), time, vectors: &vectors };
         m.frame(&input, &mut frame);
     }
     renderer.gun().append_frame(frame);
 }
+
+const PICKUP_CULL_MARGIN_M: f32 = 5.0;
+
+pub const BLACK_HOLE_PARAM: &str = "WorldPostionOfBlackHole";
 
 /// The renderer model matrix of a pickup (`pickups_hook::frame`): actor location + yaw, the mesh's bounds origin (glTF metres) moved onto the actor.
 pub fn to_world(pos: Vec3, yaw: f32, origin_cm: [f32; 3]) -> Mat4 {

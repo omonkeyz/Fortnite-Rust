@@ -310,6 +310,16 @@ pub mod sounds {
     pub const ENTER: (&str, &str) = ("BuildPreviewEditEnter", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_G_To_Edit_Cue");
     pub const EXIT: (&str, &str) = ("BuildPreviewEditExit", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_CancelEdit_Cue");
     pub const TILE: (&str, &str) = ("BuildPreviewEditTile", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_Edit_TurnOnTile_Cue");
+    pub const CHANGE: (&str, &str) = ("BuildPreviewChange", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_Select_Cue");
+    pub const GRID_SNAP: (&str, &str) = ("BuildPreviewGridSnap", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_BluePrint_Select_Cue");
+    pub const ROTATE: (&str, &str) = ("BuildPreviewRotate", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_Rotate_Cue");
+    pub const UNABLE_TO_PLACE: (&str, &str) = ("BuildPreviewUnableToPlace", "/Game/Sounds/Fort_UI_Sounds/Gameplay/UI_CantBuild_Cue");
+    pub const UNABLE_TO_AFFORD: (&str, &str) = ("BuildPreviewUnableToAfford", "/Game/Sounds/Fort_UI_Sounds/Gameplay/UI_NotEnoughResources_Cue");
+    pub const SELECT: [(&str, &str); 3] = [
+        ("BuildSelectWood", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_SelectWood_Cue"),
+        ("BuildSelectStone", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_SelectRock_Cue"),
+        ("BuildSelectMetal", "/Game/Sounds/Fort_UI_Sounds/Gameplay/Fort_Build_SelectMetal_Cue"),
+    ];
 }
 
 /// Everything editing needs from the paks.

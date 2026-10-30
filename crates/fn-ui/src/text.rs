@@ -48,12 +48,31 @@ pub fn font_or_system(src: &dyn AssetSource, name: &str) -> Option<fontdue::Font
     candidates.iter().find_map(|f| try_load_font(&std::path::PathBuf::from(&windir).join("Fonts").join(f)).ok())
 }
 
+type FontCell = Arc<std::sync::OnceLock<Option<Arc<fontdue::Font>>>>;
+static FONT_CACHE: std::sync::Mutex<Option<HashMap<&'static str, FontCell>>> = std::sync::Mutex::new(None);
+fn cached_font(key: &'static str, load: impl FnOnce() -> Option<fontdue::Font>) -> Option<Arc<fontdue::Font>> {
+    let cell = FONT_CACHE.lock().ok().map(|mut g| g.get_or_insert_with(HashMap::new).entry(key).or_default().clone());
+    let Some(c) = cell else { return load().map(Arc::new) };
+    let r = c.get_or_init(|| load().map(Arc::new)).clone();
+    if r.is_none() { if let Ok(mut g) = FONT_CACHE.lock() { if let Some(m) = g.as_mut() { if m.get(key).is_some_and(|x| Arc::ptr_eq(x, &c)) { m.remove(key); } } } }
+    r
+}
+fn cached_or_system(src: &dyn AssetSource, name: &str, key: &'static str) -> Option<Arc<fontdue::Font>> {
+    if let Some(f) = cached_font(key, || src.read(name).and_then(|b| parse_font(b).ok())) { return Some(f); }
+    let bold = name.to_ascii_lowercase().contains("bold");
+    let candidates: [(&str, &'static str); 2] = if bold { [("segoeuib.ttf", "s:segoeuib.ttf"), ("arialbd.ttf", "s:arialbd.ttf")] } else { [("segoeui.ttf", "s:segoeui.ttf"), ("arial.ttf", "s:arial.ttf")] };
+    candidates.iter().find_map(|(f, k)| cached_font(k, || system_font(f)))
+}
+pub fn warm_fonts(src: &dyn AssetSource) { let _ = Fonts::load(src); }
+
 impl Fonts {
     pub fn load(src: &dyn AssetSource) -> Option<Self> {
-        let title = src.read("BurbankBigCondensed-Black.ufont").and_then(|b| parse_font(b).ok()).map(Arc::new);
-        let roboto_bold = src.read_in("Roboto-Bold.ttf", "/Slate/Fonts/").and_then(|b| parse_font(b).ok()).map(Arc::new);
-        let burbank_bold = src.read("BurbankBigRegular-Bold.ufont").and_then(|b| parse_font(b).ok()).map(Arc::new);
-        Some(Self { regular: Arc::new(font_or_system(src, "NotoSans-Regular.ufont")?), bold: Arc::new(font_or_system(src, "NotoSans-Bold.ufont")?), title, roboto_bold, burbank_bold, segoe_bold: system_font("segoeuib.ttf").map(Arc::new), segoe_semibold: system_font("seguisb.ttf").map(Arc::new) })
+        let title = cached_font("a:BurbankBigCondensed-Black.ufont", || src.read("BurbankBigCondensed-Black.ufont").and_then(|b| parse_font(b).ok()));
+        let roboto_bold = cached_font("a:/Slate/Fonts/Roboto-Bold.ttf", || src.read_in("Roboto-Bold.ttf", "/Slate/Fonts/").and_then(|b| parse_font(b).ok()));
+        let burbank_bold = cached_font("a:BurbankBigRegular-Bold.ufont", || src.read("BurbankBigRegular-Bold.ufont").and_then(|b| parse_font(b).ok()));
+        let regular = cached_or_system(src, "NotoSans-Regular.ufont", "a:NotoSans-Regular.ufont")?;
+        let bold = cached_or_system(src, "NotoSans-Bold.ufont", "a:NotoSans-Bold.ufont")?;
+        Some(Self { regular, bold, title, roboto_bold, burbank_bold, segoe_bold: cached_font("s:segoeuib.ttf", || system_font("segoeuib.ttf")), segoe_semibold: cached_font("s:seguisb.ttf", || system_font("seguisb.ttf")) })
     }
     pub fn font(&self, id: FontId) -> &fontdue::Font {
         let f: &Arc<fontdue::Font> = match id { FontId::Regular => &self.regular, FontId::Bold => &self.bold, FontId::Title => self.title.as_ref().unwrap_or(&self.bold), FontId::RobotoBold => self.roboto_bold.as_ref().unwrap_or(&self.bold), FontId::BurbankBold => self.burbank_bold.as_ref().or(self.title.as_ref()).unwrap_or(&self.bold), FontId::SegoeBold => self.segoe_bold.as_ref().unwrap_or(&self.bold), FontId::SegoeSemibold => self.segoe_semibold.as_ref().or(self.segoe_bold.as_ref()).unwrap_or(&self.bold) }; f

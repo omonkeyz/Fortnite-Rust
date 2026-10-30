@@ -179,7 +179,11 @@ fn note_decode(t0: std::time::Instant, _raw: u64, clen: u64) {
     if MAIN_CHECK.get().is_some_and(|f| f()) { MAIN_DECODES.fetch_add(1, Ordering::Relaxed); MAIN_DECODE_US.fetch_add(us, Ordering::Relaxed); }
 }
 
-const CACHE_BUDGET: usize = 96 << 20;
+static CACHE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(96 << 20);
+pub fn set_cache_budget(bytes: usize) {
+    CACHE_BUDGET.store(bytes, Ordering::Relaxed);
+    if let Ok(mut g) = CACHE.lock() { if let Some(c) = g.as_mut() { while c.bytes > bytes { let Some(k) = c.order.pop_front() else { break }; if let Some(x) = c.map.remove(&k) { c.bytes -= x.len(); } } } }
+}
 const AHEAD_CHUNKS: u32 = 8;
 const AHEAD_BYTES: u64 = 4 << 20;
 const AHEAD_PREFIX_END: u32 = 3275;
@@ -225,14 +229,15 @@ struct Lru { map: HashMap<u32, Arc<Vec<u8>>>, order: VecDeque<u32>, bytes: usize
 static CACHE: Mutex<Option<Lru>> = Mutex::new(None);
 fn cache_get(i: u32) -> Option<Arc<Vec<u8>>> { CACHE.lock().ok()?.as_ref()?.map.get(&i).cloned() }
 fn cache_put(i: u32, d: Arc<Vec<u8>>) {
-    if d.len() > CACHE_BUDGET / 4 { return; }
+    let budget = CACHE_BUDGET.load(Ordering::Relaxed);
+    if d.len() > budget / 4 { return; }
     let Ok(mut g) = CACHE.lock() else { return };
     let c = g.get_or_insert_with(|| Lru { map: HashMap::new(), order: VecDeque::new(), bytes: 0 });
     if c.map.contains_key(&i) { return; }
     c.bytes += d.len();
     c.map.insert(i, d);
     c.order.push_back(i);
-    while c.bytes > CACHE_BUDGET { let Some(k) = c.order.pop_front() else { break }; if let Some(x) = c.map.remove(&k) { c.bytes -= x.len(); } }
+    while c.bytes > budget { let Some(k) = c.order.pop_front() else { break }; if let Some(x) = c.map.remove(&k) { c.bytes -= x.len(); } }
 }
 
 static INDEX: OnceLock<Option<Index>> = OnceLock::new();

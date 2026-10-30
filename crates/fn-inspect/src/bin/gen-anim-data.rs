@@ -66,6 +66,8 @@ const BS_SKYDIVE: &[(&str, &str)] = &[
     ("sky_hangglider_lean_f", "Female/BS_Skydive_HangGlider_Lean"),
 ];
 
+const DBNO_BS: &str = "/Game/Animation/Game/MainPlayer/Locomotion/Medium/Male/DBNO/BS_DBNO_CMM";
+const DBNO_CLIPS: &[&str] = &["/Game/Animation/Game/MainPlayer/Reacts/HitReacts/AthenaDBNO_Loop_CMM", "/Game/Animation/Game/MainPlayer/Locomotion/Medium/Male/DBNO/DBNOCrawl_E_CMM"];
 const FEMALE_CLIPS: &[&str] = &["/Game/Animation/Game/MainPlayer/Locomotion/Medium/Female/Turns/Idle_Turn_Left", "/Game/Animation/Game/MainPlayer/Locomotion/Medium/Female/Turns/Idle_Turn_Right", "Pose_Blueprint_Place_CMF", "Pose_Blueprint_Edit_CMF"];
 
 const BS_FEMALE: &[(&str, &str)] = &[
@@ -198,9 +200,11 @@ fn main() {
     let list: Vec<(&str, &str)> = BS_BASE.iter().chain(if legacy { [].iter() } else { BS_EXTRA.iter() }).chain(if legacy { [].iter() } else { BS_FEMALE.iter() }).copied().collect();
     let mut bs: Vec<Bs> = list.iter().map(|(k, n)| read_bs(&p, k, n)).collect();
     if !legacy { for (k, n) in BS_SKYDIVE { bs.push(read_bs(&p, k, &format!("{SKY}/{n}"))); } }
+    if !legacy { bs.push(read_bs(&p, "dbno_crawl", DBNO_BS)); }
     let mut names: BTreeSet<String> = bs.iter().flat_map(|b| b.samples.iter().map(|s| s.0.clone())).collect();
     names.extend(direct_clips());
     if !legacy { names.extend(FEMALE_CLIPS.iter().map(|s| s.to_string())); }
+    if !legacy { names.extend(DBNO_CLIPS.iter().map(|s| s.to_string())); }
     let mut missing = vec![];
     let clips: Vec<Clip> = names.iter().filter_map(|n| { let c = read_clip(&p, n); if c.is_none() { missing.push(n.clone()); } c }).collect();
     let skel = |profile: &str| -> Vec<(String, f64)> {

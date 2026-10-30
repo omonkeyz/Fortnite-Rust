@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --port 8798",
+    "dev": "node dev.mjs",
+    "dev:replace": "node dev.mjs --replace",
+    "dev:stop": "node dev.mjs --stop",
     "deploy": "wrangler deploy",
-    "test": "node test/mp-test.mjs"
+    "test": "node test/mp-test.mjs && node test/modes-test.mjs && node test/pickup-test.mjs && node test/emote-test.mjs"
   },
   "devDependencies": {
     "ws": "8.18.0"

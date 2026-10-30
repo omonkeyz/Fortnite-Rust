@@ -51,7 +51,7 @@ fn layout_row_counts_match_original() {
     let game = layout_table::TABS.iter().find(|t| t.id == "game").unwrap();
     // 1.8: 21 Game rows (no Uncap Framerate) and 7 HUD rows (no Net Debug Stats)
     assert_eq!(game.subs[0].rows.iter().filter(|r| !r.extension).count(), 21);
-    assert_eq!(game.subs[0].rows.iter().filter(|r| r.extension).map(|r| r.label).collect::<Vec<_>>(), ["Confirm Edit on Release", "Reset Edit on Release", "Turbo Building"]);
+    assert_eq!(game.subs[0].rows.iter().filter(|r| r.extension).map(|r| r.label).collect::<Vec<_>>(), Vec::<&str>::new());
     assert_eq!(game.subs[1].rows.len(), 7);
     let ids: Vec<&str> = layout_table::TABS.iter().map(|t| t.id).collect();
     assert_eq!(ids, ["video", "game", "brightness", "audio", "input", "controller", "livestream"]);
@@ -330,8 +330,8 @@ fn game_tab_shows_the_17_pc_battle_royale_rows_and_hud_sub_tab_has_7() {
     assert_eq!(layout_table::TABS[1].subs[0].rows.iter().filter(|r| !r.extension).count(), 21);
     let ctx = visibility::MenuContext::default();
     let labels: Vec<&str> = visibility::visible_rows("game", &layout_table::TABS[1].subs[0], &ctx).iter().map(|r| r.label).collect();
-    assert_eq!(labels.len(), 20);
-    for want in ["Confirm Edit on Release", "Reset Edit on Release", "Turbo Building"] { assert!(labels.contains(&want), "{want}"); }
+    assert_eq!(labels.len(), 17);
+    for gone in ["Confirm Edit on Release", "Reset Edit on Release", "Turbo Building"] { assert!(!labels.contains(&gone), "{gone}"); }
     for gone in ["Xbox Safe Zone", "First-Person Camera", "Show Head Accessories", "Show Backpack"] { assert!(!labels.contains(&gone), "{gone}"); }
     // the list scrolls: all rows must be reachable, so scroll down in steps and collect what was drawn
     let mut seen = std::collections::HashSet::new();

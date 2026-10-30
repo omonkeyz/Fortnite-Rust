@@ -116,10 +116,13 @@ mod tests {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BotZone { pub center: Vec3, pub radius: f32, pub next_center: Vec3, pub next_radius: f32, pub shrinking: bool, pub phase: usize, pub damage_fraction: f32 }
+
 pub const STORM_DEATH_CAUSE: fn_ui::screens::kill_feed::DeathCause = fn_ui::screens::kill_feed::DeathCause::OutsideSafeZone;
 
 #[derive(Default)]
-pub struct StormMatch { zones: Option<fn_game::storm_zones::SafeZones>, clock: f32, last_drop_now: Option<f32>, scale: Option<f32>, in_match: bool, roster: u32, outside: bool, last_step: Option<u8>, wall_key: Option<u32> }
+pub struct StormMatch { zones: Option<fn_game::storm_zones::SafeZones>, clock: f32, last_drop_now: Option<f32>, scale: Option<f32>, in_match: bool, roster: u32, outside: bool, last_step: Option<u8>, wall_key: Option<u32>, death_place: Option<u32>, alert: Option<fn_ui::screens::hud_cooked::ActionAlert>, game_over_shown: bool }
 
 const KEY_WALL_STATIONARY: u32 = 0x5354_0001;
 const KEY_WALL_MOVING: u32 = 0x5354_0002;
@@ -131,11 +134,19 @@ fn match_seed() -> u32 {
 }
 
 impl StormMatch {
+    pub fn zones_view(&self) -> Option<(f32, usize, Vec<[f32; 3]>)> { let z = self.zones.as_ref().filter(|z| z.active)?; Some((self.clock, z.phase, z.locations.clone())) }
     pub fn active(&self) -> bool { self.in_match }
     pub fn players_left(&self) -> Option<u32> {
-        if crate::mp_hook::active() { return crate::mp_hook::players_alive(); }
+        if crate::mp_hook::in_match() { return crate::mp_hook::players_alive(); }
         if !self.in_match { return None; }
-        Some(self.roster.saturating_sub(crate::kill_feed_hook::eliminations()))
+        Some((self.roster + crate::bots_hook::roster()).saturating_sub(crate::kill_feed_hook::eliminations()))
+    }
+    pub fn bot_zone(&self) -> Option<BotZone> {
+        let z = self.zones.as_ref().filter(|z| z.active)?;
+        let i = z.ind?;
+        let off = offset_cm();
+        let g = |c: [f32; 3]| glam::Vec3::new((c[0] + off[0]) * 0.01, 0., (c[1] + off[1]) * 0.01);
+        Some(BotZone { center: g(i.center), radius: i.radius * 0.01, next_center: g(i.next_center), next_radius: i.next_radius * 0.01, shrinking: i.state == Some(fn_game::storm_zones::ZoneState::Shrinking), phase: z.phase, damage_fraction: z.damage_fraction() })
     }
     pub fn hud_phase(&self, sim: &fn_game::GameSim) -> Option<(u8, f32)> {
         let d = sim.drop.as_ref()?;
@@ -146,7 +157,7 @@ impl StormMatch {
     }
     pub fn frame(&mut self, sim: &mut fn_game::GameSim, arms: Option<&mut crate::arms::Arms>) -> Vec<fn_audio_sink::SoundEvent> {
         let mut out = vec![];
-        if crate::mp_hook::active() { return out; }
+        if crate::mp_hook::in_match() { return out; }
         let Some(d) = sim.drop.as_ref() else {
             if self.in_match {
                 for k in [KEY_WALL_STATIONARY, KEY_WALL_MOVING, KEY_STORM_LOOP] { out.push(fn_audio_sink::SoundEvent::ContainerLoopStop { key: k, fade: 0. }); }
@@ -157,6 +168,7 @@ impl StormMatch {
         if !self.in_match {
             *self = StormMatch { in_match: true, roster: 1, scale: fn_live::var("FN_STORM_TIMESCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s > 0.), ..Default::default() };
             crate::kill_feed_hook::reset_eliminations();
+            crate::kill_feed_hook::set_won(false);
             sim.storm.turn_off();
             eprintln!("[storm] match: no safe zone until 60 s after the bus leaves the drop zone (1.8 OnAircraftExitedDropZone -> StartSafeZonePhase)");
         }
@@ -218,6 +230,7 @@ impl StormMatch {
         let outside = z.active && pawn.is_some() && !z.inside_tag;
         if outside != self.outside {
             self.outside = outside;
+            if outside { self.alert = Some(fn_ui::screens::hud_cooked::ActionAlert::Storm); eprintln!("[storm] the player left the safe zone: AthenaPlayerActionAlert (storm)"); }
             out.push(fn_audio_sink::SoundEvent::BuildingCue { cue: storm_cue("/Shield_Passthrough_Cue"), pos: Some(f) });
             out.push(if outside { fn_audio_sink::SoundEvent::ContainerLoop { cue: storm_cue("/SafeZone_Storm_Loop_Cue"), key: KEY_STORM_LOOP, pos: None } } else { fn_audio_sink::SoundEvent::ContainerLoopStop { key: KEY_STORM_LOOP, fade: 1. } });
         }
@@ -238,9 +251,22 @@ impl StormMatch {
         let c = |p: [f32; 3], r: f32| { let (u, v) = fn_hud_adapter::minimap_uv_ue(p[0], p[1]); [u, v, r / fn_hud_adapter::MAP_WORLD_SCALE_CM / s] };
         Some(fn_ui::screens::hud_extra::StormMap { current: c(i.center, i.radius), next: c(i.next_center, i.next_radius) })
     }
+    pub fn game_over(&mut self, alive: bool) -> Option<fn_ui::screens::hud_cooked::GameOver> {
+        use fn_ui::screens::hud_cooked::{DeathKind, GameOver};
+        use fn_ui::screens::kill_feed::{DeathCause, Killer};
+        if crate::kill_feed_hook::won() || (crate::mp_hook::active() && (alive || crate::mp_hook::team_alive()) && self.zones.is_some() && crate::mp_hook::teams_alive() == Some(1)) { return Some(GameOver::Won); }
+        let Some((cause, killer)) = crate::kill_feed_hook::local_death() else { self.death_place = None; return None };
+        let left = self.players_left();
+        let place = *self.death_place.get_or_insert_with(|| left.map_or(1, |n| n + 1));
+        let kind = match (cause, killer) { (DeathCause::OutsideSafeZone, _) => DeathKind::Storm, (DeathCause::FallDamage, _) | (_, Killer::Themself) => DeathKind::SelfInflicted, (_, Killer::Player(c)) => DeathKind::Killer(c.name), _ => DeathKind::Killer(String::new()) };
+        Some(GameOver::Died { player: crate::kill_feed_hook::local_name(), kind, place, team_size: 1 })
+    }
+    pub fn cursor_mode(&self) -> bool { self.game_over_shown }
+    pub fn set_cursor_mode(&mut self, on: bool) { self.game_over_shown = on; }
+    pub fn take_alert(&mut self) -> Option<fn_ui::screens::hud_cooked::ActionAlert> { self.alert.take() }
     pub fn hud(&self, sim: &fn_game::GameSim, st: &mut fn_ui::screens::hud::HudState) {
         st.players_left = self.players_left().or(st.players_left);
-        if crate::mp_hook::active() { return; }
+        if crate::mp_hook::in_match() { return; }
         st.game_phase = self.hud_phase(sim);
         st.storm_map = self.storm_map();
     }

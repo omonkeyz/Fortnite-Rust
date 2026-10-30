@@ -76,15 +76,20 @@ struct SecSlot { state: u8, sstate: u8, e: u32, bkey: u32, se: u32, sbkey: u32 }
 struct PropC { proto: u32, pos: [u32; 3], mirror: bool, gen: u32, kind: Option<Arc<KindGpu>>, row: Option<(f32, u32)>, slot: u32, l2w: Mat4, wb: (Vec3, f32, [f32; 3]) }
 #[derive(Clone)]
 struct PoiC { kind: Option<Arc<KindGpu>>, c: Vec3, r: f32, origin: [f32; 3] }
-struct GroupC { c: Vec3, r: f32, all_far_ok: bool, n: u32, dfs: Vec<FxDfInstance> }
+struct GroupC { c: Vec3, r: f32, all_far_ok: bool, n: u32, dfs: Vec<FxDfInstance>, max_cull: f32, stream_cull: bool, unbounded: bool }
 fn poi_cache_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| fn_live::var("FN_STATICS_POI_CACHE").map_or(true, |v| v != "0")) }
 /// A placement's record slot: its own `Primitive` buffer only once a per-placement (not instanced) draw needs it.
 struct Slot { prim: Option<FxBufId>, last: Option<[f32; 16]> }
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ActorMid { pub scalars: Vec<(&'static str, f32)>, pub vectors: Vec<(&'static str, [f32; 4])> }
+static ACTOR_MIDS: Mutex<Option<Arc<HashMap<u32, Arc<ActorMid>>>>> = Mutex::new(None);
+pub fn set_actor_mids(m: HashMap<u32, Arc<ActorMid>>) { if let Ok(mut g) = ACTOR_MIDS.lock() { *g = if m.is_empty() { None } else { Some(Arc::new(m)) }; } }
+fn actor_mids() -> Option<Arc<HashMap<u32, Arc<ActorMid>>>> { ACTOR_MIDS.lock().ok().and_then(|g| g.clone()) }
 /// INSTANCING: float4s per record of the instance storage (`fn_fx::program::INSTANCE_PRIMITIVE_FLOAT4S`).
 const INST_F4: usize = fn_fx::program::INSTANCE_PRIMITIVE_FLOAT4S as usize;
 /// INSTANCING: one instanced scene draw of this frame (material entry x mesh section) / one instanced shadow draw (shadow entry x mesh section).
 struct Batch { e: usize, mesh: FxMeshId, first: u32, count: u32, ids: Vec<u32>, origin: [f32; 3] }
-struct SBatch { se: usize, mesh: FxMeshId, first: u32, count: u32, ids: Vec<u32>, bounds: Vec<[f32; 4]> }
+struct SBatch { se: usize, pipe: usize, mesh: FxMeshId, first: u32, count: u32, ids: Vec<u32>, bounds: Vec<[f32; 4]> }
 fn bytemuck_u32(v: &[u32]) -> Vec<u8> { if cfg!(target_endian = "little") { bytemuck::cast_slice(v).to_vec() } else { v.iter().flat_map(|x| x.to_le_bytes()).collect() } }
 /// INSTANCING: `FN_STATICS_INSTANCING=0` draws every placement on its own (the per-placement path, A/B and fallback).
 fn instancing() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| fn_live::var("FN_STATICS_INSTANCING").map_or(true, |v| v != "0")) }
@@ -134,6 +139,13 @@ pub struct StaticsRender {
     binds: HashMap<(usize, usize), Vec<(u32, FxBindId)>>,
     vs_bufs: HashMap<(usize, usize), FxBufId>,
     shadow_binds: HashMap<(usize, usize), Vec<(u32, FxBindId)>>,
+    cur_mid: Option<Arc<ActorMid>>,
+    mid_bufs: HashMap<(usize, usize), FxBufId>,
+    mid_binds: HashMap<(usize, usize), Vec<(u32, FxBindId)>>,
+    mid_shadow_binds: HashMap<(usize, usize), Vec<(u32, FxBindId)>>,
+    mid_draws: Vec<(usize, usize, FxMeshId, u32, u32, [f32; 3])>,
+    mid_sdraws: Vec<(usize, usize, FxMeshId, u32, u32, [f32; 4])>,
+    mid_inst_binds: HashMap<(usize, usize, bool), Vec<(u32, FxBindId)>>,
     /// Handles of the static-mesh path whose placements this path draws (scene.rs drops them from the old draw).
     handled: HashSet<fn_render::StaticMeshHandle>,
     warned: HashSet<String>,
@@ -168,7 +180,7 @@ pub struct StaticsRender {
     bkeys: Vec<(usize, FxMeshId, u32, u32)>, bkey_of: HashMap<(usize, usize, u32, u32), u32>, bstamp: Vec<(u32, u32)>,
     sbkeys: Vec<(usize, FxMeshId, u32, u32)>, sbkey_of: HashMap<(usize, usize, u32, u32), u32>, sbstamp: Vec<(u32, u32)>,
     wstamp: Vec<u32>, swstamp: Vec<u32>, shadow_canon: HashMap<usize, usize>,
-    prop_cache: Vec<PropC>, poi_slots: Vec<u32>, proxy_slots: Vec<u32>,
+    prop_cache: Vec<PropC>, poi_slots: Vec<u32>, proxy_slots: Vec<u32>, rr_done: HashSet<String>, rr_pipes: HashMap<String, Vec<FxPipeId>>,
     /// REPORT ONLY: the run's summed stats.
     run: RunAcc,
     const_writes: Vec<Option<Vec<(FxBufId, Vec<u8>)>>>,
@@ -220,6 +232,7 @@ fn prep_mesh(set: &PakSet, id: &str, object: &str, long: &str) -> Result<MeshPre
 }
 struct MeshShared { lods: Vec<Lod>, mats: Vec<Option<String>>, screen_size: [f32; MAX_STATIC_MESH_LODS], bounds: fn_render::primitive_ub::BoxSphereBounds, name: String }
 
+const POI_UPLOAD_BYTES: u64 = 6 << 20;
 fn yaw_ue(yaw_game: f32) -> Mat3 { Mat3::from_rotation_z(-yaw_game) }
 
 /// `UStaticMesh::GetBounds()` = the tagged `ExtendedBounds` of the `StaticMesh` export (as fn_fx::gpu::load_mesh reads it), `None` when not serialized.
@@ -284,7 +297,7 @@ fn web_cap_cm(name: &str, def_m: f32) -> f32 {
     if !cfg!(target_arch = "wasm32") { return 0.; }
     fn_live::var(name).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(def_m).max(0.) * 100.
 }
-fn prop_cap_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| web_cap_cm("FN_WEB_PROP_MAX_M", 250.)) }
+fn prop_cap_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| web_cap_cm("FN_WEB_PROP_MAX_M", 0.)) }
 static ON_BUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CAP_NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static CAP_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
@@ -298,10 +311,10 @@ pub fn set_on_bus(on: bool) {
     let next = if cur <= 0. || target >= cur || target <= 0. { target } else { (cur - CAP_SHRINK_CM_S * dt).max(target) };
     CAP_NOW.store(next.to_bits(), Ordering::Relaxed);
 }
-fn bus_cap_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| web_cap_cm("FN_WEB_BUS_POI_MAX_M", 1500.)) }
+fn bus_cap_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| web_cap_cm("FN_WEB_BUS_POI_MAX_M", 0.)) }
 fn live_proxy_cap_cm() -> f32 { let c = f32::from_bits(CAP_NOW.load(Ordering::Relaxed)); if c > 0. { c } else { proxy_cap_cm() } }
 fn proxy_in_cap(c: &crate::poi::HlodCluster, eye: Vec3) -> bool { let cap = live_proxy_cap_cm(); cap <= 0. || (eye.clamp(c.lo, c.hi) - eye).length() <= cap }
-fn proxy_cap_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| web_cap_cm("FN_WEB_POI_MAX_M", 600.)) }
+fn proxy_cap_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| web_cap_cm("FN_WEB_POI_MAX_M", 0.)) }
 fn view_distance_scale() -> f32 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| fn_live::var("FN_STATIC_VDS").map_or(true, |v| v != "0")) { f32::from_bits(VDS.load(Ordering::Relaxed)) } else { 1.0 }
@@ -312,10 +325,10 @@ const STATIC_MESH_LOD_DISTANCE_SCALE: f32 = 1.0;
 impl StaticsRender {
     pub fn new(install: &Path, props_dir: &Path) -> Result<StaticsRender, String> {
         let set = Arc::new(PakSet::open_install(install).map_err(|e| e.to_string())?);
-        Ok(StaticsRender { set, props_dir: props_dir.to_path_buf(), cat: None, gpu_ready: false, cache: TextureCache::tracked(), shared: None, fade_buf: None, kinds: HashMap::new(), entries: vec![], index: HashMap::new(), shadows: HashMap::new(), default_mat: None, pool: vec![], slot_of: HashMap::new(), binds: HashMap::new(), vs_bufs: HashMap::new(), shadow_binds: HashMap::new(), handled: HashSet::new(), warned: HashSet::new(), log: vec![], stats: Stats::default(), grass: crate::grass_render::GrassRender::new(), next_proto: 0, prebuilt: false, build_ms: 0., poi_built: false, df_cache: HashMap::new(), prop_rows: HashMap::new(), proxy_kinds: HashMap::new(), mid_bases: HashMap::new(), mesh_cache: HashMap::new(),
+        Ok(StaticsRender { set, props_dir: props_dir.to_path_buf(), cat: None, gpu_ready: false, cache: TextureCache::tracked(), shared: None, fade_buf: None, kinds: HashMap::new(), entries: vec![], index: HashMap::new(), shadows: HashMap::new(), default_mat: None, pool: vec![], slot_of: HashMap::new(), binds: HashMap::new(), vs_bufs: HashMap::new(), shadow_binds: HashMap::new(), cur_mid: None, mid_bufs: HashMap::new(), mid_binds: HashMap::new(), mid_shadow_binds: HashMap::new(), mid_draws: vec![], mid_sdraws: vec![], mid_inst_binds: HashMap::new(), handled: HashSet::new(), warned: HashSet::new(), log: vec![], stats: Stats::default(), grass: crate::grass_render::GrassRender::new(), next_proto: 0, prebuilt: false, build_ms: 0., poi_built: false, df_cache: HashMap::new(), prop_rows: HashMap::new(), proxy_kinds: HashMap::new(), mid_bases: HashMap::new(), mesh_cache: HashMap::new(),
             inst_store: None, inst_cap: 0, inst_cpu: vec![], inst_dirty: vec![], inst_binds: HashMap::new(), inst_shadow_binds: HashMap::new(), inst_vs: HashMap::new(),
             batches: vec![], sbatches: vec![], next_kid: 0, frame_no: 0, kgen: 1, secs: vec![], bkeys: vec![], bkey_of: HashMap::new(), bstamp: vec![], sbkeys: vec![], sbkey_of: HashMap::new(), sbstamp: vec![],
-            wstamp: vec![], swstamp: vec![], shadow_canon: HashMap::new(), prop_cache: vec![], poi_slots: vec![], proxy_slots: vec![], run: RunAcc::default(), const_writes: vec![], ivstamp: vec![], poi_c: vec![], group_c: vec![], poi_c_key: 0 })
+            wstamp: vec![], swstamp: vec![], shadow_canon: HashMap::new(), prop_cache: vec![], poi_slots: vec![], proxy_slots: vec![], rr_done: HashSet::new(), rr_pipes: HashMap::new(), run: RunAcc::default(), const_writes: vec![], ivstamp: vec![], poi_c: vec![], group_c: vec![], poi_c_key: 0 })
     }
     fn warn(&mut self, key: &str, msg: String) { if self.warned.insert(key.to_owned()) { eprintln!("[statics] {msg}"); self.log.push(msg); } }
 
@@ -398,7 +411,7 @@ impl StaticsRender {
             let (mat, num_uv, front_cw) = (self.entries[e].mat.clone(), self.entries[e].num_uv, self.entries[e].front_cw);
             let needs_default = matches!(mat.flags.blend.as_str(), "BLEND_Opaque") && mat.cooked.find(Vf::Local.type_name(), fn_fx::gpu::SHADOW_VS).is_none();
             if needs_default && self.default_mat.is_none() {
-                let d = Material::load(&self.set, fn_fx::gpu::DEFAULT_SURFACE_MATERIAL).map(Arc::new);
+                let d = match take_preloaded(fn_fx::gpu::DEFAULT_SURFACE_MATERIAL) { Some(m) => m, None => Material::load(&self.set, fn_fx::gpu::DEFAULT_SURFACE_MATERIAL).map(Arc::new) };
                 if let Err(err) = &d { self.warn("defmat", format!("{}: {err}", fn_fx::gpu::DEFAULT_SURFACE_MATERIAL)); }
                 self.default_mat = Some(d.ok());
             }
@@ -492,6 +505,24 @@ impl StaticsRender {
     }
 
     /// Every material entry of a kind, built up front so the first frame on this path has no missing section.
+    fn render_ready(&mut self, fx: &FxRenderer, id: &str) -> bool {
+        if self.rr_done.contains(id) { return true; }
+        if !self.rr_pipes.contains_key(id) {
+            let Some(Ok(k)) = self.kinds.get(id) else { return true };
+            let mut pipes = vec![];
+            for lod in &k.lods {
+                for (slot, _, _) in &lod.sections {
+                    let Some(p) = k.slots.get(*slot).cloned().flatten() else { continue };
+                    if let Some(Ok(e)) = self.index.get(&(p, lod.num_uv, false)) { let pp = self.entries[*e].gpu.pipe; if !pipes.contains(&pp) { pipes.push(pp); } }
+                }
+            }
+            self.rr_pipes.insert(id.to_owned(), pipes);
+        }
+        if self.rr_pipes.get(id).is_some_and(|v| v.iter().any(|p| fx.pipe_pending(*p))) { return false; }
+        self.rr_pipes.remove(id);
+        self.rr_done.insert(id.to_owned());
+        true
+    }
     fn prebuild(&mut self, fx: &mut FxRenderer, k: &KindGpu) -> bool {
         let mut ok = true;
         for lod in &k.lods {
@@ -553,7 +584,7 @@ impl StaticsRender {
         out.buffer_writes.push((shared.light, bytes(&fn_render::sky_light::fx_light_block())));
         // the kinds of the loaded library (once): GPU data + every material; a kind with any unbuildable section stays on the old path (whole, never mixed).
         // LOAD TIME: normally `prebuild_step` already built them under the loading screen; this finishes whatever is left (all of it in scripted runs).
-        self.build_kinds(fx, props, real, None);
+        prof("statics s0 kinds", || self.build_kinds(fx, props, real, None));
         let eye = fn_fx::view::to_ue(view.eye).as_vec3();
         let fwd = fn_fx::view::dir_to_ue(view.forward).as_vec3().normalize();
         let up0 = fn_fx::view::dir_to_ue(view.up).as_vec3();
@@ -568,8 +599,18 @@ impl StaticsRender {
         self.frame_no = self.frame_no.wrapping_add(1).max(1); // PERF: the per-frame stamps (written buffers, batches)
         // WORLD (HLOD, 2026-10-07): which clusters show their proxy this frame (FLODSceneTree) and have it built; their sub actors are not drawn
         let mut pt = ProfLap::new(); let poi = crate::poi::current();
-        let proxy_on: Vec<bool> = poi.as_ref().map(|s| { let fb = fallback_clusters(s); s.clusters.iter().enumerate().map(|(i, c)| (c.proxy_visible(eye) || (fb[i] && far_enough(c, eye))) && matches!(self.kinds.get(&s.kinds[c.kind].id), Some(Ok(_)))).collect() }).unwrap_or_default();
+        let proxy_on: Vec<bool> = poi.as_ref().map(|s| { let fb = fallback_clusters(s); s.clusters.iter().enumerate().map(|(i, c)| (c.proxy_visible(eye) || fb[i]) && matches!(self.kinds.get(&s.kinds[c.kind].id), Some(Ok(_)))).collect() }).unwrap_or_default();
         let hidden = |cl: u32| cl != crate::poi::NO_CLUSTER && proxy_on.get(cl as usize).copied().unwrap_or(false);
+        if self.frame_no % 60 == 0 { if let Some(s) = poi.as_ref() {
+            let fb = fallback_clusters(s);
+            let gap = s.clusters.iter().enumerate().filter(|(i, c)| fb[*i] && !proxy_on[*i] && (eye.clamp(c.lo, c.hi) - eye).length() < 35000.).count();
+            let near: Vec<&crate::poi::PoiGroup> = s.groups.iter().filter(|g| g.resident.load(Ordering::Relaxed) && !g.ready.load(Ordering::Relaxed) && (g.center - eye).length() - g.radius < 20000.).collect();
+            let unbuilt: usize = near.iter().map(|g| g.kinds.iter().filter(|&&k| !self.kinds.contains_key(&s.kinds[k as usize].id)).count()).sum();
+            let compiling: usize = near.iter().map(|g| g.kinds.iter().filter(|&&k| !self.render_ready(fx, &s.kinds[k as usize].id)).count()).sum();
+            if gap > 0 || !near.is_empty() { eprintln!("[poi gap] {gap} clusters without proxy or detail, {} groups within 200 m not ready ({unbuilt} kinds unbuilt, {compiling} compiling), eye {:.0} m up", near.len(), eye.z / 100.); }
+        } }
+        let keep_on = self.frame_no % KEEP_EVERY == 0;
+        let mut keep: Vec<u32> = vec![];
         // PERF (2026-10-07): per prop index its kind, row, slot and transform, rebuilt only when the prop or the layout kinds change (was: hashing per prop per frame)
         if self.prop_cache.len() != props.len() { self.prop_cache = vec![PropC { proto: u32::MAX, pos: [0; 3], mirror: false, gen: 0, kind: None, row: None, slot: 0, l2w: Mat4::IDENTITY, wb: (Vec3::ZERO, 0., [0.; 3]) }; props.len()]; }
         for (i, p) in props.iter().enumerate() {
@@ -589,6 +630,7 @@ impl StaticsRender {
             }
             let c = &self.prop_cache[i];
             let Some(k) = c.kind.clone() else { continue };
+            if keep_on && (c.wb.0 - eye).length() - c.wb.1 < KEEP_NEAR_CM { keep.push(k.kid); }
             if c.row.is_some_and(|r| hidden(r.1)) { continue; }
             let placed = c.row.map(|r| (r.0, true)).or_else(|| (fort_cull_on() && k.cull_cm <= 0.).then(|| (fn_render::quality::fort_cull::cull_distance_m(c.wb.1 * 0.01) * 100., true)));
             let (l2w, slot, pre) = (c.l2w, c.slot as usize, poi_cache_on().then_some(c.wb));
@@ -602,7 +644,9 @@ impl StaticsRender {
         if let Some(poi) = poi {
             pt.lap("statics s1 props"); let res = self.poi_build(fx, &poi, eye, None, None); pt.lap("statics s2 poi_build"); HARD_CM.store(0, Ordering::Relaxed);
             // a destroyed actor's components are gone (its harvestable in the sim's props is dead)
-            let dead: HashSet<u32> = props.iter().filter(|p| fn_combat::is_poi_proto(p.proto) && !p.alive()).map(|p| p.proto & !fn_combat::POI_PROTO).collect();
+            let mut dead: HashSet<u32> = props.iter().filter(|p| fn_combat::is_poi_proto(p.proto) && !p.alive()).map(|p| p.proto & !fn_combat::POI_PROTO).collect();
+            dead.extend(crate::bounce_hook::hidden_actors());
+            let mids = actor_mids();
             // PERF: the built kind per POI kind index, looked up once per frame (not a String-keyed lookup per placement)
             let mut kc: Vec<Option<Option<Arc<KindGpu>>>> = vec![None; poi.kinds.len()];
             let stream = crate::poi::stream_cm();
@@ -614,6 +658,7 @@ impl StaticsRender {
                     if !g.ready.load(Ordering::Relaxed) { continue; }
                     if self.group_c[gi].is_none() {
                         let (mut lo, mut hi, mut all_far_ok, mut n, mut dfs) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), true, 0u32, vec![]);
+                        let (mut max_cull, mut stream_cull, mut unbounded) = (0f32, false, false);
                         for &i in &g.placements {
                             let pl = &poi.placements[i as usize];
                             let kind = match self.kinds.get(&poi.kinds[pl.kind].id) { Some(Ok(k)) => Some(k.clone()), _ => None };
@@ -624,12 +669,13 @@ impl StaticsRender {
                             if let Some(k) = &pc.kind {
                                 lo = lo.min(pc.c - Vec3::splat(pc.r)); hi = hi.max(pc.c + Vec3::splat(pc.r)); n += 1;
                                 if !(pl.cluster == crate::poi::NO_CLUSTER && pl.cull_cm <= 0.) { all_far_ok = false; }
+                                if pl.cull_cm > 0. { max_cull = max_cull.max(pl.cull_cm); } else if pl.cluster == crate::poi::NO_CLUSTER { stream_cull = true; } else { unbounded = true; }
                                 if let Some(df) = &k.df { dfs.push(FxDfInstance { mesh: df.clone(), local_to_world: pl.l2w }); }
                             }
                             self.poi_c[i as usize] = Some(pc);
                         }
                         let (c, r) = if n > 0 { let c = (lo + hi) * 0.5; (c, (hi - lo).length() * 0.5) } else { (Vec3::ZERO, 0.) };
-                        self.group_c[gi] = Some(GroupC { c, r, all_far_ok, n, dfs });
+                        self.group_c[gi] = Some(GroupC { c, r, all_far_ok, n, dfs, max_cull, stream_cull, unbounded });
                     }
                     let gc = self.group_c[gi].as_ref().unwrap();
                     if gc.n == 0 { continue; }
@@ -638,7 +684,9 @@ impl StaticsRender {
                         let dist = d.length() - r;
                         let z = d.dot(cull.fwd);
                         let out_view = !(z + r > cull.near_cm && z - r < cull.far_cm && d.dot(cull.right).abs() <= z * cull.tx + r * cull.sx && d.dot(cull.up).abs() <= z * cull.ty + r * cull.sy);
-                        if (gc.all_far_ok && dist > stream + 1.) || (out_view && dist > POI_CSM_CM + 1.) {
+                        let reach = if gc.stream_cull { (gc.max_cull * view_distance_scale()).max(stream) } else { gc.max_cull * view_distance_scale() };
+                        let all_culled = !gc.unbounded && dist > reach + 1. && (!keep_on || dist > KEEP_NEAR_CM + 1.);
+                        if (gc.all_far_ok && dist > stream + 1.) || (out_view && dist > POI_CSM_CM + 1.) || all_culled {
                             out.distance_field_objects.extend(gc.dfs.iter().cloned());
                             st.placements += gc.n; st.culled_distance += gc.n;
                             continue;
@@ -655,6 +703,7 @@ impl StaticsRender {
                         let dist = d.length() - r;
                         let z = d.dot(cull.fwd);
                         let in_view = z + r > cull.near_cm && z - r < cull.far_cm && d.dot(cull.right).abs() <= z * cull.tx + r * cull.sx && d.dot(cull.up).abs() <= z * cull.ty + r * cull.sy;
+                        if keep_on && dist < KEEP_NEAR_CM { keep.push(k.kid); }
                         if (pl.cluster == crate::poi::NO_CLUSTER && pl.cull_cm <= 0. && dist > stream) || (!in_view && dist > POI_CSM_CM) {
                             if let Some(df) = &k.df { out.distance_field_objects.push(FxDfInstance { mesh: df.clone(), local_to_world: pl.l2w }); }
                             st.placements += 1; st.culled_distance += 1;
@@ -665,7 +714,9 @@ impl StaticsRender {
                         if self.poi_slots.len() <= iu { self.poi_slots.resize(poi.placements.len().max(iu + 1), u32::MAX); }
                         if self.poi_slots[iu] == u32::MAX { self.poi_slots[iu] = self.slot((0x8000_0000 | i, [0; 3], false)) as u32; }
                         let slot = self.poi_slots[iu] as usize;
+                        self.cur_mid = mids.as_ref().and_then(|m| m.get(&pl.actor).cloned());
                         self.draw_one_pre(fx, &k, pl.l2w, slot, &cull, view, t, &mut st, out, Some((pl.cull_cm, pl.cast_shadow)), Some(pre));
+                        self.cur_mid = None;
                     }
                 }
             } else {
@@ -698,7 +749,9 @@ impl StaticsRender {
                     if self.poi_slots.len() <= iu { self.poi_slots.resize(poi.placements.len().max(iu + 1), u32::MAX); }
                     if self.poi_slots[iu] == u32::MAX { self.poi_slots[iu] = self.slot((0x8000_0000 | i, [0; 3], false)) as u32; }
                     let slot = self.poi_slots[iu] as usize;
+                    self.cur_mid = mids.as_ref().and_then(|m| m.get(&pl.actor).cloned());
                     self.draw_one(fx, &k, pl.l2w, slot, &cull, view, t, &mut st, out, Some((pl.cull_cm, pl.cast_shadow)));
+                    self.cur_mid = None;
                 }
             }
             }
@@ -721,6 +774,7 @@ impl StaticsRender {
             }
         }
         pt.lap("statics s4 proxies"); self.flush_batches(fx, view, t, &mut st, out); // INSTANCING: the frame's instanced draws
+        if keep_on { self.keep_textures(fx, keep); }
         pt.lap("statics s5 flush"); if prof_on() { let (a, n) = MATW.with(|c| c.replace((0., 0.))); prof_add("statics mat writes ms", a); prof_add("statics mat writes count", n); }
         self.run.add(&st, cull.occ.is_some(), fn_render::occlusion::newest_age());
         self.stats = st;
@@ -731,12 +785,21 @@ impl StaticsRender {
         }
     }
 
+    fn keep_textures(&mut self, fx: &mut FxRenderer, mut ks: Vec<u32>) {
+        ks.sort_unstable(); ks.dedup();
+        let mut es: HashSet<usize> = HashSet::new();
+        for kid in ks { if let Some(v) = self.secs.get(kid as usize) { for s in v { if s.state == 2 { es.insert(s.e as usize); } } } }
+        for &e in &es { if let Some(en) = self.entries.get(e) { fx.touch_binds(&en.gpu.binds); } }
+        for ((e, _), b) in &self.mid_binds { if es.contains(e) { fx.touch_binds(b); } }
+        for ((e, _, _), b) in &self.mid_inst_binds { if es.contains(e) { fx.touch_binds(b); } }
+    }
+
     /// ALL POIS (STREAMING): updates which POI groups are resident around `eye` (FX space cm) and builds the kinds of the resident ones, nearest first: under
     /// `budget` (at least one kind per call; `None` = POI_BUILD_MS, or everything in scripted runs). Returns the resident groups, nearest first.
     fn poi_build(&mut self, fx: &mut FxRenderer, poi: &crate::poi::PoiSet, eye: Vec3, budget: Option<std::time::Duration>, only_cm: Option<f32>) -> Vec<usize> {
         let stream = crate::poi::stream_cm();
         let hint = stream_hint();
-        #[cfg(target_arch = "wasm32")] stream_web::request_ring(&self.set, poi, hint.or_else(read_hint).unwrap_or(eye)); // BROWSER PORT: the kinds' reads on workers, ahead of the view
+        #[cfg(target_arch = "wasm32")] { let kinds = &self.kinds; stream_web::request_ring(&self.set, poi, hint.or_else(read_hint).unwrap_or(eye), hint.is_some(), &|id: &str| kinds.contains_key(id)); } // BROWSER PORT: the kinds' reads on workers, ahead of the view
         let mut res: Vec<(f32, usize)> = vec![];
         // WORLD (HLOD): a group is resident while one of its clusters shows its sub actors, or the view is within the reach of its unclustered placements
         let near: Vec<bool> = poi.clusters.iter().map(|c| !c.proxy_visible(eye)).collect();
@@ -754,9 +817,9 @@ impl StaticsRender {
         let budget = budget.unwrap_or(std::time::Duration::from_secs_f32(POI_BUILD_MS / 1000.));
         let t0 = std::time::Instant::now();
         let (mut built, mut groups) = (0usize, 0usize);
-        let over = |built: usize| !sync && built > 0 && t0.elapsed() >= budget;
+        let over = |built: usize| !sync && built > 0 && (t0.elapsed() >= budget || fn_render::fx::frame_upload_bytes() >= POI_UPLOAD_BYTES);
         let fallback = fallback_clusters(poi);
-        let mut want: Vec<(f32, usize)> = poi.clusters.iter().enumerate().filter(|(i, c)| (c.proxy_visible(eye) || (fallback[*i] && far_enough(c, eye))) && proxy_in_cap(c, eye) && !self.kinds.contains_key(&poi.kinds[c.kind].id)).map(|(i, c)| ((eye.clamp(c.lo, c.hi) - eye).length(), i)).collect();
+        let mut want: Vec<(f32, usize)> = poi.clusters.iter().enumerate().filter(|(i, c)| (c.proxy_visible(eye) || fallback[*i]) && proxy_in_cap(c, eye) && !self.kinds.contains_key(&poi.kinds[c.kind].id)).map(|(i, c)| ((eye.clamp(c.lo, c.hi) - eye).length(), i)).collect();
         want.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, ci) in want {
             if over(built) { break; }
@@ -778,6 +841,7 @@ impl StaticsRender {
             for &k in &g.kinds {
                 let id = &poi.kinds[k as usize].id;
                 if self.kinds.contains_key(id) { continue; }
+                #[cfg(target_arch = "wasm32")] if !stream_web::is_done(id) { let _ = stream_web::ready(&self.set, id, { promoted += 1; promoted <= 16 }); done = false; continue; }
                 checks += 1;
                 if !sync && checks > READY_CHECKS { break 'res; }
                 #[cfg(target_arch = "wasm32")] if !stream_web::ready(&self.set, id, { promoted += 1; promoted <= 16 }) { done = false; continue; }
@@ -786,6 +850,7 @@ impl StaticsRender {
                 #[cfg(target_arch = "wasm32")] stream_web::built(id);
                 built += 1;
             }
+            if done && !g.kinds.iter().all(|&k| self.render_ready(fx, &poi.kinds[k as usize].id)) { done = false; }
             if done { g.ready.store(true, Ordering::Relaxed); groups += 1; }
             if out_of_budget { break; }
         }
@@ -796,6 +861,7 @@ impl StaticsRender {
                 for &k in &poi.groups[gi].kinds {
                     let id = &poi.kinds[k as usize].id;
                     if self.kinds.contains_key(id) { continue; }
+                    #[cfg(target_arch = "wasm32")] if !stream_web::is_done(id) { continue; }
                     checks += 1;
                     if checks > READY_CHECKS { break 'ahead; }
                     #[cfg(target_arch = "wasm32")] if !stream_web::ready(&self.set, id, false) { continue; }
@@ -893,7 +959,10 @@ impl StaticsRender {
                 } else if let Some(w) = &self.const_writes[e] { out.buffer_writes.extend(w.iter().cloned()); }
                 if let Some(tw) = tw { MATW.with(|c| { let (a, n) = c.get(); c.set((a + tw.elapsed().as_secs_f32() * 1000., n + 1.)); }); }
             }
-            if in_view {
+            if in_view && sl.bkey != u32::MAX && self.cur_mid.is_some() {
+                self.mid_buffer(fx, e, s, t, out);
+                self.mid_draws.push((e, s, mesh, first, count, wo));
+            } else if in_view {
                 if sl.bkey != u32::MAX {
                     let bk = sl.bkey as usize;
                     let (f0, b0) = self.bstamp[bk];
@@ -916,7 +985,10 @@ impl StaticsRender {
                         }
                         None => None,
                     };
-                    let binds = match self.binds.get(&(e, s)) { Some(b) => b.clone(), None => { let b = self.entries[e].gpu.bind_variant_globals(fx, pb, None, vs); self.binds.insert((e, s), b.clone()); b } };
+                    let binds = if self.cur_mid.is_some() {
+                        let mb = self.mid_buffer(fx, e, s, t, out);
+                        match self.mid_binds.get(&(e, s)) { Some(b) => b.clone(), None => { let b = self.entries[e].gpu.bind_variant_globals(fx, pb, Some(mb), vs); self.mid_binds.insert((e, s), b.clone()); b } }
+                    } else { match self.binds.get(&(e, s)) { Some(b) => b.clone(), None => { let b = self.entries[e].gpu.bind_variant_globals(fx, pb, None, vs); self.binds.insert((e, s), b.clone()); b } } };
                     out.draws.push(FxDraw { pipe: self.entries[e].gpu.pipe, binds, geom: FxGeom::MeshRange { mesh, first_index: first, index_count: count }, instances: None, sort });
                     st.draws += 1;
                 }
@@ -928,21 +1000,29 @@ impl StaticsRender {
                     if self.swstamp[se] != fno { self.swstamp[se] = fno; let sh = self.shadows[&se].as_ref().unwrap(); out.buffer_writes.extend(sh.gpu.shadow_globals_writes(&sh.mat, t, view.eye.to_array())); }
                     // PERF (2026-10-06): the placement's bounds (UE cm -> renderer metres, the (x, z, y) swap of `to_ue`): the renderer culls it per cascade
                     let bounds = [c.x / 100., c.z / 100., c.y / 100., r / 100.];
-                    if sl.sbkey != u32::MAX {
+                    let own_mid = self.cur_mid.is_some() && self.shadows[&se].as_ref().is_some_and(|sh| sh.own);
+                    if sl.sbkey != u32::MAX && own_mid {
+                        self.mid_buffer(fx, se, s, t, out);
+                        self.mid_sdraws.push((se, s, mesh, first, count, bounds));
+                    } else if sl.sbkey != u32::MAX {
                         let bk = sl.sbkey as usize;
                         let (f0, b0) = self.sbstamp[bk];
                         let b = if f0 == fno { b0 as usize } else {
                             let (bse, bm, bf, bc) = self.sbkeys[bk];
-                            self.sbatches.push(SBatch { se: bse, mesh: bm, first: bf, count: bc, ids: vec![], bounds: vec![] });
+                            let pipe = self.shadows.get(&bse).and_then(|s| s.as_ref()).map_or(0, |s| s.gpu.pipe.0);
+                            self.sbatches.push(SBatch { se: bse, pipe, mesh: bm, first: bf, count: bc, ids: vec![], bounds: vec![] });
                             self.sbstamp[bk] = (fno, (self.sbatches.len() - 1) as u32);
                             self.sbatches.len() - 1
                         };
                         self.sbatches[b].ids.push(s as u32); self.sbatches[b].bounds.push(bounds);
                     } else {
                         let pb = self.slot_buffer(fx, s);
-                        let sb = match self.shadow_binds.get(&(se, s)) { Some(b) => b.clone(), None => {
+                        let sb = if own_mid {
+                            let mb = self.mid_buffer(fx, se, s, t, out);
+                            match self.mid_shadow_binds.get(&(se, s)) { Some(b) => b.clone(), None => { let sh = self.shadows[&se].as_ref().unwrap(); let b = sh.gpu.bind_variant_globals(fx, pb, Some(mb), None); self.mid_shadow_binds.insert((se, s), b.clone()); b } }
+                        } else { match self.shadow_binds.get(&(se, s)) { Some(b) => b.clone(), None => {
                             let mb = self.entries[se].gpu.material_buf; let sh = self.shadows[&se].as_ref().unwrap();
-                            let b = sh.gpu.bind_variant_globals(fx, pb, if sh.own { Some(mb) } else { None }, None); self.shadow_binds.insert((se, s), b.clone()); b } };
+                            let b = sh.gpu.bind_variant_globals(fx, pb, if sh.own { Some(mb) } else { None }, None); self.shadow_binds.insert((se, s), b.clone()); b } } };
                         let pipe = self.shadows[&se].as_ref().unwrap().gpu.pipe;
                         out.shadow_draws.push(FxShadowDraw { pipe, binds: sb, geom: FxGeom::MeshRange { mesh, first_index: first, index_count: count }, bounds: Some(bounds), instances: None });
                         st.shadow_draws += 1;
@@ -1015,6 +1095,19 @@ impl StaticsRender {
     }
 
     /// The per-placement `Primitive` buffer of slot `s` (draws that are not instanced), created on first use from the slot's record.
+    fn mid_buffer(&mut self, fx: &mut FxRenderer, e: usize, s: usize, t: fn_fx::uniform::MaterialTime, out: &mut FxFrame) -> FxBufId {
+        let mut ov = self.entries[e].mat.overrides.clone();
+        if let Some(m) = self.cur_mid.as_ref() {
+            for (n, v) in &m.scalars { ov.scalars.insert((*n).to_owned(), *v); }
+            for (n, v) in &m.vectors { ov.vectors.insert((*n).to_owned(), *v); }
+        }
+        let packed = fn_fx::uniform::evaluate(&self.entries[e].mat.uniform, &ov, t.world);
+        let mut cb = packed.cb; cb.resize(cb.len().max(self.entries[e].gpu.material_registers).max(1), [0.0; 4]);
+        let n = cb.len();
+        let b = *self.mid_bufs.entry((e, s)).or_insert_with(|| fx.create_buffer("statics placement MID", n * 16));
+        out.buffer_writes.push((b, bytes(&cb)));
+        b
+    }
     fn slot_buffer(&mut self, fx: &mut FxRenderer, s: usize) -> FxBufId {
         if let Some(b) = self.pool[s].prim { return b; }
         let b = fx.create_buffer("statics primitive", INST_F4 * 16);
@@ -1029,12 +1122,12 @@ impl StaticsRender {
     fn flush_batches(&mut self, fx: &mut FxRenderer, view: &ViewParams, t: fn_fx::uniform::MaterialTime, st: &mut Stats, out: &mut FxFrame) {
         let need = self.pool.len().max(1);
         if self.inst_store.is_none() || need > self.inst_cap {
-            let cap = need.next_power_of_two().max(1024);
+            let cap = (need * 2).next_power_of_two().max(1024);
             let b = fx.create_buffer("statics instance primitives", cap * INST_F4 * 16);
             if self.inst_cpu.len() < cap * INST_F4 { self.inst_cpu.resize(cap * INST_F4, [0.; 4]); }
             fx.write_buffer(b, &bytes(&self.inst_cpu[..need * INST_F4]));
             self.inst_store = Some(b); self.inst_cap = cap;
-            self.inst_binds.clear(); self.inst_shadow_binds.clear();
+            self.inst_binds.clear(); self.inst_shadow_binds.clear(); self.mid_inst_binds.clear();
             self.inst_dirty.clear();
         }
         let store = self.inst_store.unwrap();
@@ -1054,8 +1147,7 @@ impl StaticsRender {
         // PERF: draws of one pipeline / material entry / mesh next to each other (the FX pass skips the repeated pipeline, bind group and buffer sets)
         let entries = &self.entries;
         self.batches.sort_unstable_by_key(|b| (entries[b.e].gpu.pipe.0, b.e, b.mesh.0, b.first));
-        let shadows = &self.shadows;
-        self.sbatches.sort_unstable_by_key(|b| (shadows.get(&b.se).and_then(|s| s.as_ref()).map_or(0, |s| s.gpu.pipe.0), b.se, b.mesh.0, b.first));
+        self.sbatches.sort_unstable_by_key(|b| (b.pipe, b.se, b.mesh.0, b.first));
         for bi in 0..self.batches.len() {
             let e = self.batches[bi].e;
             let vs = match self.entries[e].gpu.vs_globals().map(|g| g.float4s) {
@@ -1090,6 +1182,32 @@ impl StaticsRender {
             st.shadow_draws += 1; st.shadow_instanced += ids.len() as u32;
             out.shadow_draws.push(FxShadowDraw { pipe, binds: sb, geom: FxGeom::MeshRange { mesh: bt.mesh, first_index: bt.first, index_count: bt.count }, bounds: None, instances: Some(FxShadowInstances { ids, bounds }) });
         }
+        for (e, sl, mesh, first, count, origin) in std::mem::take(&mut self.mid_draws) {
+            let vs = match self.entries[e].gpu.vs_globals().map(|g| g.float4s) {
+                Some(n) => {
+                    let b = *self.inst_vs.entry(e).or_insert_with(|| fx.create_buffer("statics base-pass VS globals (instanced)", n * 16));
+                    if self.ivstamp.len() <= e { self.ivstamp.resize(self.entries.len().max(e + 1), 0); }
+                    if !vs_once() || self.ivstamp[e] != self.frame_no {
+                        self.ivstamp[e] = self.frame_no;
+                        let prev = if self.entries[e].velocity { Some(Mat4::IDENTITY) } else { None };
+                        if let Some(by) = self.entries[e].gpu.vs_globals_bytes(&self.entries[e].mat, t, prev) { out.buffer_writes.push((b, by)); }
+                    }
+                    Some(b)
+                }
+                None => None,
+            };
+            let mb = self.mid_bufs[&(e, sl)];
+            let binds = match self.mid_inst_binds.get(&(e, sl, false)) { Some(b) => b.clone(), None => { let b = self.entries[e].gpu.bind_variant_globals(fx, store, Some(mb), vs); self.mid_inst_binds.insert((e, sl, false), b.clone()); b } };
+            out.draws.push(FxDraw { pipe: self.entries[e].gpu.pipe, binds, geom: FxGeom::MeshRange { mesh, first_index: first, index_count: count }, instances: Some(FxInstances { bytes: bytemuck_u32(&[sl as u32]), count: 1 }), sort: view.sort(origin) });
+            st.draws += 1; st.instanced += 1;
+        }
+        for (se, sl, mesh, first, count, bounds) in std::mem::take(&mut self.mid_sdraws) {
+            let mb = self.mid_bufs[&(se, sl)];
+            let sb = match self.mid_inst_binds.get(&(se, sl, true)) { Some(b) => b.clone(), None => { let sh = self.shadows[&se].as_ref().unwrap(); let b = sh.gpu.bind_variant_globals(fx, store, Some(mb), None); self.mid_inst_binds.insert((se, sl, true), b.clone()); b } };
+            let pipe = self.shadows[&se].as_ref().unwrap().gpu.pipe;
+            st.shadow_draws += 1; st.shadow_instanced += 1;
+            out.shadow_draws.push(FxShadowDraw { pipe, binds: sb, geom: FxGeom::MeshRange { mesh, first_index: first, index_count: count }, bounds: None, instances: Some(FxShadowInstances { ids: vec![sl as u32], bounds: vec![bounds] }) });
+        }
         self.batches.clear(); self.sbatches.clear(); // (the batch stamps are per frame number)
     }
 
@@ -1115,15 +1233,17 @@ fn debug_skipped(path: &str) -> bool {
 static PROF: Mutex<Vec<(&'static str, Vec<f32>)>> = Mutex::new(Vec::new());
 fn prof_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| fn_live::var("FN_PERF_PROF").map_or(false, |v| v == "1")) }
 pub fn prof<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
-    if !prof_on() { return f(); }
-    let t = std::time::Instant::now(); let r = f(); prof_add(label, t.elapsed().as_secs_f32() * 1000.); r
+    let t = std::time::Instant::now(); let r = f(); let ms = t.elapsed().as_secs_f32() * 1000.; frame_section(label, ms); prof_add(label, ms); r
 }
+thread_local! { static FRAME_SECTIONS: std::cell::RefCell<Vec<(&'static str, f32)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+fn frame_section(label: &'static str, ms: f32) { FRAME_SECTIONS.with(|v| { let mut v = v.borrow_mut(); match v.iter_mut().find(|e| e.0 == label) { Some(e) => e.1 += ms, None => v.push((label, ms)) } }); }
+pub fn take_frame_sections() -> Vec<(&'static str, f32)> { FRAME_SECTIONS.with(|v| std::mem::take(&mut *v.borrow_mut())) }
 thread_local! { static MATW: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0., 0.)) }; }
 /// PERF PROFILE (debug-only): consecutive sections of one function (`lap` records the time since the previous lap under `label`).
 struct ProfLap(Option<std::time::Instant>);
 impl ProfLap {
-    fn new() -> Self { ProfLap(prof_on().then(std::time::Instant::now)) }
-    fn lap(&mut self, label: &'static str) { if let Some(t) = self.0 { prof_add(label, t.elapsed().as_secs_f32() * 1000.); self.0 = Some(std::time::Instant::now()); } }
+    fn new() -> Self { ProfLap(Some(std::time::Instant::now())) }
+    fn lap(&mut self, label: &'static str) { if let Some(t) = self.0 { let ms = t.elapsed().as_secs_f32() * 1000.; frame_section(label, ms); prof_add(label, ms); self.0 = Some(std::time::Instant::now()); } }
 }
 fn prof_add(label: &'static str, ms: f32) { if !prof_on() { return; } if let Ok(mut g) = PROF.lock() { match g.iter_mut().find(|e| e.0 == label) { Some(e) => e.1.push(ms), None => g.push((label, vec![ms])) } } }
 fn prof_report() -> String { PROF.lock().map(|g| g.iter().map(|(l, v)| { let mut s: Vec<f32> = v.iter().skip(10).copied().collect(); s.sort_by(|a, b| a.total_cmp(b)); let q = |p: f32| s.get(((s.len() as f32 * p) as usize).min(s.len().saturating_sub(1))).copied().unwrap_or(0.); format!("  prof {l:<28} median {:7.3} ms  p95 {:7.3}  max {:7.2}  ({} calls)\n", q(0.5), q(0.95), q(1.0), v.len()) }).collect()).unwrap_or_default() }
@@ -1173,6 +1293,7 @@ pub fn prewarm(kind_ids: Vec<String>) {
                 if let Some(path) = slot { if !paths.contains(&path) { paths.push(path); } }
             }
         }
+        if !paths.iter().any(|p| p == fn_fx::gpu::DEFAULT_SURFACE_MATERIAL) { paths.push(fn_fx::gpu::DEFAULT_SURFACE_MATERIAL.to_owned()); }
         let n = paths.len();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let out: Mutex<HashMap<String, Result<Arc<Material>, String>>> = Mutex::new(HashMap::new());
@@ -1203,13 +1324,15 @@ pub fn prewarm(kind_ids: Vec<String>) {
         });
         eprintln!("[statics] prewarm: {} slot materials of {} kinds parsed in {:.0} ms, {} textures decoded in {:.0} ms", out.len(), kind_ids.len(), t_mats.as_secs_f32() * 1000., textures.len(), (t0.elapsed() - t_mats).as_secs_f32() * 1000.);
         if let Ok(mut g) = PREWARMED_TEXTURES.lock() { *g = textures; }
-        if let Ok(mut g) = PRELOADED.lock() { *g = Some(out); }
+        if let Ok(mut g) = PRELOADED.lock() { let m = g.get_or_insert_with(HashMap::new); for (k, v) in out { m.entry(k).or_insert(v); } }
     });
     if let (Ok(h), Ok(mut g)) = (h, PREWARM.lock()) { *g = Some(h); }
 }
 /// ALL POIS: per-frame budget (ms) for building the kinds of newly resident POI groups in the live game. CHOSEN: 6 ms (at least one kind per frame; a kind
 /// with new materials takes ~50 ms, so a group coming into range costs a few frames of hitching: the shader translation is not asynchronous).
 const POI_BUILD_MS: f32 = 6.;
+const KEEP_EVERY: u32 = 30;
+const KEEP_NEAR_CM: f32 = 15000.;
 /// ALL POIS (CULLING): an off-screen POI placement nearer than this (cm, from its bounds) is still submitted for the shadow cascades. CHOSEN: the CSM radius
 /// `GetCSMMaxDistance` at its largest (DynamicShadowDistanceMovableLight 4500 cm x r.Shadow.DistanceScale 2, fn-render lighting.rs) + 50 m for casters
 /// standing toward the sun (UE extrudes each cascade's caster volume toward the light).
@@ -1272,8 +1395,6 @@ fn spawn_eye() -> Vec3 {
     fn_fx::view::to_ue(Vec3::new(x, fn_terrain::ground_y(x, z) + 2., z)).as_vec3()
 }
 fn first_cm() -> f32 { static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *V.get_or_init(|| fn_live::var("FN_POI_FIRST_M").or_else(|_| fn_live::var("FNWEB_POI_START_M")).ok().and_then(|v| v.parse::<f32>().ok()).map_or(6000., |m| m * 100.)) }
-const FALLBACK_MIN_CM: f32 = 15000.;
-fn far_enough(c: &crate::poi::HlodCluster, eye: Vec3) -> bool { (eye.clamp(c.lo, c.hi) - eye).length() >= FALLBACK_MIN_CM }
 fn fallback_clusters(poi: &crate::poi::PoiSet) -> Vec<bool> {
     let mut v = vec![false; poi.clusters.len()];
     for g in poi.groups.iter().filter(|g| !g.ready.load(Ordering::Relaxed)) { for &c in &g.clusters { if let Some(x) = v.get_mut(c as usize) { *x = true; } } }
@@ -1288,7 +1409,7 @@ fn first_frame_progress<V>(poi: &crate::poi::PoiSet, eye: Vec3, kinds: &HashMap<
     }
     let fb = fallback_clusters(poi);
     for (i, c) in poi.clusters.iter().enumerate() {
-        if !(((fb[i] && far_enough(c, eye)) || c.proxy_visible(eye)) && proxy_in_cap(c, eye)) { continue; }
+        if !((fb[i] || c.proxy_visible(eye)) && proxy_in_cap(c, eye)) { continue; }
         if seen.insert(c.kind) { total += 1; if kinds.contains_key(&poi.kinds[c.kind].id) { done += 1; } }
     }
     (done, total)
@@ -1303,6 +1424,7 @@ pub fn frame(fx: &mut FxRenderer, props: &[fn_combat::Harvestable], real: Option
 pub fn handles(h: fn_render::StaticMeshHandle) -> bool { STATE.lock().ok().map_or(false, |g| g.as_ref().map_or(false, |s| s.handled.contains(&h))) }
 /// The handled set changed since the last call (scene.rs re-uploads its static instance list).
 pub fn take_changed() -> bool { CHANGED.swap(false, Ordering::Relaxed) }
+pub fn handled_meshes() -> Vec<fn_render::StaticMeshHandle> { STATE.lock().ok().and_then(|g| g.as_ref().map(|s| s.handled.iter().copied().collect())).unwrap_or_default() }
 pub fn report() -> String { format!("{}{}", prof_report(), STATE.lock().ok().and_then(|g| g.as_ref().map(|s| format!("{}{}", s.report(), s.grass.report()))).unwrap_or_default()) }
 pub fn stats() -> Option<Stats> { STATE.lock().ok().and_then(|g| g.as_ref().map(|s| s.stats.clone())) }
 
@@ -1316,6 +1438,15 @@ pub fn grass_frame(fx: &mut FxRenderer, grass: Option<&crate::foliage::Grass>, v
     let shared = s.shared.unwrap();
     let StaticsRender { set, cache, grass: gr, .. } = s;
     if gr.frame(set, cache, fx, shared, grass, view, view_distance_scale, out) { CHANGED.store(true, Ordering::Relaxed); }
+}
+pub fn grass_prebuild(fx: &mut FxRenderer, grass: Option<&crate::foliage::Grass>) {
+    let Some(grass) = grass else { return };
+    let Ok(mut g) = STATE.lock() else { return };
+    let Some(s) = g.as_mut() else { return };
+    s.init_gpu(fx);
+    let shared = s.shared.unwrap();
+    let StaticsRender { set, cache, grass: gr, .. } = s;
+    if gr.prebuild(set, cache, fx, shared, grass) { CHANGED.store(true, Ordering::Relaxed); }
 }
 /// GRASS: the ground cover is drawn by the real-shader path (scene.rs leaves the blades out of the old static draw).
 pub fn grass_active() -> bool { STATE.lock().ok().map_or(false, |g| g.as_ref().map_or(false, |s| s.grass.active())) }

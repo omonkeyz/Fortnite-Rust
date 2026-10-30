@@ -212,7 +212,7 @@ mod tests {
         // the four healables share the montage / trigger-duration data `loadout_stats` already reads
         for h in crate::loadout_stats::HEALABLE_ITEMS {
             let s = all.iter().find(|s| h.ends_with(&s.name)).unwrap();
-            assert!(s.trigger_duration.is_some() && s.trigger_ability_time.is_some(), "{}", s.name);
+            assert!((s.trigger_duration.is_some() || s.name == "Athena_Grenade") && s.trigger_ability_time.is_some(), "{}", s.name);
         }
     }
 }

@@ -89,12 +89,15 @@ pub struct VolumeAtlas<K> {
     pub generation: u32,
     /// Volumes `AddElement` could not place ("Failed to allocate ... in distance field atlas").
     pub failed: Vec<K>,
+    previous: Vec<(K, [u32; 3])>,
+    pad: Option<[u32; 3]>,
 }
 
 impl<K: Copy + PartialEq + std::fmt::Debug> VolumeAtlas<K> {
     pub fn new(max_size: [u32; 3]) -> VolumeAtlas<K> {
-        VolumeAtlas { max_size, layout: TextureLayout3d::new([0; 3], max_size), current: vec![], pending: vec![], texture_size: None, generation: 0, failed: vec![] }
+        VolumeAtlas { max_size, layout: TextureLayout3d::new([0; 3], max_size), current: vec![], pending: vec![], texture_size: None, generation: 0, failed: vec![], previous: vec![], pad: None }
     }
+    pub fn with_texture_padding(mut self, step: [u32; 3]) -> VolumeAtlas<K> { self.pad = Some(step); self }
     /// `AddAllocation`.
     pub fn add(&mut self, key: K, size: [u32; 3]) { if !self.current.iter().any(|c| c.0 == key) && !self.pending.iter().any(|p| p.0 == key) { self.pending.push((key, size)); } }
     /// `RemoveAllocation` of a placed volume: UE frees its layout node; here every remaining volume is placed again on the next [`Self::update`] (a
@@ -117,6 +120,7 @@ impl<K: Copy + PartialEq + std::fmt::Debug> VolumeAtlas<K> {
     pub fn block(&self, key: K) -> Option<[u32; 3]> { self.current.iter().find(|c| c.0 == key).map(|c| c.2) }
     /// Every placed volume: (key, size, block min).
     pub fn placed(&self) -> &[(K, [u32; 3], [u32; 3])] { &self.current }
+    pub fn take_previous(&mut self) -> Vec<(K, [u32; 3])> { std::mem::take(&mut self.previous) }
     /// `UpdateAllocations`.
     pub fn update(&mut self) -> AtlasUpdate<K> {
         if self.pending.is_empty() { return AtlasUpdate::None; }
@@ -138,13 +142,15 @@ impl<K: Copy + PartialEq + std::fmt::Debug> VolumeAtlas<K> {
             // a clean slate: every volume placed again, largest first
             self.layout = TextureLayout3d::new([0; 3], self.max_size);
             self.generation += 1;
+            self.previous = self.current.iter().map(|c| (c.0, c.2)).collect();
             let mut all: Vec<(K, [u32; 3])> = self.current.drain(..).map(|(k, s, _)| (k, s)).chain(placed.into_iter().map(|(k, s, _)| (k, s))).collect();
             all.sort_by(|a, b| vol(&b.1).cmp(&vol(&a.1)));
             placed = vec![];
             for (k, s) in all { match self.layout.add_element(s) { Some(min) => placed.push((k, s, min)), None => self.failed.push(k) } }
         }
         self.current.extend(placed);
-        self.texture_size = Some(self.layout.size().map(|v| v.max(1)));
+        let size = self.layout.size().map(|v| v.max(1));
+        self.texture_size = Some(match self.pad { Some(p) => [0, 1, 2].map(|a| size[a].div_ceil(p[a].max(1)).saturating_mul(p[a].max(1)).min(self.max_size[a]).max(size[a])), None => size });
         AtlasUpdate::Full { regenerated }
     }
 }

@@ -95,6 +95,7 @@ pub struct BuildInput {
     intents: Vec<BuildIntent>,
     /// (material, seconds left) of the last "not enough materials" report.
     afford: Option<(Material, f32)>,
+    status: Option<fn_ui::screens::hud_cooked::StatusEvent>,
     /// The intents of the last finished frame (`end_frame`), for consumers that poll instead of draining.
     last: Vec<BuildIntent>,
     /// `Gameplay.Action.Player.InteractBuild` is blocked by an active ability (the pawn ASC's `AreAbilityTagsBlocked`; the app sets it from the pickaxe combo,
@@ -103,12 +104,6 @@ pub struct BuildInput {
     /// How many `PerformBuildingEditInteraction` presses were refused by that block (`Building.Edit.Failed` feedback, "Unable to Edit Building").
     edit_failed: u32,
     trap_icon: Option<(String, u8)>,
-    confirm_on_release: bool,
-    reset_on_release: bool,
-    edit_armed: bool,
-    reset_armed: bool,
-    turbo_build: bool,
-    turbo_wait: f32,
 }
 impl Default for BuildInput { fn default() -> Self { Self::new() } }
 
@@ -118,8 +113,6 @@ const K_FIRE: usize = 6; const K_MAT: usize = 7; const K_EDIT: usize = 8; const 
 
 /// AFortClientAnnouncement `TimeToLive` of the generic basic announcement (`Announce_Gen_Basic` CDO: 5.0 s).
 pub const UNABLE_TO_AFFORD_SECONDS: f32 = 5.;
-pub const TURBO_BUILD_FIRST_INTERVAL: f32 = 0.05;
-pub const TURBO_BUILD_INTERVAL: f32 = 0.05;
 
 /// The keys used for `action`: the player's binding row (defaults = ConfigD_Athena via the generated `fn_settings` table).
 pub fn keys_for(b: &Bindings, action: usize) -> [fn_settings::Key; 2] { b.get(action) }
@@ -129,11 +122,7 @@ pub fn piece_of_slot(slot: usize) -> Option<PieceKind> { PieceKind::ALL.get(slot
 
 impl BuildInput {
     /// Controller ctor state: Primary bar focused, Secondary remembered slot 0 (Wall), Wood.
-    pub fn new() -> Self { BuildInput { focused_secondary: false, building_slot: 0, material: Material::Wood, editing: false, occupied: [true, true, true, true, false], prev: [false; 16], intents: Vec::new(), afford: None, last: Vec::new(), interact_build_blocked: false, edit_failed: 0, trap_icon: None,
-        confirm_on_release: false, reset_on_release: false, edit_armed: false, reset_armed: false, turbo_build: false, turbo_wait: 0. } }
-    pub fn set_edit_release_options(&mut self, confirm_on_release: bool, reset_on_release: bool) { self.confirm_on_release = confirm_on_release; self.reset_on_release = reset_on_release; }
-    pub fn set_turbo_build(&mut self, on: bool) { self.turbo_build = on; }
-    pub fn edit_release_options(&self) -> (bool, bool) { (self.confirm_on_release, self.reset_on_release) }
+    pub fn new() -> Self { BuildInput { focused_secondary: false, building_slot: 0, material: Material::Wood, editing: false, occupied: [true, true, true, true, false], prev: [false; 16], intents: Vec::new(), afford: None, status: None, last: Vec::new(), interact_build_blocked: false, edit_failed: 0, trap_icon: None } }
 
     pub fn is_building(&self) -> bool { self.focused_secondary }
     pub fn is_editing(&self) -> bool { self.editing }
@@ -158,6 +147,7 @@ impl BuildInput {
     pub fn try_interact_build(&mut self) -> bool {
         if !self.interact_build_blocked { return true; }
         self.edit_failed += 1;
+        self.status = Some(fn_ui::screens::hud_cooked::StatusEvent::BuildingEditFailed);
         eprintln!("[build-input] PerformBuildingEditInteraction refused: Gameplay.Action.Player.InteractBuild blocked by the active pickaxe combo -> Building.Edit.Failed \"Unable to Edit Building\" (#{})", self.edit_failed);
         false
     }
@@ -198,7 +188,8 @@ impl BuildInput {
         self.intents.push(BuildIntent::MaterialChanged(self.material));
     }
     /// The placement path found the current tier unaffordable (FUN_1408336f0): starts the "Not enough {0} to build!" message.
-    pub fn unable_to_afford(&mut self, material: Material) { self.afford = Some((material, UNABLE_TO_AFFORD_SECONDS)); }
+    pub fn unable_to_afford(&mut self, material: Material) { self.afford = Some((material, UNABLE_TO_AFFORD_SECONDS)); self.status = Some(fn_ui::screens::hud_cooked::StatusEvent::UnableToAfford(match material { Material::Wood => 0, Material::Stone => 1, Material::Metal => 2 })); }
+    pub fn take_status(&mut self) -> Option<fn_ui::screens::hud_cooked::StatusEvent> { self.status.take() }
     /// The material of a still-showing "not enough materials" message.
     pub fn afford_message(&self) -> Option<Material> { self.afford.map(|a| a.0) }
 
@@ -217,8 +208,8 @@ impl BuildInput {
         let slots: [bool; BUILD_SLOTS] = std::array::from_fn(|i| edge(K_F1 + i, A_SECONDARY_QUICKBAR_SLOT_F1 + i, &mut prev).0);
         let (fire_p, fire_r) = edge(K_FIRE, A_FIRE, &mut prev);
         let (mat, _) = edge(K_MAT, A_CHANGE_MATERIAL, &mut prev);
-        let (edit, edit_up) = edge(K_EDIT, A_PERFORM_BUILDING_EDIT_INTERACTION, &mut prev);
-        let (reset, reset_up) = edge(K_RESET, A_BUILDING_EDIT_RESET, &mut prev);
+        let (edit, _) = edge(K_EDIT, A_PERFORM_BUILDING_EDIT_INTERACTION, &mut prev);
+        let (reset, _) = edge(K_RESET, A_BUILDING_EDIT_RESET, &mut prev);
         let (rot, _) = edge(K_ROT, A_ROTATE, &mut prev);
         let (improve, _) = edge(K_IMPROVE, A_PERFORM_BUILDING_IMPROVEMENT_INTERACTION, &mut prev);
         let (up, _) = edge(K_UP, A_SLOT_UP, &mut prev);
@@ -228,22 +219,12 @@ impl BuildInput {
         let slot_key = (0..BUILD_SLOTS).any(|i| slots[i] && self.occupied[i]);
         let wheel = self.focused_secondary && (up || down) && !(up && down);
         if self.editing && edit_switch_cancel_enabled() && (switch || slot_key || wheel) { self.cancel_edit(); }
-        let edit_was_armed = self.edit_armed;
-        if edit_up { self.edit_armed = false; }
-        let reset_was_armed = self.reset_armed;
-        if reset_up { self.reset_armed = false; }
         if self.editing {
             // EditModeInputComponent0 is on top of the stack: Fire / reset / confirm go to the session.
             if fire_p { self.intents.push(BuildIntent::EditSelectPressed); }
             if fire_r { self.intents.push(BuildIntent::EditSelectReleased); }
-            if self.reset_on_release {
-                if reset { self.reset_armed = true; }
-                if reset_up && reset_was_armed { self.intents.push(BuildIntent::EditReset); }
-            } else if reset { self.intents.push(BuildIntent::EditReset); }
-            if self.confirm_on_release {
-                if edit { self.edit_armed = true; }
-                if edit_up && edit_was_armed { self.intents.push(BuildIntent::EditConfirm); }
-            } else if edit { self.intents.push(BuildIntent::EditConfirm); } // CompleteBuildingEditInteraction = G (decrypted DefaultInput.ini line 252, same key as PerformBuildingEditInteraction)
+            if reset { self.intents.push(BuildIntent::EditReset); }
+            if edit { self.intents.push(BuildIntent::EditConfirm); } // CompleteBuildingEditInteraction = G (decrypted DefaultInput.ini line 252, same key as PerformBuildingEditInteraction)
             return;
         }
         if switch {
@@ -263,15 +244,11 @@ impl BuildInput {
         }
         if mat { self.change_material(); }
         if self.piece().is_some() || self.trap_held() {
-            if fire_p { self.intents.push(BuildIntent::Place); self.turbo_wait = TURBO_BUILD_FIRST_INTERVAL; }
-            else if self.turbo_build && self.prev[K_FIRE] && self.piece().is_some() {
-                self.turbo_wait -= dt.max(0.);
-                if self.turbo_wait <= 0. { self.intents.push(BuildIntent::Place); self.turbo_wait = (self.turbo_wait + TURBO_BUILD_INTERVAL).max(0.); }
-            }
+            if fire_p { self.intents.push(BuildIntent::Place); }
             if rot { self.intents.push(BuildIntent::Rotate); }
             if improve { self.intents.push(BuildIntent::Improve); }
         }
-        if edit { self.edit_armed = true; self.intents.push(BuildIntent::EditBegin); }
+        if edit { self.intents.push(BuildIntent::EditBegin); }
     }
 
     /// The building quickbar HUD state (key texts from the bindings).
@@ -333,21 +310,6 @@ mod tests {
         let lmb = Key::from_name("LeftMouseButton").unwrap().poll_code().unwrap();
         let mut n = 0; for _ in 0..120 { bi.update(&b, |c| c == lmb, false, 1. / 60.); n += bi.drain_intents().iter().filter(|i| **i == BuildIntent::Place).count(); }
         assert_eq!(n, 1);
-    }
-    #[test] fn turbo_build_repeats_place_while_fire_is_held() {
-        let (mut bi, b) = setup(); bi.set_turbo_build(true); press(&mut bi, &b, &["Q"]);
-        let lmb = Key::from_name("LeftMouseButton").unwrap().poll_code().unwrap();
-        let mut frames = vec![];
-        for f in 0..60 { bi.update(&b, |c| c == lmb, false, 1. / 60.); if bi.drain_intents().iter().any(|i| *i == BuildIntent::Place) { frames.push(f); } }
-        assert_eq!(frames.len(), 20, "{frames:?}");
-        assert_eq!(frames[0], 0);
-        assert!(frames.windows(2).all(|w| w[1] - w[0] == 3), "{frames:?}");
-        bi.update(&b, |_| false, false, 1. / 60.); bi.drain_intents();
-        let mut n = 0; for _ in 0..30 { bi.update(&b, |_| false, false, 1. / 60.); n += bi.drain_intents().iter().filter(|i| **i == BuildIntent::Place).count(); }
-        assert_eq!(n, 0);
-        let (mut combat, b) = setup(); combat.set_turbo_build(true);
-        let mut n = 0; for _ in 0..60 { combat.update(&b, |c| c == lmb, false, 1. / 60.); n += combat.drain_intents().iter().filter(|i| **i == BuildIntent::Place).count(); }
-        assert_eq!(n, 0, "no build intents with a weapon held");
     }
     #[test] fn edit_mode_routes_fire_reset_confirm() {
         let (mut bi, b) = setup(); press(&mut bi, &b, &["Q"]);
@@ -422,69 +384,17 @@ mod tests {
         if i.contains(&BuildIntent::EditConfirm) { bi.set_editing(false); }
         i
     }
-    #[test] fn confirm_edit_on_release_off_needs_a_second_press() {
+    #[test] fn confirm_needs_a_second_press() {
         let (mut bi, b) = setup(); frame(&mut bi, &b, &["Q"]); frame(&mut bi, &b, &[]);
         assert_eq!(frame(&mut bi, &b, &["G"]), vec![BuildIntent::EditBegin]);
         assert!(frame(&mut bi, &b, &["G"]).is_empty());
-        assert!(frame(&mut bi, &b, &[]).is_empty(), "releasing G does not confirm with the option off");
+        assert!(frame(&mut bi, &b, &[]).is_empty(), "releasing G does not confirm");
         assert_eq!(frame(&mut bi, &b, &["G"]), vec![BuildIntent::EditConfirm]);
     }
-    #[test] fn confirm_edit_on_release_confirms_when_the_held_edit_key_is_released() {
-        let (mut bi, b) = setup(); bi.set_edit_release_options(true, false); frame(&mut bi, &b, &["Q"]); frame(&mut bi, &b, &[]);
-        assert_eq!(frame(&mut bi, &b, &["G"]), vec![BuildIntent::EditBegin]);
-        assert_eq!(frame(&mut bi, &b, &["G", "LeftMouseButton"]), vec![BuildIntent::EditSelectPressed]);
-        assert_eq!(frame(&mut bi, &b, &["G"]), vec![BuildIntent::EditSelectReleased]);
-        assert_eq!(frame(&mut bi, &b, &[]), vec![BuildIntent::EditConfirm], "release of G confirms");
-        assert!(!bi.is_editing());
-        bi.set_editing(true);
-        assert!(frame(&mut bi, &b, &["G"]).is_empty(), "a press while editing only arms");
-        assert_eq!(frame(&mut bi, &b, &[]), vec![BuildIntent::EditConfirm]);
-    }
-    #[test] fn confirm_on_release_does_nothing_when_the_edit_never_began() {
-        let (mut bi, b) = setup(); bi.set_edit_release_options(true, false);
-        bi.update(&b, |c| c == Key::from_name("G").unwrap().poll_code().unwrap(), false, 1. / 60.);
-        assert_eq!(bi.drain_intents(), vec![BuildIntent::EditBegin]);
-        bi.update(&b, |_| false, false, 1. / 60.);
-        assert!(bi.drain_intents().is_empty(), "refused / no target: the release is not a confirm");
-        bi.set_editing(true);
-        bi.update(&b, |_| false, false, 1. / 60.);
-        assert!(bi.drain_intents().is_empty());
-    }
-    #[test] fn reset_edit_on_release_resets_on_the_release_edge_only() {
+    #[test] fn reset_happens_on_the_press() {
         let (mut bi, b) = setup(); frame(&mut bi, &b, &["Q"]); frame(&mut bi, &b, &[]); frame(&mut bi, &b, &["G"]); frame(&mut bi, &b, &[]);
         assert_eq!(frame(&mut bi, &b, &["RightMouseButton"]), vec![BuildIntent::EditReset], "off: the press resets");
         assert!(frame(&mut bi, &b, &[]).is_empty());
-        bi.set_edit_release_options(false, true);
-        assert!(frame(&mut bi, &b, &["RightMouseButton"]).is_empty(), "on: nothing on the press");
-        assert!(frame(&mut bi, &b, &["RightMouseButton"]).is_empty());
-        assert_eq!(frame(&mut bi, &b, &[]), vec![BuildIntent::EditReset], "on: the release resets");
-    }
-    #[test] fn reset_on_release_ignores_a_press_from_before_the_edit() {
-        let (mut bi, b) = setup(); bi.set_edit_release_options(true, true);
-        frame(&mut bi, &b, &["RightMouseButton"]);
-        assert_eq!(frame(&mut bi, &b, &["RightMouseButton", "G"]), vec![BuildIntent::EditBegin]);
-        assert!(frame(&mut bi, &b, &["G"]).is_empty(), "the aim held into the edit is not a reset");
-        assert_eq!(frame(&mut bi, &b, &["G", "RightMouseButton"]), Vec::<BuildIntent>::new());
-        assert_eq!(frame(&mut bi, &b, &["G"]), vec![BuildIntent::EditReset]);
-        assert_eq!(frame(&mut bi, &b, &[]), vec![BuildIntent::EditConfirm], "both options: reset on release, then confirm on release");
-    }
-    #[test] fn pad_b_hold_edit_with_confirm_on_release() {
-        use fn_game::inputdev::pad::{State, B};
-        use fn_game::pad_layout::{Layout, Mode, PadMapper};
-        let (mut bi, b) = setup(); bi.set_edit_release_options(true, false);
-        let mut m = PadMapper::new();
-        let mut seen = Vec::new();
-        for i in 0..40 {
-            let pressed = i < 30;
-            let mode = if bi.is_editing() { Mode::Edit } else if bi.is_building() { Mode::Build } else { Mode::Combat };
-            let a = m.update(Some(&State { buttons: if pressed { B } else { 0 }, ..Default::default() }), Layout::Standard, mode, false, 1. / 60.);
-            let codes: Vec<u16> = a.held.iter().filter_map(|&x| b.get(x).iter().find_map(|k| k.poll_code())).collect();
-            bi.update(&b, |c| codes.contains(&c), false, 1. / 60.);
-            for it in bi.drain_intents() { if it == BuildIntent::EditBegin { bi.set_editing(true); } if it == BuildIntent::EditConfirm { bi.set_editing(false); } seen.push((i, it)); }
-        }
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[0].1, BuildIntent::EditBegin); assert!(seen[0].0 >= 14 && seen[0].0 <= 16, "{seen:?}");
-        assert_eq!(seen[1], (30, BuildIntent::EditConfirm), "releasing B confirms");
     }
     #[test] fn afford_message_expires() { let mut bi = BuildInput::new(); bi.unable_to_afford(Material::Metal); assert_eq!(bi.afford_message(), Some(Material::Metal)); bi.update(&Settings::default().input.bindings, |_| false, false, 5.); assert_eq!(bi.afford_message(), None); }
 }

@@ -14,6 +14,8 @@ struct Sampled { levels: Vec<Level>, linear: bool, wrap: bool }
 
 fn build(store: &TextureStore, id: TextureId) -> Option<Sampled> {
     let t = store.get(id)?;
+    t.mark_cpu();
+    if !t.has_pixels() { return None; }
     let pm = premultiply_rgba8(&t.rgba);
     let mut levels = vec![Level { w: t.w as usize, h: t.h as usize, px: pm.clone() }];
     if t.sampler.mips {

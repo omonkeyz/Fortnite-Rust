@@ -101,6 +101,7 @@ impl Cooked {
 pub struct AerialFeedback { install: Option<PathBuf>, cooked: Option<Option<Cooked>> }
 impl Clone for AerialFeedback { fn clone(&self) -> Self { AerialFeedback { install: self.install.clone(), cooked: None } } }
 impl AerialFeedback {
+    pub fn store(&self) -> Option<Rc<Store>> { match &self.cooked { Some(Some(c)) => Some(c.ui.store.clone()), _ => None } }
     pub fn set_install(&mut self, install: PathBuf) { if self.install.as_ref() != Some(&install) { self.install = Some(install); self.cooked = None; } }
     pub fn build(&mut self, ctx: &mut UiContext, w: f32, h: f32, p: &AerialPrompt, glider: &str, out: &mut RenderList) -> bool {
         if self.cooked.is_none() {

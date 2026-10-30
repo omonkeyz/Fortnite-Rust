@@ -1204,3 +1204,112 @@ index 955d1f6..6927c02 100644
  #[stable(feature = "available_parallelism", since = "1.59.0")]
  pub use functions::available_parallelism;
  #[stable(feature = "park_timeout", since = "1.4.0")]
+diff --git a/std/src/hash/random.rs b/std/src/hash/random.rs
+index b9c21ab..4cbb74e 100644
+--- a/std/src/hash/random.rs
++++ b/std/src/hash/random.rs
+@@ -81,7 +81,48 @@ impl BuildHasher for RandomState {
+     type Hasher = DefaultHasher;
+     #[inline]
+     fn build_hasher(&self) -> DefaultHasher {
+-        DefaultHasher(SipHasher13::new_with_keys(self.k0, self.k1))
++        DefaultHasher(Inner::new_with_keys(self.k0, self.k1))
++    }
++}
++
++#[cfg(not(all(target_os = "unknown", target_feature = "atomics")))]
++type Inner = SipHasher13;
++#[cfg(all(target_os = "unknown", target_feature = "atomics"))]
++type Inner = fnweb_hash::FnwebHasher;
++
++#[cfg(all(target_os = "unknown", target_feature = "atomics"))]
++mod fnweb_hash {
++    use crate::hash::Hasher;
++    const K: u64 = 0x9E37_79B9_7F4A_7C15;
++    #[derive(Clone, Debug)]
++    pub struct FnwebHasher { h: u64 }
++    impl FnwebHasher {
++        #[inline]
++        pub const fn new_with_keys(k0: u64, k1: u64) -> FnwebHasher { FnwebHasher { h: k0 ^ k1.rotate_left(32) } }
++        #[inline(always)]
++        fn add(&mut self, w: u64) { self.h = (self.h.rotate_left(5) ^ w).wrapping_mul(K); }
++    }
++    impl Hasher for FnwebHasher {
++        #[inline]
++        fn write(&mut self, b: &[u8]) {
++            let mut c = b.chunks_exact(8);
++            for x in &mut c { self.add(u64::from_le_bytes([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]])); }
++            let r = c.remainder();
++            if !r.is_empty() { let mut t = [0u8; 8]; t[..r.len()].copy_from_slice(r); self.add(u64::from_le_bytes(t) ^ ((r.len() as u64) << 59)); }
++        }
++        #[inline] fn write_u8(&mut self, i: u8) { self.add(i as u64) }
++        #[inline] fn write_u16(&mut self, i: u16) { self.add(i as u64) }
++        #[inline] fn write_u32(&mut self, i: u32) { self.add(i as u64) }
++        #[inline] fn write_u64(&mut self, i: u64) { self.add(i) }
++        #[inline] fn write_u128(&mut self, i: u128) { self.add(i as u64); self.add((i >> 64) as u64) }
++        #[inline] fn write_usize(&mut self, i: usize) { self.add(i as u64) }
++        #[inline]
++        fn finish(&self) -> u64 {
++            let mut z = self.h;
++            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
++            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
++            z ^ (z >> 31)
++        }
+     }
+ }
+ 
+@@ -91,7 +132,7 @@ impl BuildHasher for RandomState {
+ /// not be relied upon over releases.
+ #[derive(Clone, Debug)]
+ #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
+-pub struct DefaultHasher(SipHasher13);
++pub struct DefaultHasher(Inner);
+ 
+ impl DefaultHasher {
+     /// Creates a new `DefaultHasher`.
+@@ -104,7 +145,7 @@ impl DefaultHasher {
+     #[rustc_const_unstable(feature = "const_default", issue = "143894")]
+     #[must_use]
+     pub const fn new() -> DefaultHasher {
+-        DefaultHasher(SipHasher13::new_with_keys(0, 0))
++        DefaultHasher(Inner::new_with_keys(0, 0))
+     }
+ }
+ 
+@@ -136,6 +177,36 @@ impl Hasher for DefaultHasher {
+         self.0.write_str(s);
+     }
+ 
++    #[inline]
++    fn write_u8(&mut self, i: u8) {
++        self.0.write_u8(i)
++    }
++
++    #[inline]
++    fn write_u16(&mut self, i: u16) {
++        self.0.write_u16(i)
++    }
++
++    #[inline]
++    fn write_u32(&mut self, i: u32) {
++        self.0.write_u32(i)
++    }
++
++    #[inline]
++    fn write_u64(&mut self, i: u64) {
++        self.0.write_u64(i)
++    }
++
++    #[inline]
++    fn write_u128(&mut self, i: u128) {
++        self.0.write_u128(i)
++    }
++
++    #[inline]
++    fn write_usize(&mut self, i: usize) {
++        self.0.write_usize(i)
++    }
++
+     #[inline]
+     fn finish(&self) -> u64 {
+         self.0.finish()

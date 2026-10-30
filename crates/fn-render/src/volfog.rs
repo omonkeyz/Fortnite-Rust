@@ -423,6 +423,8 @@ pub struct ExtVolFogFrame<'a> {
     pub lights: &'a [ExtLight],
     pub grid_pixel_size: u32,
     pub grid_size_z: u32,
+    pub voxel: Option<ExtVoxelFrame<'a>>,
+    pub device_z: [f32; 2],
 }
 
 /// GPU block (struct XV in [`EXT_WGSL`]).
@@ -537,6 +539,7 @@ fn x_scatter(@builtin(global_invocation_id) id: vec3<u32>) {
         if (l.spot.w <= 0.0) { continue; }
         let tl = l.pos.xyz - world;
         let d2 = dot(tl, tl);
+        if (d2 * l.pos.w * l.pos.w >= 1.0) { continue; }
         let L = tl * inverseSqrt(d2);
         var att = 1.0;
         if (l.color.w == 0.0) {
@@ -614,6 +617,8 @@ struct ExtVolume {
     scatter_bg: [Option<wgpu::BindGroup>; 2],
     composite_bg: Option<wgpu::BindGroup>,
     key: u64,
+    vbuf_v: Option<wgpu::Texture>,
+    vox_bg: Option<wgpu::BindGroup>,
 }
 
 /// The volumetric fog of an external renderer (see the section comment): `prepare` -> `encode_compute` (one compute pass) -> `encode_composite` (a render
@@ -638,6 +643,7 @@ pub struct ExtVolFog {
     last_frame: Option<u64>,
     parity: usize,
     active: bool,
+    vox: Option<ExtVoxelizer>,
 }
 
 impl ExtVolFog {
@@ -670,10 +676,20 @@ impl ExtVolFog {
         let dummy_shadow = device.create_texture(&wgpu::TextureDescriptor { label: Some("xvfog no shadow"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Depth32Float, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] }).create_view(&Default::default());
         ExtVolFog { device: device.clone(), params, setup_pipe, scatter_pipe, integrate_pipe, composite_pipe, bgl_setup, bgl_scatter, bgl_integrate, bgl_composite,
-            uniform_buf, light_buf, lin_sampler, dummy_shadow, volume: None, prev_view_proj: None, last_frame: None, parity: 0, active: false }
+            uniform_buf, light_buf, lin_sampler, dummy_shadow, volume: None, prev_view_proj: None, last_frame: None, parity: 0, active: false, vox: None }
     }
 
     pub fn active(&self) -> bool { self.active }
+    pub fn destroy_volumes(&mut self) {
+        if let Some(v) = self.volume.take() {
+            v.vbuf_a.destroy();
+            for l in &v.light { l.destroy(); }
+            v.integrated.destroy();
+            if let Some(t) = &v.vbuf_v { t.destroy(); }
+        }
+    }
+    pub fn set_voxelizer(&mut self, v: ExtVoxelizer) { self.vox = Some(v); self.volume = None; }
+    pub fn voxelizer(&self) -> Option<&ExtVoxelizer> { self.vox.as_ref() }
     pub fn grid(&self) -> Option<[u32; 3]> { self.volume.as_ref().map(|v| v.grid) }
     /// True when a `prepare` with `frame_index` reprojects a history (the previous `prepare` was the frame before).
     pub fn has_history(&self, frame_index: u64) -> bool { self.volume.is_some() && self.last_frame.is_some_and(|l| l + 1 == frame_index) }
@@ -693,7 +709,14 @@ impl ExtVolFog {
             let v = |t: &wgpu::Texture| t.create_view(&Default::default());
             let setup_bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("xvfog setup bg"), layout: &self.bgl_setup, entries: &[b_buf(0, &self.uniform_buf), b_tex(9, &v(&vbuf_a))] });
             let integrate_bg = [&l0, &l1].map(|l| d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("xvfog integrate bg"), layout: &self.bgl_integrate, entries: &[b_buf(0, &self.uniform_buf), b_tex(10, &v(&integrated)), b_tex(11, &v(l))] }));
-            self.volume = Some(ExtVolume { grid, vbuf_a, light: [l0, l1], integrated, setup_bg, integrate_bg, scatter_bg: [None, None], composite_bg: None, key: u64::MAX });
+            let vbuf_v = self.vox.as_ref().map(|_| mk("xvfog VBufferA (voxelized)"));
+            let vox_bg = match (&self.vox, &vbuf_v) {
+                (Some(vx), Some(t)) => Some(d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("xvfog voxelize bg"), layout: &vx.bgl3, entries: &[
+                    b_buf(0, &vx.u_buf), b_buf(1, &vx.p_buf), b_tex(2, &v(&vbuf_a)), b_tex(3, &v(t)),
+                ] })),
+                _ => None,
+            };
+            self.volume = Some(ExtVolume { grid, vbuf_a, light: [l0, l1], integrated, setup_bg, integrate_bg, scatter_bg: [None, None], composite_bg: None, key: u64::MAX, vbuf_v, vox_bg });
             self.last_frame = None;
         }
         let consecutive = self.last_frame.is_some_and(|l| l + 1 == f.frame_index);
@@ -702,7 +725,7 @@ impl ExtVolFog {
         let key = f.depth_gen.wrapping_mul(2) + f.shadow.is_some() as u64;
         if vol.key != key || vol.scatter_bg[0].is_none() {
             let v = |t: &wgpu::Texture| t.create_view(&Default::default());
-            let (va, l0, l1, ig) = (v(&vol.vbuf_a), v(&vol.light[0]), v(&vol.light[1]), v(&vol.integrated));
+            let (va, l0, l1, ig) = (v(vol.vbuf_v.as_ref().unwrap_or(&vol.vbuf_a)), v(&vol.light[0]), v(&vol.light[1]), v(&vol.integrated));
             let lights = [&l0, &l1];
             let shadow = f.shadow.map_or(&self.dummy_shadow, |s| s.0);
             vol.scatter_bg = [0usize, 1].map(|c| Some(d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("xvfog scatter bg"), layout: &self.bgl_scatter, entries: &[
@@ -736,6 +759,30 @@ impl ExtVolFog {
             prev_view_proj: self.prev_view_proj.unwrap_or(Mat4::IDENTITY).to_cols_array_2d(),
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&u));
+        if let Some(vx) = self.vox.as_mut() {
+            let fit = |src: &[[f32; 4]], n: u32| { let mut o = vec![[0f32; 4]; n as usize]; for (d, s) in o.iter_mut().zip(src) { *d = *s; } o };
+            let px = f.grid_pixel_size.max(1);
+            let bits = |i: u32| f32::from_bits(i);
+            let vfog = [
+                [bits(grid[0]), bits(grid[1]), bits(grid[2]), 0.],
+                [grid[0] as f32, grid[1] as f32, grid[2] as f32, bits(31 - px.leading_zeros())],
+                [z[0], z[1], z[2], 0.],
+                [1. / (grid[0] * px) as f32, 1. / (grid[1] * px) as f32, bits(px), bits(px)],
+                [p.distance_cm, 0., 0., 0.],
+            ];
+            queue.write_buffer(&vx.vfog_buf, 0, bytemuck::cast_slice(&fit(&vfog, vx.vfog_size)));
+            vx.count = 0;
+            if let Some(vf) = &f.voxel {
+                queue.write_buffer(&vx.view_buf, 0, bytemuck::cast_slice(&fit(vf.view_cb, vx.view_size)));
+                queue.write_buffer(&vx.mat_buf, 0, bytemuck::cast_slice(&fit(vf.material_cb, vx.mat_size)));
+                let n = vf.particles.len().min(VOX_MAX_PARTICLES);
+                if n > 0 { queue.write_buffer(&vx.p_buf, 0, bytemuck::cast_slice(&vf.particles[..n])); }
+                vx.count = n as u32;
+            }
+            let (tx, ty) = f.tan_half;
+            let vu = VoxU { grid: [grid[0] as f32, grid[1] as f32, grid[2] as f32, vx.count as f32], zp: [z[0], z[1], z[2], 0.], jit: [j[0], j[1], j[2], 0.], proj: [tx, ty, f.device_z[0], f.device_z[1]] };
+            queue.write_buffer(&vx.u_buf, 0, bytemuck::bytes_of(&vu));
+        }
         self.prev_view_proj = Some(f.view_proj);
         self.last_frame = Some(f.frame_index);
         self.active = true;
@@ -748,6 +795,12 @@ impl ExtVolFog {
         pass.set_pipeline(&self.setup_pipe);
         pass.set_bind_group(0, &v.setup_bg, &[]);
         pass.dispatch_workgroups(g[0].div_ceil(4), g[1].div_ceil(4), g[2].div_ceil(4));
+        if let (Some(vx), Some(bg)) = (&self.vox, &v.vox_bg) {
+            pass.set_pipeline(&vx.pipe);
+            for (gi, b) in &vx.bgs { pass.set_bind_group(*gi, b, &[]); }
+            pass.set_bind_group(3, bg, &[]);
+            pass.dispatch_workgroups(g[0].div_ceil(4), g[1].div_ceil(4), g[2].div_ceil(4));
+        }
         pass.set_pipeline(&self.scatter_pipe);
         pass.set_bind_group(0, v.scatter_bg[self.parity].as_ref(), &[]);
         pass.dispatch_workgroups(g[0].div_ceil(4), g[1].div_ceil(4), g[2].div_ceil(4));
@@ -763,6 +816,187 @@ impl ExtVolFog {
         pass.set_bind_group(0, v.composite_bg.as_ref(), &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct ExtVolParticle {
+    pub c01: [f32; 4],
+    pub c23: [f32; 4],
+    pub origin_radius: [f32; 4],
+    pub depth: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoxRes { ViewCb, VolumetricFogCb, MaterialCb, Texture(usize), Sampler(usize) }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct VoxU { grid: [f32; 4], zp: [f32; 4], jit: [f32; 4], proj: [f32; 4] }
+
+pub const VOX_MAX_PARTICLES: usize = 256;
+
+const VOX_WGSL: &str = r#"
+struct VXU { grid: vec4<f32>, zp: vec4<f32>, jit: vec4<f32>, proj: vec4<f32> }
+struct VXP { c01: vec4<f32>, c23: vec4<f32>, o: vec4<f32>, z: vec4<f32> }
+@group(3) @binding(0) var<uniform> vxu: VXU;
+@group(3) @binding(1) var<storage, read> vxp: array<VXP>;
+@group(3) @binding(2) var vx_in: texture_3d<f32>;
+@group(3) @binding(3) var vx_out: texture_storage_3d<rgba16float, write>;
+fn vx_slice(d: f32) -> i32 {
+    let a = d * vxu.zp.x + vxu.zp.y;
+    if (a < 0.0 || a != a) { return 0; }
+    if (a == 0.0) { return -2147483647 - 1; }
+    let s = log2(a) * vxu.zp.z;
+    if (s >= 2147483520.0) { return 2147483647; }
+    if (s <= -2147483648.0) { return -2147483647 - 1; }
+    return i32(s);
+}
+fn vx_depth(s: f32) -> f32 { return (exp2(s / vxu.zp.z) - vxu.zp.y) / vxu.zp.x; }
+fn vx_cross(a: vec2<f32>, b: vec2<f32>) -> f32 { return a.x * b.y - a.y * b.x; }
+fn vx_tri(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> bool {
+    let d1 = vx_cross(b - a, p - a);
+    let d2 = vx_cross(c - b, p - b);
+    let d3 = vx_cross(a - c, p - c);
+    let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    return !(neg && pos);
+}
+@compute @workgroup_size(4, 4, 4)
+fn x_voxelize(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= u32(vxu.grid.x) || id.y >= u32(vxu.grid.y) || id.z >= u32(vxu.grid.z)) { return; }
+    var acc = textureLoad(vx_in, vec3<i32>(id), 0);
+    let gz = i32(vxu.grid.z);
+    let sd = vx_depth(f32(id.z) + vxu.jit.z);
+    let ndc = vec2<f32>((f32(id.x) + 0.5) / vxu.grid.x * 2.0 - 1.0, 1.0 - (f32(id.y) + 0.5) / vxu.grid.y * 2.0);
+    let p = vec2<f32>((ndc.x - vxu.jit.x / vxu.grid.x) * sd * vxu.proj.x, (ndc.y - vxu.jit.y / vxu.grid.y) * sd * vxu.proj.y);
+    var count = 0.0;
+    let n = u32(vxu.grid.w);
+    for (var i = 0u; i < n; i = i + 1u) {
+        let q = vxp[i];
+        let r = q.o.w;
+        let cu = vx_slice(q.z.x - r);
+        let fu = vx_slice(q.z.y + r);
+        if (cu >= gz || fu < 0) { continue; }
+        let zi = i32(id.z);
+        if (zi < max(cu, 0) || zi > min(fu, gz - 1)) { continue; }
+        let off = abs(sd - q.o.z);
+        if (r != 0.0 && off > r) { continue; }
+        let ratio = select(1.0, sqrt(max(r * r - off * off, 0.0)) / r, r > 0.0);
+        let c0 = q.o.xy + ratio * (q.c01.xy - q.o.xy);
+        let c1 = q.o.xy + ratio * (q.c01.zw - q.o.xy);
+        let c2 = q.o.xy + ratio * (q.c23.xy - q.o.xy);
+        let c3 = q.o.xy + ratio * (q.c23.zw - q.o.xy);
+        if (vx_tri(p, c0, c1, c2) || vx_tri(p, c0, c2, c3)) { count = count + 1.0; }
+    }
+    if (count > 0.0) {
+        var v: array<vec4<f32>, VX_N>;
+        v[VX_POS] = vec4<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5, vxu.proj.z + vxu.proj.w / sd, sd);
+        let o = VX_FN(v);
+        acc = acc + o[0] * count;
+    }
+    textureStore(vx_out, vec3<i32>(id), acc);
+}
+"#;
+
+struct VoxDecl { group: u32, binding: u32, res: VoxRes, kind: u8, size: u32, dim: wgpu::TextureViewDimension }
+
+pub struct ExtVoxelizer {
+    pipe: wgpu::ComputePipeline,
+    bgl3: wgpu::BindGroupLayout,
+    bgs: Vec<(u32, wgpu::BindGroup)>,
+    view_buf: wgpu::Buffer,
+    vfog_buf: wgpu::Buffer,
+    mat_buf: wgpu::Buffer,
+    u_buf: wgpu::Buffer,
+    p_buf: wgpu::Buffer,
+    pub view_size: u32,
+    pub mat_size: u32,
+    vfog_size: u32,
+    count: u32,
+    pub notes: Vec<String>,
+}
+
+fn parse_vox_decls(wgsl: &str, roles: &dyn Fn(&str) -> Option<VoxRes>) -> Result<Vec<VoxDecl>, String> {
+    let mut out = vec![];
+    for line in wgsl.lines() {
+        let Some(rest) = line.strip_prefix("@group(") else { continue };
+        let (g, rest) = rest.split_once(") @binding(").ok_or("bad group line")?;
+        let (b, rest) = rest.split_once(')').ok_or("bad binding line")?;
+        let (group, binding): (u32, u32) = (g.parse().map_err(|_| "group")?, b.parse().map_err(|_| "binding")?);
+        let decl = rest.trim();
+        let name = decl.split(':').next().unwrap_or("").rsplit(' ').next().unwrap_or("").trim().to_owned();
+        let res = roles(&name).ok_or_else(|| format!("no resource for {name}"))?;
+        let (kind, size, dim) = if decl.starts_with("var<uniform>") {
+            let sz = decl.split("vec4<f32>, ").nth(1).and_then(|r| r.split('>').next()).and_then(|n| n.parse::<u32>().ok()).ok_or("uniform size")?;
+            (0u8, sz, wgpu::TextureViewDimension::D2)
+        } else if decl.contains("texture_3d") { (1, 0, wgpu::TextureViewDimension::D3) }
+        else if decl.contains("texture_2d") { (1, 0, wgpu::TextureViewDimension::D2) }
+        else if decl.contains(": sampler") { (2, 0, wgpu::TextureViewDimension::D2) }
+        else { return Err(format!("unsupported declaration {decl}")); };
+        if group > 2 { return Err(format!("resource group {group}")); }
+        out.push(VoxDecl { group, binding, res, kind, size, dim });
+    }
+    Ok(out)
+}
+
+impl ExtVoxelizer {
+    pub fn new(device: &wgpu::Device, ps_wgsl: &str, ps_fn: &str, roles: &dyn Fn(&str) -> Option<VoxRes>, textures: &[&wgpu::TextureView], samplers: &[&wgpu::Sampler]) -> Result<ExtVoxelizer, String> {
+        if ps_wgsl.contains("textureSample(") || ps_wgsl.contains("textureSampleBias(") || ps_wgsl.contains("dpdx") || ps_wgsl.contains("dpdy") || ps_wgsl.contains("discard") {
+            return Err("the voxelize program needs derivatives / discard (not a compute program)".into());
+        }
+        let n = ps_wgsl.split(&format!("fn {ps_fn}(v: array<vec4<f32>, ")).nth(1).and_then(|r| r.split('>').next()).and_then(|x| x.parse::<u32>().ok()).ok_or("voxelize program input array")?;
+        if n < 4 { return Err(format!("voxelize program reads {n} input registers, SV_Position is v3")); }
+        let decls = parse_vox_decls(ps_wgsl, roles)?;
+        let src = format!("{ps_wgsl}\n{}", VOX_WGSL.replace("VX_N", &n.to_string()).replace("VX_POS", "3").replace("VX_FN", ps_fn));
+        let sm = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("volume voxelization"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let size_of = |r: VoxRes| decls.iter().find(|d| d.res == r).map_or(1, |d| d.size.max(1));
+        let (view_size, vfog_size, mat_size) = (size_of(VoxRes::ViewCb), size_of(VoxRes::VolumetricFogCb), size_of(VoxRes::MaterialCb));
+        let ub = |label: &str, n: u32| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: n as u64 * 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let (view_buf, vfog_buf, mat_buf) = (ub("voxelize View", view_size), ub("voxelize VolumetricFog", vfog_size), ub("voxelize Material", mat_size));
+        let mut layouts = vec![];
+        let mut bgs_src: Vec<(u32, Vec<wgpu::BindGroupEntry>)> = vec![];
+        for g in 0..3u32 {
+            let ds: Vec<&VoxDecl> = decls.iter().filter(|d| d.group == g).collect();
+            let entries: Vec<wgpu::BindGroupLayoutEntry> = ds.iter().map(|d| wgpu::BindGroupLayoutEntry { binding: d.binding, visibility: C, count: None, ty: match d.kind {
+                0 => wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                1 => wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: d.dim, multisampled: false },
+                _ => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            } }).collect();
+            layouts.push(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("voxelize program"), entries: &entries }));
+            let mut be = vec![];
+            for d in ds {
+                let r = match d.res {
+                    VoxRes::ViewCb => view_buf.as_entire_binding(),
+                    VoxRes::VolumetricFogCb => vfog_buf.as_entire_binding(),
+                    VoxRes::MaterialCb => mat_buf.as_entire_binding(),
+                    VoxRes::Texture(i) => wgpu::BindingResource::TextureView(textures.get(i).ok_or_else(|| format!("texture {i} missing"))?),
+                    VoxRes::Sampler(i) => wgpu::BindingResource::Sampler(samplers.get(i).ok_or_else(|| format!("sampler {i} missing"))?),
+                };
+                be.push(wgpu::BindGroupEntry { binding: d.binding, resource: r });
+            }
+            bgs_src.push((g, be));
+        }
+        let bgl3 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("voxelize volume"), entries: &[
+            e_uniform(0, C),
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: C, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 2, visibility: C, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
+            e_store3d(3),
+        ] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("voxelize"), bind_group_layouts: &[Some(&layouts[0]), Some(&layouts[1]), Some(&layouts[2]), Some(&bgl3)], immediate_size: 0 });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("volume voxelization"), layout: Some(&pl), module: &sm, entry_point: Some("x_voxelize"), compilation_options: Default::default(), cache: None });
+        let bgs = bgs_src.into_iter().map(|(g, be)| (g, device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("voxelize program"), layout: &layouts[g as usize], entries: &be }))).collect();
+        let u_buf = ub("voxelize params", 4);
+        let p_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("voxelize particles"), size: (VOX_MAX_PARTICLES * std::mem::size_of::<ExtVolParticle>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let notes = vec![format!("voxelize program {ps_fn}: {n} input registers, View {view_size} / VolumetricFog {vfog_size} / Material {mat_size} float4, {} resources", decls.len())];
+        Ok(ExtVoxelizer { pipe, bgl3, bgs, view_buf, vfog_buf, mat_buf, u_buf, p_buf, view_size, mat_size, vfog_size, count: 0, notes })
+    }
+}
+
+pub struct ExtVoxelFrame<'a> {
+    pub view_cb: &'a [[f32; 4]],
+    pub material_cb: &'a [[f32; 4]],
+    pub particles: &'a [ExtVolParticle],
 }
 
 /// UE `SHBasisFunction` signs (SHMath.h: V[1] = -0.488603 y, V[3] = -0.488603 x; RECALLED engine source, the shader only consumes the coefficients):

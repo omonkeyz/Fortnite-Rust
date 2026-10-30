@@ -45,6 +45,7 @@ struct Ctx<'a> {
     bps: HashMap<String, Option<Bp>>,
     actors: Vec<Value>,
     out: Vec<Value>,
+    hidden: Vec<Value>,
     groups: Vec<Value>,
     lights: Vec<Value>,
     particles: Vec<Value>,
@@ -72,6 +73,7 @@ struct Ctx<'a> {
     layout_actors: Vec<Value>,
     /// WORLD: `BuildingTextureData` assets read (path -> its Diffuse / Normal / Specular / OverrideMaterial).
     texture_data: HashMap<String, Option<Value>>,
+    volumes: Vec<Value>,
 }
 
 /// WORLD (2026-10-07): a `BuildingTextureData` asset's properties (`None` = unreadable).
@@ -191,13 +193,9 @@ fn blocks_pawn(body: &Value) -> (bool, String) {
     if enabled.ends_with("NoCollision") { return (false, profile); }
     let no = ["NoCollision", "OverlapAll", "OverlapAllDynamic", "OverlapOnlyPawn", "IgnoreOnlyPawn", "Trigger", "UI", "Spectator", "InvisibleWallDynamic_NoPawn", "CameraOnly", "WeaponOnly", "ProjectileOnly"];
     if no.iter().any(|p| profile.eq_ignore_ascii_case(p)) { return (false, profile); }
-    if profile == "Custom" {
-        if enabled.ends_with("NoCollision") { return (false, profile); }
-        let pawn = body.get("CollisionResponses").and_then(|c| c.get("ResponseArray")).and_then(|a| a.as_array()).and_then(|a| a.iter().find(|r| r.get("Channel").and_then(|c| c.as_str()) == Some("Pawn")))
-            .and_then(|r| r.get("Response").and_then(|v| v.as_str())).map(|s| s.ends_with("Block"));
-        return (pawn.unwrap_or(true), profile);
-    }
-    (true, profile)
+    let pawn = body.get("CollisionResponses").and_then(|c| c.get("ResponseArray")).and_then(|a| a.as_array()).and_then(|a| a.iter().find(|r| r.get("Channel").and_then(|c| c.as_str()) == Some("Pawn")))
+        .and_then(|r| r.get("Response").and_then(|v| v.as_str())).map(|s| s.ends_with("Block"));
+    (pawn.unwrap_or(true), profile)
 }
 
 fn obj(v: &Value) -> Map<String, Value> { v.as_object().cloned().unwrap_or_default() }
@@ -310,6 +308,8 @@ fn scan(cx: &mut Ctx, package: &str, parent: Xf, filter: Option<([f64; 2], f64)>
             "loot_tier_group": cdo.get("SearchLootTierGroup").or_else(|| cdo.get("DestructionLootTierGroup")),
             "loot": loot,
         }));
+        let parents: Vec<String> = bp.as_ref().map(|b| b.chain.iter().skip(1).take(b.chain.len().saturating_sub(2)).map(|l| l.class.trim_end_matches("_C").to_string()).collect()).unwrap_or_default();
+        if !parents.is_empty() { cx.actors[actor_i]["parents"] = json!(parents); }
         if loot { cx.loot.push(json!({"actor": actor_i, "class": class_short, "native": native, "t": xf.t, "q": xf.q, "tier_group": cdo.get("SearchLootTierGroup")})); }
         // DOORS (2026-10-08): `ABuildingWall::PreInitializeComponents` @1404c0210 -> FUN_1404abb40 creates the DoorComponent when `DoorMesh` (+0x1040) is set:
         // attached to the root (= `xf`) at `DoorOffset` (+0xFF8, instance editable: the merged value), slot 0 = `DoorAnimatingMaterial` (+0x1038)
@@ -338,8 +338,15 @@ fn scan(cx: &mut Ctx, package: &str, parent: Xf, filter: Option<([f64; 2], f64)>
                     cx.lights.push(json!({"actor": actor_i, "actor_class": class_short, "component": cname, "class": ccn, "hidden": hidden, "t": t, "q": q, "props": l}));
                     continue;
                 }
-                "ParticleSystemComponent" => { cx.particles.push(json!({"actor": actor_i, "actor_class": class_short, "component": cname, "template": m.get("Template"), "auto_activate": m.get("bAutoActivate"), "hidden": hidden, "t": t, "q": q, "s": sc})); continue; }
+                "ParticleSystemComponent" => { cx.particles.push(json!({"actor": actor_i, "actor_class": class_short, "component": cname, "template": m.get("Template"), "auto_activate": m.get("bAutoActivate"), "hidden": hidden, "cull_cm": m.get("CachedMaxDrawDistance"), "params": m.get("InstanceParameters"), "t": t, "q": q, "s": sc})); continue; }
                 "AudioComponent" => { cx.audio += 1; continue; }
+                "BrushComponent" => {
+                    let setup = (0..pkg.exports.len()).find(|&b| pkg.export_class_name(b) == "BodySetup" && pkg.exports[b].outer_index.export_index() == Some(c));
+                    let boxes: Vec<Value> = setup.and_then(|b| pkg.read_export(b).ok()).map(|o| o.props.to_json(&pkg)).and_then(|j| j.pointer("/AggGeom/ConvexElems").and_then(|v| v.as_array()).cloned()).unwrap_or_default()
+                        .iter().filter_map(|e| { let b = e.get("ElemBox")?; Some(json!({"min": b.get("Min")?, "max": b.get("Max")?, "points": e.get("VertexData").cloned().unwrap_or(json!([]))})) }).collect();
+                    cx.volumes.push(json!({"actor": actor_i, "class": class_short, "native": native, "priority": cdo.get("Priority"), "physics_on_contact": cdo.get("bPhysicsOnContact"), "water": cdo.get("bWaterVolume"), "fluid_friction": cdo.get("FluidFriction"), "t": t, "q": q, "s": sc, "boxes": boxes}));
+                    continue;
+                }
                 _ => {}
             }
             let foliage = ccn == "FoliageInstancedStaticMeshComponent" || ccn == "HierarchicalInstancedStaticMeshComponent" || ccn == "InstancedStaticMeshComponent";
@@ -347,7 +354,15 @@ fn scan(cx: &mut Ctx, package: &str, parent: Xf, filter: Option<([f64; 2], f64)>
             // the mesh: the BuildingSMActor's main component shows the actor's StaticMesh
             let mesh = if main_smc.as_deref() == Some(cname.as_str()) { actor_mesh.clone().or_else(|| m.get("StaticMesh").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from)) } else { m.get("StaticMesh").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from) };
             let Some(mesh) = mesh else { skip(cx, format!("{class_short}.{cname} (component without a mesh)")); continue };
-            if hidden { skip(cx, format!("{class_short}.{cname} (hidden in game)")); continue; }
+            if hidden {
+                skip(cx, format!("{class_short}.{cname} (hidden in game)"));
+                if !foliage {
+                    let (collide, profile) = blocks_pawn(m.get("BodyInstance").unwrap_or(&Value::Null));
+                    let cull = m.get("CachedMaxDrawDistance").and_then(|v| v.as_f64()).filter(|v| *v > 0.).or_else(|| m.get("LDMaxDrawDistance").and_then(|v| v.as_f64()).filter(|v| *v > 0.)).unwrap_or(0.);
+                    cx.hidden.push(json!({"actor": actor_i, "comp": cname, "mesh": mesh, "overrides": m.get("OverrideMaterials").cloned().unwrap_or(json!([])), "t": t, "q": q, "s": sc, "collide": collide, "profile": profile, "cull_cm": cull, "cast_shadow": m.get("CastShadow").and_then(|v| v.as_bool()).unwrap_or(true)}));
+                }
+                continue;
+            }
             let overrides: Vec<Value> = m.get("OverrideMaterials").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             let (collide, profile) = blocks_pawn(m.get("BodyInstance").unwrap_or(&Value::Null));
             let cull = m.get("CachedMaxDrawDistance").and_then(|v| v.as_f64()).filter(|v| *v > 0.).or_else(|| m.get("LDMaxDrawDistance").and_then(|v| v.as_f64()).filter(|v| *v > 0.)).unwrap_or(0.);
@@ -470,8 +485,8 @@ fn document(src: &Source, cx: &Ctx, name: &str, area: Option<([f64; 2], f64)>, l
     let doc = json!({
         "version": 2, "name": name, "level": level, "center_cm": center, "radius_m": radius_m,
         "units": "UE world cm (left handed, Z up); q = FQuat (x, y, z, w); t / q / s = world transform (the component's for placements / lights)",
-        "levels": lv_list, "levels_used": levels_used, "groups": cx.groups, "actors": cx.actors, "placements": cx.out, "meshes": mesh_doc,
-        "lights": cx.lights, "particles": cx.particles, "loot": cx.loot, "doors": cx.doors, "audio_components": cx.audio, "skipped": cx.skipped, "health_rows": cx.health_rows,
+        "levels": lv_list, "levels_used": levels_used, "groups": cx.groups, "actors": cx.actors, "placements": cx.out, "hidden_placements": cx.hidden, "meshes": mesh_doc,
+        "lights": cx.lights, "particles": cx.particles, "loot": cx.loot, "doors": cx.doors, "volumes": cx.volumes, "audio_components": cx.audio, "skipped": cx.skipped, "health_rows": cx.health_rows,
         "hlod": cx.hlod, "layout_actors": {"fields": ["class", "x", "y", "z", "cull_cm", "hlod"], "rows": cx.layout_actors},
         "ground_cover": {"mesh": "/Game/Environments/Foliage/Meshes/S_WavyGrass_01.S_WavyGrass_01", "fields": ["x", "y", "z", "qx", "qy", "qz", "qw", "scale", "random"], "instances": cx.ground_cover},
     });
@@ -504,7 +519,7 @@ pub fn run(src: &Source, a: &PropsArgs) -> Result<(), String> {
     if all && layout_classes.is_empty() { eprintln!("[poi] no {}: the landscape levels keep their layout props too", a.out.join("catalog.json").display()); }
     let layout_classes = std::sync::Arc::new(layout_classes);
     let none = std::sync::Arc::new(std::collections::HashSet::new());
-    let new_ctx = |skip_layout: bool| Ctx { src, bps: HashMap::new(), actors: vec![], out: vec![], groups: vec![], lights: vec![], particles: vec![], loot: vec![], doors: vec![], audio: 0, skipped: BTreeMap::new(), health_props: health_props.clone(), health_section: health_section.clone(), skip_layout: if skip_layout { layout_classes.clone() } else { none.clone() }, ground_cover: vec![], health_rows: BTreeMap::new(), hlod: vec![], layout_actors: vec![], texture_data: HashMap::new() };
+    let new_ctx = |skip_layout: bool| Ctx { src, bps: HashMap::new(), actors: vec![], out: vec![], hidden: vec![], groups: vec![], lights: vec![], particles: vec![], loot: vec![], doors: vec![], audio: 0, skipped: BTreeMap::new(), health_props: health_props.clone(), health_section: health_section.clone(), skip_layout: if skip_layout { layout_classes.clone() } else { none.clone() }, ground_cover: vec![], health_rows: BTreeMap::new(), hlod: vec![], layout_actors: vec![], texture_data: HashMap::new(), volumes: vec![] };
     let lvls = levels(src)?;
     let lv_list: Vec<Value> = lvls.iter().map(|lv| json!({"package": lv.package, "t": lv.xf.t, "q": lv.xf.q})).collect();
     if all {

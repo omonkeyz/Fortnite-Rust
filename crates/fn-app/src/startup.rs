@@ -166,6 +166,7 @@ impl Overlay {
 }
 impl AssetSource for Overlay {
     fn read(&self, name: &str) -> Option<Vec<u8>> { self.1.lock().ok().and_then(|p| p.as_ref().and_then(|p| p.read(name))) }
+    fn read_in(&self, name: &str, dir_hint: &str) -> Option<Vec<u8>> { self.1.lock().ok().and_then(|p| p.as_ref().and_then(|p| p.read_in(name, dir_hint))) }
     fn image(&self, name: &str) -> Option<Image> {
         if let Some(i) = self.0.lock().ok().and_then(|m| m.get(&name.to_ascii_lowercase()).cloned()) { return Some(i); }
         self.1.lock().ok().and_then(|p| p.as_ref().and_then(|p| p.image(name)))

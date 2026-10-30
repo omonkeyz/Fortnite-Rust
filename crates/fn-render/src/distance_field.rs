@@ -790,7 +790,9 @@ fn env_flag(name: &str, default: bool) -> bool { fn_live::var(name).map_or(defau
 pub fn modified_object_bounds(old: &[DfObject], new: &[DfObject]) -> Vec<Vec4> {
     use std::collections::HashMap;
     let key = |o: &DfObject| (o.mesh, o.local_to_world.to_cols_array().map(f32::to_bits));
-    let mut count: HashMap<(usize, [u32; 16]), i32> = HashMap::new();
+    let p = old.iter().zip(new).take_while(|(a, b)| key(a) == key(b)).count();
+    let (old, new) = (&old[p..], &new[p..]);
+    let mut count: HashMap<(usize, [u32; 16]), i32, std::hash::BuildHasherDefault<FxHasher>> = HashMap::with_capacity_and_hasher(old.len(), Default::default());
     for o in old { *count.entry(key(o)).or_insert(0) += 1; }
     let mut out = vec![];
     for o in new {
@@ -804,6 +806,30 @@ pub fn modified_object_bounds(old: &[DfObject], new: &[DfObject]) -> Vec<Vec4> {
         if let Some(k) = count.get_mut(&key(o)) { if *k > 0 { *k -= 1; out.push(o.center.extend(o.radius)); } }
     }
     out
+}
+
+#[derive(Default)]
+pub(crate) struct FxHasher(u64);
+pub(crate) type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut c = bytes.chunks_exact(8);
+        for w in &mut c { self.add(u64::from_le_bytes(w.try_into().unwrap())); }
+        for &b in c.remainder() { self.add(b as u64); }
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) { self.add(i as u64); }
+    #[inline]
+    fn write_u64(&mut self, i: u64) { self.add(i); }
+    #[inline]
+    fn write_usize(&mut self, i: usize) { self.add(i as u64); }
+    #[inline]
+    fn finish(&self) -> u64 { self.0.rotate_left(26) }
+}
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) { self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95); }
 }
 
 /// `GetShadowTileCulledData` (DistanceFieldShadowingShared.usf:27): the light tile of a DF-space point.
@@ -877,6 +903,7 @@ pub(crate) struct DistanceFields {
     /// global distance field redone) only when the layout outgrows the texture (`Generation` change).
     atlas: crate::distance_field_atlas::VolumeAtlas<AtlasKey>,
     atlas_tex: Option<wgpu::Texture>,
+    old_atlas: Vec<wgpu::Texture>,
     /// PERF: whole-atlas rebuilds so far (each one is logged).
     atlas_rebuilds: u32,
     layout: AtlasLayout,
@@ -903,7 +930,7 @@ pub(crate) struct DistanceFields {
     dyn_aliases: Vec<(std::sync::Arc<MeshDistanceField>, usize)>,
     /// PERF (2026-10-07): the `dyn_meshes` index of every `Arc` seen by [`Self::set_dynamic`] (by address: each one is kept alive in `dyn_meshes` / `dyn_aliases`,
     /// so an address is never reused), instead of a linear search per object per frame (thousands of placed statics x hundreds of meshes).
-    dyn_index: std::collections::HashMap<usize, usize>,
+    dyn_index: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<FxHasher>>,
     /// DF SHADOW SCREEN PASS (2026-10-06): the half-resolution ray trace of the cascade (distance_field_shadow.rs) and the generation of the light-tile buffer
     /// its bind group holds (bumped whenever `tiles_buf` is re-created).
     shadow_pass: crate::distance_field_shadow::DfShadowPass,
@@ -934,9 +961,9 @@ impl DistanceFields {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("df atlas sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         let ao = crate::distance_field_ao::DfAo::new(device);
         DistanceFields {
-            meshes: vec![], instances: vec![], objects: vec![], objects_dirty: false, atlas: crate::distance_field_atlas::VolumeAtlas::new([ue::ATLAS_SIZE_XY, ue::ATLAS_SIZE_XY, ue::ATLAS_SIZE_Z]), atlas_tex: None, atlas_rebuilds: 0, layout: AtlasLayout::default(),
+            meshes: vec![], instances: vec![], objects: vec![], objects_dirty: false, atlas: crate::distance_field_atlas::VolumeAtlas::new([ue::ATLAS_SIZE_XY, ue::ATLAS_SIZE_XY, ue::ATLAS_SIZE_Z]).with_texture_padding([ue::ATLAS_SIZE_XY, ue::ATLAS_SIZE_XY, 384]), atlas_tex: None, old_atlas: vec![], atlas_rebuilds: 0, layout: AtlasLayout::default(),
             uniform_buf, objects_buf, objects_cap: 64, tiles_buf, tiles_cap: 256, atlas_view, sampler, ao, bind_dirty: true, stats: DfStats::default(), rt: None, resource_gen: 0,
-            dyn_meshes: vec![], dyn_instances: vec![], dyn_aliases: vec![], dyn_index: std::collections::HashMap::new(),
+            dyn_meshes: vec![], dyn_instances: vec![], dyn_aliases: vec![], dyn_index: Default::default(),
             shadow_pass: crate::distance_field_shadow::DfShadowPass::new(device), tiles_gen: 0, prep_ms: vec![],
             objects_gen: 1, cull_prep: CullPrep::default(), cull_prep_gen: 0, cull_scratch: CullScratch::default(), tile_words: vec![], tiles_key: None, tile_stats: LightTileStats::default(), dyn_ms: 0.,
         }
@@ -947,7 +974,7 @@ impl DistanceFields {
     fn atlas_texture(device: &wgpu::Device, size: [u32; 3]) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("df atlas (PF_G8)"), size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: size[2] }, mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D3, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+            dimension: wgpu::TextureDimension::D3, format: wgpu::TextureFormat::R8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         })
     }
 
@@ -1028,6 +1055,7 @@ impl DistanceFields {
     }
 
     fn rebuild(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        for t in self.old_atlas.drain(..) { t.destroy(); }
         let t_rebuild = std::time::Instant::now(); // PERF: prep df atlas / objects
         // DF ATLAS (2026-10-06, freezes): UpdateAllocations (DistanceFieldAtlas.cpp:246-436, distance_field_atlas.rs). A volume that fits the current texture
         // is uploaded into its block alone (RHIUpdateTexture3D per allocation); only a layout that outgrew the texture rebuilds it (Generation++), which
@@ -1057,34 +1085,85 @@ impl DistanceFields {
                 let t_atlas = std::time::Instant::now(); // PERF: logged below (a whole-atlas rebuild + upload is a frame hitch)
                 let size = self.atlas.texture_size().unwrap_or([1, 1, 1]);
                 let tex = Self::atlas_texture(device, size);
-                // the coalesced full update (one RHIUpdateTexture3D of the whole atlas)
-                let (w, h) = (size[0] as usize, size[1] as usize);
-                let mut data = vec![0u8; w * h * size[2] as usize];
-                for &(k, _, b) in self.atlas.placed() {
-                    let Some((s, texels)) = self.volume(k) else { continue };
-                    for z in 0..s[2] as usize {
-                        for y in 0..s[1] as usize {
-                            let src = (z * s[1] as usize + y) * s[0] as usize;
-                            let dst = ((b[2] as usize + z) * h + b[1] as usize + y) * w + b[0] as usize;
-                            data[dst..dst + s[0] as usize].copy_from_slice(&texels[src..src + s[0] as usize]);
+                let previous = self.atlas.take_previous();
+                let moved_on_gpu = if let (true, Some(old)) = (regenerated && !previous.is_empty(), self.atlas_tex.as_ref()) {
+                    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("df atlas move") });
+                    let (mut moved, mut uploaded) = (0usize, 0usize);
+                    for &(k, s, b) in self.atlas.placed() {
+                        match previous.iter().find(|p| p.0 == k) {
+                            Some(&(_, from)) => {
+                                enc.copy_texture_to_texture(
+                                    wgpu::TexelCopyTextureInfo { texture: old, mip_level: 0, origin: wgpu::Origin3d { x: from[0], y: from[1], z: from[2] }, aspect: wgpu::TextureAspect::All },
+                                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x: b[0], y: b[1], z: b[2] }, aspect: wgpu::TextureAspect::All },
+                                    wgpu::Extent3d { width: s[0], height: s[1], depth_or_array_layers: s[2] },
+                                );
+                                moved += 1;
+                            }
+                            None => {
+                                let Some((vs, texels)) = self.volume(k) else { continue };
+                                queue.write_texture(
+                                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x: b[0], y: b[1], z: b[2] }, aspect: wgpu::TextureAspect::All },
+                                    texels,
+                                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(vs[0]), rows_per_image: Some(vs[1]) },
+                                    wgpu::Extent3d { width: vs[0], height: vs[1], depth_or_array_layers: vs[2] },
+                                );
+                                uploaded += 1;
+                            }
                         }
                     }
+                    queue.submit([enc.finish()]);
+                    self.atlas_view = tex.create_view(&Default::default());
+                    if let Some(old) = self.atlas_tex.replace(tex.clone()) { self.old_atlas.push(old); }
+                    self.bind_dirty = true;
+                    self.resource_gen += 1;
+                    self.ao.atlas_changed();
+                    self.objects_dirty = true;
+                    self.atlas_rebuilds += 1;
+                    if !self.atlas.failed.is_empty() { eprintln!("[df] atlas: failed to allocate {:?} in the distance field atlas", std::mem::take(&mut self.atlas.failed)); }
+                    eprintln!("[df] atlas regenerated #{} (generation {}): {moved} volumes moved on the GPU, {uploaded} uploaded, {}x{}x{} in {:.1} ms", self.atlas_rebuilds, self.atlas.generation, size[0], size[1], size[2], t_atlas.elapsed().as_secs_f32() * 1000.);
+                    true
+                } else { false };
+                if !moved_on_gpu {
+                // the coalesced full update (one RHIUpdateTexture3D of the whole atlas)
+                let (w, h, d) = (size[0] as usize, size[1] as usize, size[2] as usize);
+                let slab = ((8usize << 20) / (w * h).max(1)).clamp(1, d.max(1));
+                let mut data = vec![0u8; w * h * slab];
+                let mut z0 = 0usize;
+                while z0 < d {
+                    let z1 = (z0 + slab).min(d);
+                    let part = &mut data[..w * h * (z1 - z0)];
+                    part.fill(0);
+                    for &(k, _, b) in self.atlas.placed() {
+                        let Some((s, texels)) = self.volume(k) else { continue };
+                        let (bz0, bz1) = (b[2] as usize, b[2] as usize + s[2] as usize);
+                        if bz1 <= z0 || bz0 >= z1 { continue; }
+                        for z in bz0.max(z0)..bz1.min(z1) {
+                            let lz = z - bz0;
+                            for y in 0..s[1] as usize {
+                                let src = (lz * s[1] as usize + y) * s[0] as usize;
+                                let dst = ((z - z0) * h + b[1] as usize + y) * w + b[0] as usize;
+                                part[dst..dst + s[0] as usize].copy_from_slice(&texels[src..src + s[0] as usize]);
+                            }
+                        }
+                    }
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: z0 as u32 }, aspect: wgpu::TextureAspect::All },
+                        &*part,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0]), rows_per_image: Some(size[1]) },
+                        wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: (z1 - z0) as u32 },
+                    );
+                    z0 = z1;
                 }
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    &data,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0]), rows_per_image: Some(size[1]) },
-                    wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: size[2] },
-                );
                 self.atlas_view = tex.create_view(&Default::default());
-                self.atlas_tex = Some(tex);
+                if let Some(old) = self.atlas_tex.replace(tex) { self.old_atlas.push(old); }
                 self.bind_dirty = true;
                 self.resource_gen += 1;
                 self.ao.atlas_changed();
                 self.objects_dirty = true;
                 self.atlas_rebuilds += 1;
                 if !self.atlas.failed.is_empty() { eprintln!("[df] atlas: failed to allocate {:?} in the distance field atlas", std::mem::take(&mut self.atlas.failed)); }
-                eprintln!("[df] atlas rebuild #{} ({}, generation {}): {} static + {} dynamic volumes, {}x{}x{} ({:.1} MB) in {:.1} ms", self.atlas_rebuilds, if regenerated { "the layout outgrew the texture" } else { "first" }, self.atlas.generation, self.meshes.iter().filter(|m| m.is_some()).count(), self.dyn_meshes.len(), size[0], size[1], size[2], data.len() as f32 / (1024. * 1024.), t_atlas.elapsed().as_secs_f32() * 1000.);
+                eprintln!("[df] atlas rebuild #{} ({}, generation {}): {} static + {} dynamic volumes, {}x{}x{} ({:.1} MB) in {:.1} ms", self.atlas_rebuilds, if regenerated { "the layout outgrew the texture" } else { "first" }, self.atlas.generation, self.meshes.iter().filter(|m| m.is_some()).count(), self.dyn_meshes.len(), size[0], size[1], size[2], (w * h * d) as f32 / (1024. * 1024.), t_atlas.elapsed().as_secs_f32() * 1000.);
+                }
             }
         }
         self.prep_ms.push(("atlas", t_rebuild.elapsed().as_secs_f32() * 1000.));

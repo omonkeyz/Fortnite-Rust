@@ -199,10 +199,30 @@ pub fn shake_amplitude(shake: f32) -> f32 { if shake > 0. { (shake * 60.).sin() 
 fn srgb_lut() -> [f32; 256] {
     std::array::from_fn(|i| { let c = i as f32 / 255.; if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } })
 }
-fn encode_srgb(x: f32) -> u8 {
+fn encode_srgb_exact(x: f32) -> u8 {
     let x = x.clamp(0., 1.);
     let c = if x <= 0.003_130_8 { x * 12.92 } else { 1.055 * x.powf(1. / 2.4) - 0.055 };
     (c * 255. + 0.5) as u8
+}
+fn encode_thresholds() -> &'static [f32; 256] {
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [f32::INFINITY; 256];
+        for k in 1..256usize {
+            let (mut lo, mut hi) = (0u32, 1f32.to_bits());
+            if (encode_srgb_exact(f32::from_bits(hi)) as usize) < k { continue; }
+            while lo < hi { let mid = lo + (hi - lo) / 2; if (encode_srgb_exact(f32::from_bits(mid)) as usize) >= k { hi = mid; } else { lo = mid + 1; } }
+            t[k] = f32::from_bits(lo);
+        }
+        t
+    })
+}
+fn encode_srgb(x: f32) -> u8 {
+    let x = x.clamp(0., 1.);
+    let t = encode_thresholds();
+    let (mut lo, mut hi) = (0usize, 255usize);
+    while lo < hi { let mid = (lo + hi + 1) / 2; if x >= t[mid] { lo = mid; } else { hi = mid - 1; } }
+    lo as u8
 }
 
 /// Share of texels with alpha >= `cutoff` (0..1).
@@ -260,6 +280,15 @@ pub fn build_mips_srgb(img: &RgbaImage, masked: Option<f32>) -> Vec<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn threshold_srgb_encode_matches_powf() {
+        let t = encode_thresholds();
+        let mut b = 0u32;
+        while b <= 1f32.to_bits() { let x = f32::from_bits(b); assert_eq!(encode_srgb(x), encode_srgb_exact(x), "{x}"); b += 4099; }
+        for k in 1..256 { let c = t[k].to_bits(); for d in [c.saturating_sub(2), c.saturating_sub(1), c, c + 1, c + 2] { let x = f32::from_bits(d); assert_eq!(encode_srgb(x), encode_srgb_exact(x), "{x}"); } }
+        for x in [-1f32, 2., f32::NAN, 0., 1.] { assert_eq!(encode_srgb(x), encode_srgb_exact(x)); }
+    }
 
     #[test]
     fn lod_selection_has_hysteresis() {

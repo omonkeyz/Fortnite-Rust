@@ -136,6 +136,9 @@ fn locker_slots_open_the_picker_and_a_tile_click_equips() {
     let c = r.center_of(tile);
     assert_eq!(Controller::role(&r.lobby, tile), Role::Tile(Slot::Outfit, 2));
     let ev = r.click(c);
+    assert!(ev.contains(&UiEvent::Preview { slot: Slot::Outfit, index: 2 }), "{ev:?}");
+    assert!(r.st.locker.picking.is_some() && r.st.locker.equipped[0] != Some(2));
+    let ev = r.click(c);
     assert!(ev.contains(&UiEvent::Equip { slot: Slot::Outfit, index: 2 }), "{ev:?}");
     assert!(ev.contains(&UiEvent::PickerClosed));
     assert_eq!(r.st.locker.equipped[0], Some(2));
@@ -189,4 +192,67 @@ fn the_picker_scrolls_in_whole_rows() {
     // clamps at the end
     for _ in 0..200 { r.ctl.wheel(&r.lobby, &r.frame, &mut r.st, c.0, c.1, 1); }
     assert_eq!(r.st.locker.scroll_row, total - vis);
+}
+
+#[test]
+fn the_banner_slot_opens_the_editor_and_apply_sets_the_banner() {
+    let Some(mut r) = Rig::new() else { return };
+    r.click(r.tab_center("LOCKER"));
+    let l = r.lobby.locker().unwrap();
+    assert!(l.banner.data.icons.len() > 100 && l.banner.data.colors.len() == 21, "{} {}", l.banner.data.icons.len(), l.banner.data.colors.len());
+    assert_eq!(l.banner.data.icon_cats.first().map(|c| c.0.as_str()), Some("Standard"));
+    let slot = l.banner_slot.expect("BannerSlot");
+    assert_eq!(Controller::role(&r.lobby, slot), Role::BannerSlot);
+    let sr = r.frame.id_rects[slot];
+    let img = r.lobby.ui.w.iter().filter(|w| w.name == "BannerImage" && r.lobby.ui.is_descendant(w.id, slot)).map(|w| w.id).next().expect("banner image");
+    let ir = r.frame.id_rects[img];
+    assert!((ir.w / ir.h - 0.8).abs() < 0.02 && ir.w <= sr.w + 0.5, "{ir:?} in {sr:?}");
+    assert!(r.lobby.ui.w[img].mat_textures.iter().any(|(k, v)| k == "BannerIcon" && v.contains("Arrow")), "{:?}", r.lobby.ui.w[img].mat_textures);
+    r.click(r.center_of(slot));
+    let e = r.st.locker.banner_editor.clone().expect("editor open");
+    assert!(!e.color_page && e.icon == banner::DEFAULT_ICON);
+    r.redraw();
+    let l = r.lobby.locker().unwrap();
+    let (cols, vis, total) = l.banner.grid;
+    assert!(cols >= 4 && vis >= 2 && total >= 4, "{:?}", l.banner.grid);
+    let modal = l.banner.modal().unwrap();
+    let tiles: Vec<usize> = r.lobby.ui.w.iter().filter(|w| r.lobby.ui.is_descendant(w.id, modal) && matches!(Controller::role(&r.lobby, w.id), Role::Banner(banner::BannerButton::Tile(_)))).map(|w| w.id).collect();
+    let t1 = *tiles.iter().find(|&&t| Controller::role(&r.lobby, t) == Role::Banner(banner::BannerButton::Tile(1))).unwrap();
+    let tr = r.frame.id_rects[t1];
+    assert!((tr.w - 96.0).abs() < 1.0 && (tr.h - 120.0).abs() < 1.0 && cols == 6, "{tr:?} {cols} {:?}", r.frame.id_rects[r.lobby.locker().unwrap().banner.tile_view().unwrap()]);
+    r.click(r.center_of(t1));
+    let e = r.st.locker.banner_editor.clone().unwrap();
+    assert_ne!(e.icon, banner::DEFAULT_ICON);
+    let apply = r.lobby.ui.find_in(modal, "ApplyButton").unwrap();
+    let ev = r.click(r.center_of(apply));
+    assert!(ev.iter().any(|x| matches!(x, UiEvent::BannerApply { icon, .. } if *icon == e.icon)), "{ev:?}");
+    assert_eq!(r.st.locker.banner_icon, e.icon);
+    let ec = r.lobby.ui.find_in(modal, "EditColorButton").unwrap();
+    r.click(r.center_of(ec));
+    assert!(r.st.locker.banner_editor.as_ref().unwrap().color_page);
+    assert!(r.ctl.cancel(&mut r.st));
+    assert!(r.st.locker.banner_editor.is_none());
+}
+
+#[test]
+fn the_last_picker_row_is_drawn_at_full_tile_size() {
+    let Some(mut r) = Rig::new() else { return };
+    r.st.locker.items[0] = (0..31).map(|i| LockerItem { id: format!("outfit{i}"), name: format!("outfit{i}"), rarity: i % 4, icon: None }).collect();
+    r.click(r.tab_center("LOCKER"));
+    let slot = r.lobby.locker().unwrap().slot_widget(Slot::Outfit);
+    r.click(r.center_of(slot));
+    r.animate(0.3);
+    r.redraw();
+    let tv = r.lobby.locker().unwrap().tile_view().unwrap();
+    let c = r.center_of(tv);
+    for _ in 0..50 { r.ctl.wheel(&r.lobby, &r.frame, &mut r.st, c.0, c.1, 1); }
+    r.redraw();
+    let tvr = r.frame.id_rects[tv];
+    let last = r.lobby.locker().unwrap().tile_button(Slot::Outfit, 30).unwrap();
+    let first = r.lobby.locker().unwrap().tile_button(Slot::Outfit, 0).unwrap();
+    assert!(r.lobby.ui.w[last].vis.draws());
+    let (lr, fr) = (r.frame.id_rects[last], r.frame.id_rects[first]);
+    let r29 = r.frame.id_rects[r.lobby.locker().unwrap().tile_button(Slot::Outfit, 29).unwrap()];
+    assert!(r.lobby.ui.w[r.lobby.locker().unwrap().tile_button(Slot::Outfit, 29).unwrap()].vis.draws() && (lr.h - r29.h).abs() < 0.5 && lr.h > 50.0, "{lr:?} vs {r29:?} first {fr:?}");
+    assert!(lr.y + lr.h <= tvr.y + tvr.h + 1.0, "{lr:?} outside {tvr:?}");
 }

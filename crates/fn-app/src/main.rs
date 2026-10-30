@@ -53,6 +53,7 @@ mod lobby_shop;
 mod lobby_ui;
 mod lobby_mm;
 mod lobby_host;
+mod lobby_party;
 mod lobby_fx;
 mod login_name;
 mod name_store;
@@ -63,14 +64,21 @@ mod part_anim_glue; // PART ANIM HOOK
 mod muzzle_hook; // MUZZLE HOOK
 mod foot_fx; // FOOT FX: walk / run / land dust (foot_fx.rs)
 mod heal_fx; // HEAL FX: P_Consume_Item burst when a healing item applies (heal_fx.rs)
+mod water_hook;
+mod waterfall_fx;
 mod hurt_hook; // HURT HOOK: fall damage -> shield / health, damage direction lens effect, damage camera shake (hurt_hook.rs)
 mod kill_feed_hook;
+mod death_hook;
+mod dbno_hook;
+mod emote_hook;
 mod mpc_hook; // MATERIAL PARAMETERS: the world's FortniteMaterialParameters instance over the shared collection buffer
 mod scope_hook; // SCOPE HOOK: the scoped weapon's post-process material + scope mesh
+mod decals_hook;
 mod outline_hook; // OUTLINE HOOK: the build preview highlight of blocking / destroyed props
 mod particles; // PARTICLE HOOK
 mod pickup_mesh; // PICKUPS HOOK: the displayed mesh of a world item
 mod pickup_orig; // PICKUP ITEM LIGHTING: weapon items with their original material in the gun pass (as the held gun)
+mod local_lights_hook;
 mod light_fn_hook; // LIGHT FUNCTION HOOK: the sun light function textures + world offset (fn-render light_function.rs)
 mod sky_refl_hook; // SKY REFLECTION HOOK: T_hdrsky_test03_low filtered like FilterReflectionEnvironment -> the renderer's sky specular
 mod pickups_fx; // PICKUPS FX: rarity effects of the world items
@@ -78,12 +86,20 @@ mod pickups_dxbc; // PICKUPS FX: the original cooked shader programs of their ma
 mod pickups_hook; // PICKUPS HOOK: world items (AFortPickup): spawn / toss / pick up / drop
 mod interact; // INTERACT (2026-10-08): shared Use-key state for interactable hooks (doors, containers, ...)
 mod mp_hook;
+mod bots_hook;
 mod door_hook; // DOOR HOOK (2026-10-08): map door walls + player door edits (fn_building::door): Use, swing, collision, sounds, draws
 mod trap_hook;
+mod bounce_hook;
 mod rocket_hook;
+mod gunfx_hook;
 mod bus_hook;
+mod elim_fx;
 mod skydive_anim;
+mod enhanced_anim_load;
+mod enhanced_sound;
 mod demolition_hook;
+mod floor_loot_hook;
+mod supply_drop_hook;
 mod chest_hook; // CHEST HOOK (2026-10-08): BR chests / ammo boxes: closed FX + ambient loop, hold-to-search, open burst, loot tossed as pickups (fn_game::containers)
 mod platform;
 mod poi; // POI (dev): `--world-center` + the town static meshes of `fn-export props poi`

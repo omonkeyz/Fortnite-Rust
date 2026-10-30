@@ -187,6 +187,8 @@ pub struct GunHit {
     pub rarity: String, pub tier: String, pub min_level: i64, pub ammo_path: String, pub ability_path: String, pub actor_path: String,
     /// Stat table package the row came from (/Game/Athena/Items/Weapons/AthenaRangedWeapons).
     pub stat_table: String,
+    pub tracer: Option<crate::tracer::TracerDef>,
+    pub projectile_particles: Vec<(String, [f32; 3])>,
 }
 
 /// `InitialSpeed` / `MaxSpeed` (cm/s) of the projectile Blueprint, evaluated at curve time 0 from its `AthenaProjectiles` CurveTable rows. Gravity scale: the
@@ -209,7 +211,7 @@ pub fn eval_curve(keys: &[(f32, f32, i64)], t: f32) -> f32 {
     for w in keys.windows(2) { if t < w[1].0 { return if w[0].2 == 0 { w[0].1 + (w[1].1 - w[0].1) * (t - w[0].0) / (w[1].0 - w[0].0).max(1e-9) } else { w[0].1 }; } }
     keys.last().map_or(0., |k| k.1)
 }
-fn curve_row(set: &fn_pak::PakSet, table: &str, row: &str, t: f32) -> Result<f32, String> {
+pub(crate) fn curve_row(set: &fn_pak::PakSet, table: &str, row: &str, t: f32) -> Result<f32, String> {
     let pd = fn_uasset::PackageData::load(set, table).map_err(|e| format!("{table}: {e}"))?;
     let pkg = pd.package().map_err(|e| format!("{table}: {e}"))?;
     let tb = fn_uasset::classes::read_table(&pkg, 0).map_err(|e| format!("{table}: {e}"))?;
@@ -298,8 +300,12 @@ fn class_export(pkg: &Package) -> Result<usize, String> {
 fn chain_bool(c: &[(Package, PropList)], k: &str) -> bool { c.iter().find_map(|(_, p)| p.bool(k)).unwrap_or(false) }
 fn chain_path(c: &[(Package, PropList)], k: &str) -> Option<String> { c.iter().find_map(|(pk, p)| path_of(pk, p, k)) }
 fn chain_indexed(c: &[(Package, PropList)], k: &str) -> Vec<(u32, String)> {
-    let mut out: Vec<(u32, String)> = Vec::new();
-    for (pk, p) in c { for (i, s) in indexed_paths(pk, p, k) { if !out.iter().any(|(j, _)| *j == i) { out.push((i, s)); } } }
+    let mut out: Vec<(u32, Option<String>)> = Vec::new();
+    for (pk, p) in c {
+        let nulls = p.0.iter().filter(|x| x.name == k && matches!(x.value, PropValue::Object(0))).map(|x| (x.array_index as u32, None));
+        for (i, s) in indexed_paths(pk, p, k).into_iter().map(|(i, s)| (i, Some(s))).chain(nulls) { if !out.iter().any(|(j, _)| *j == i) { out.push((i, s)); } }
+    }
+    let mut out: Vec<(u32, String)> = out.into_iter().filter_map(|(i, s)| Some((i, s?))).collect();
     out.sort_by_key(|x| x.0); out
 }
 
@@ -369,10 +375,12 @@ pub fn load(src: &ClipSourceDir, wid_package: &str) -> Result<GunHit, String> {
     let trigger = wid.text("TriggerType").unwrap_or("EFortWeaponTriggerType::OnPress").to_owned();
     let ammo = path_of(&pkg, &wid, "AmmoData").map(|p| pkg_of(&p).rsplit('/').next().unwrap_or("").to_owned()).unwrap_or_default();
     let s = |k: &str| wid.text(k).unwrap_or("").to_owned();
+    let tracer = match pres.tracer_template.as_deref() { Some(t) => match crate::tracer::load(src, t) { Ok(d) => Some(d), Err(e) => { eprintln!("[hitreg] {wid_package}: tracer {t}: {e}"); None } }, None => None };
+    let projectile_particles = pres.projectile_template.as_deref().map(|t| crate::tracer::component_particles(src, t)).unwrap_or_default();
     Ok(GunHit { wid: wid_package.to_owned(), row, stats, ability: fire_ability(src, &wid, &pkg)?, pres, projectile, perfect_aim_when_targeting_min_spread: perfect, trigger, ammo,
         rarity: s("Rarity"), tier: s("Tier"), min_level: wid.int("MinLevel").unwrap_or(0),
         ammo_path: path_of(&pkg, &wid, "AmmoData").unwrap_or_default(), ability_path: path_of(&pkg, &wid, "PrimaryFireAbility").unwrap_or_default(), actor_path: path_of(&pkg, &wid, "WeaponActorClass").unwrap_or_default(),
-        stat_table: pkg_of(&table).to_owned() })
+        stat_table: pkg_of(&table).to_owned(), tracer, projectile_particles })
 }
 
 /// Package paths of every Battle Royale ranged weapon definition in the install (`/Game/Athena/Items/Weapons/WID_*_Athena_*`, harvesting tools and

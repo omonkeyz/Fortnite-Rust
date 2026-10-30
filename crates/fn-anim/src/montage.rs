@@ -151,7 +151,7 @@ impl AnimMontage {
                     name: f.text("SectionName").unwrap_or("").to_string(),
                     next_section: f.text("NextSectionName").unwrap_or("").to_string(),
                     // Relative link method (every pickaxe section): start = SegmentBeginTime + LinkValue (LinkValue alone is the offset, 0 for all of them)
-                    start_time: f.float("StartTime").unwrap_or_else(|| f.float("SegmentBeginTime").unwrap_or(0.0) + f.float("LinkValue").unwrap_or(0.0)) as f32,
+                    start_time: f.float("StartTime").unwrap_or_else(|| { let (b, v) = (f.float("SegmentBeginTime").unwrap_or(0.0), f.float("LinkValue").unwrap_or(0.0)); match f.text("LinkMethod").map(|m| m.rsplit(':').next().unwrap_or(m)) { Some("Absolute") => v, Some("Proportional") => b + v * f.float("SegmentLength").unwrap_or(0.0), _ => b + v } }) as f32,
                 });
             }
         }

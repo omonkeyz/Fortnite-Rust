@@ -844,6 +844,7 @@
 ["file","/fn/assets/webcook/v1/pak/pak-001.bin",224395264,225443839,"",1791596526653],
 ["bundle","/fn/assets/particles-traps",-1,-1,"max=262144&ext=json,txt,ini,csv",1791596526681],
 ["bundle","/fn/assets/particles-rockets",-1,-1,"max=262144&ext=json,txt,ini,csv",1791596526726],
+["bundle","/fn/assets/particles-gunfx",-1,-1,"max=262144&ext=json,txt,ini,csv",1791596526726],
 ["file","/fn/assets/particles-rockets/systems/P_PumpkinRPG_ExplodeGoop_01.json",0,395823,"",1791596526762],
 ["file","/fn/assets/particles-rockets/meshes/Sm_RocketExplosion_01_NoLOD.json",0,1144515,"",1791596526799],
 ["file","/fn/assets/webcook/v1/pak/pak-001.bin",225443840,226492415,"",1791596526902],

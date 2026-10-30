@@ -602,3 +602,17 @@ fn tap_controller() -> Controller { let mut c = Controller::default(); c.compone
     assert!((steps[0] - (v0 + (v0 - 28. * dt)) * 0.5 * dt).abs() < 0.003, "first airborne step is the midpoint move only: {}", steps[0]);
     assert!((c.render_height() - rest).abs() < 1e-3, "rests at the same hovering height after landing");
 }
+
+#[test] fn launch_character_takes_a_walking_pawn_into_the_air_on_the_next_tick() {
+    let mut c = Cmc::new(Params::default(), Scene::default(), Vec3::ZERO);
+    for _ in 0..5 { c.tick(Vec2::new(1., 0.), 1. / 60.); }
+    assert_eq!(c.mode, Mode::Walking);
+    let vx = c.velocity.x;
+    c.launch(Vec3::new(vx, 0., 2000.));
+    c.tick(Vec2::ZERO, 1. / 60.);
+    assert_eq!(c.mode, Mode::Falling);
+    assert!(c.velocity.z > 2000. - 2800. / 60. - 1. && c.velocity.z < 2000., "{}", c.velocity.z);
+    let mut apex = 0f32; let z0 = c.feet_z();
+    for _ in 0..240 { c.tick(Vec2::ZERO, 1. / 60.); apex = apex.max(c.feet_z() - z0); }
+    assert!((apex - 2000. * 2000. / (2. * 2800.)).abs() < 40., "apex {apex}");
+}

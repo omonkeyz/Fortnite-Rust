@@ -15,24 +15,40 @@ static DONE: AtomicBool = AtomicBool::new(false);
 
 pub fn pending() -> bool { !DONE.load(Ordering::Relaxed) }
 
+static STARTED: AtomicBool = AtomicBool::new(false);
+type Loaded = (Vec<(fn_render::StaticMeshHandle, fn_render::distance_field::MeshDistanceField)>, Vec<String>, f32);
+static RESULT: std::sync::Mutex<Option<Loaded>> = std::sync::Mutex::new(None);
+
 pub fn frame(scene: &mut Scene, install: Option<PathBuf>, roots: &[PathBuf]) {
-    if DONE.swap(true, Ordering::Relaxed) { return; }
-    let Some(real) = scene.real.as_ref() else { return };
-    let Some(dir) = install else { eprintln!("[df] no install / paks: distance-field shadows and AO stay off"); return };
-    let Some(cat) = crate::props::discover(roots) else { return };
-    let set = match fn_pak::PakSet::open_install(&dir) { Ok(s) => s, Err(e) => { eprintln!("[df] paks: {e}"); return } };
-    let t0 = std::time::Instant::now();
-    let (mut ok, mut skipped) = (0usize, vec![]);
-    let jobs: Vec<(usize, fn_render::StaticMeshHandle)> = real.meshes.iter().enumerate().filter_map(|(i, m)| m.map(|h| (i, h))).collect();
-    let protos: Vec<String> = real.lib.protos.iter().map(|p| p.id.clone()).collect();
-    for (pi, handle) in jobs {
-        let Some(kind) = cat.kinds.iter().find(|k| k.id == protos[pi]) else { continue };
-        match load_one(&set, kind) {
-            Ok(df) => { scene.renderer.set_static_mesh_distance_field(handle, df); ok += 1; }
-            Err(e) => skipped.push(format!("{}: {e}", kind.id)),
-        }
+    if DONE.load(Ordering::Relaxed) { return; }
+    if STARTED.load(Ordering::Relaxed) {
+        let Some((loaded, skipped, ms)) = RESULT.lock().ok().and_then(|mut g| g.take()) else { return };
+        let ok = loaded.len();
+        for (handle, df) in loaded { scene.renderer.set_static_mesh_distance_field(handle, df); }
+        DONE.store(true, Ordering::Relaxed);
+        eprintln!("[df] {ok} cooked mesh distance fields loaded in {ms:.0} ms (worker){}", if skipped.is_empty() { String::new() } else { format!("; skipped: {}", skipped.join(", ")) });
+        return;
     }
-    eprintln!("[df] {ok} cooked mesh distance fields loaded in {:.0} ms{}", t0.elapsed().as_secs_f32() * 1000., if skipped.is_empty() { String::new() } else { format!("; skipped: {}", skipped.join("; ")) });
+    let done = |_: ()| DONE.store(true, Ordering::Relaxed);
+    let Some(real) = scene.real.as_ref() else { return done(()) };
+    let Some(dir) = install else { eprintln!("[df] no install / paks: distance-field shadows and AO stay off"); return done(()) };
+    let Some(cat) = crate::props::discover(roots) else { return done(()) };
+    let protos: Vec<String> = real.lib.protos.iter().map(|p| p.id.clone()).collect();
+    let jobs: Vec<(fn_render::StaticMeshHandle, fn_propdata::PropKind)> = real.meshes.iter().enumerate().filter_map(|(i, m)| m.and_then(|h| cat.kinds.iter().find(|k| k.id == protos[i]).map(|k| (h, k.clone())))).collect();
+    STARTED.store(true, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new().name("df load".into()).spawn(move || {
+        let t0 = std::time::Instant::now();
+        let set = match fn_pak::PakSet::open_install(&dir) { Ok(s) => s, Err(e) => { eprintln!("[df] paks: {e}"); if let Ok(mut g) = RESULT.lock() { *g = Some((vec![], vec![], 0.)); } return } };
+        let (mut loaded, mut skipped) = (vec![], vec![]);
+        for (handle, kind) in jobs {
+            match load_one(&set, &kind) {
+                Ok(df) => loaded.push((handle, df)),
+                Err(e) => skipped.push(format!("{}: {e}", kind.id)),
+            }
+        }
+        if let Ok(mut g) = RESULT.lock() { *g = Some((loaded, skipped, t0.elapsed().as_secs_f32() * 1000.)); }
+    });
+    if spawned.is_err() { STARTED.store(false, Ordering::Relaxed); done(()); }
 }
 
 fn load_one(set: &fn_pak::PakSet, kind: &fn_propdata::PropKind) -> Result<fn_render::distance_field::MeshDistanceField, String> {

@@ -175,6 +175,17 @@ fn type_data(pk: &Pkg, path: Option<&str>) -> TypeData {
             let e = p.get("EmitterInfo").cloned().unwrap_or(Value::Null);
             TypeData::Gpu(GpuInfo { max_particle_count: pi(&e, "MaxParticleCount", 0) as u32, collision: pb(&e, "bEnableCollision", false), collision_mode: ps(&e, "CollisionMode").unwrap_or("").to_string(), constant_acceleration: pv3(&e, "ConstantAcceleration", [0.0; 3]), max_lifetime: pf(&e, "MaxLifetime", 0.0) })
         }
+        "ParticleModuleTypeDataRibbon" => {
+            let d = RibbonInfo::default();
+            let axis = match ps(p, "RenderAxis").unwrap_or("") { s if s.ends_with("Trails_SourceUp") => 1, s if s.ends_with("Trails_WorldUp") => 2, _ => 0 };
+            TypeData::Ribbon(RibbonInfo { max_tessellation_between_particles: pi(p, "MaxTessellationBetweenParticles", d.max_tessellation_between_particles as i64) as i32,
+                max_particle_in_trail_count: pi(p, "MaxParticleInTrailCount", d.max_particle_in_trail_count as i64) as i32, tiling_distance: pf(p, "TilingDistance", d.tiling_distance),
+                distance_tessellation_step_size: pf(p, "DistanceTessellationStepSize", d.distance_tessellation_step_size), enable_tangent_diff_interp_scale: pb(p, "bEnableTangentDiffInterpScale", d.enable_tangent_diff_interp_scale),
+                tangent_tessellation_scalar: pf(p, "TangentTessellationScalar", d.tangent_tessellation_scalar), tangent_spawning_scalar: pf(p, "TangentSpawningScalar", d.tangent_spawning_scalar),
+                spawn_initial_particle: pb(p, "bSpawnInitialParticle", d.spawn_initial_particle), render_axis: axis,
+                enable_previous_tangent_recalculation: pb(p, "bEnablePreviousTangentRecalculation", d.enable_previous_tangent_recalculation), tangent_recalculation_every_frame: pb(p, "bTangentRecalculationEveryFrame", d.tangent_recalculation_every_frame),
+                dead_trails_on_deactivate: pb(p, "bDeadTrailsOnDeactivate", d.dead_trails_on_deactivate) })
+        }
         _ => TypeData::Sprite,
     }
 }

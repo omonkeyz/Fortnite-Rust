@@ -181,7 +181,7 @@ impl MomentDetector {
             let strikes = (g.world.hits - self.hits) + (g.world.misses - self.misses);
             for _ in 0..strikes { out.push(AudioMoment::Swing { pos: pawn }); }
             for (i, p) in g.world.props.iter().enumerate() {
-                let (was, life) = self.props[i];
+                let (was, life) = std::mem::replace(&mut self.props[i], (p.health, p.life));
                 if life == p.life && p.health < was && !p.alive() && g.world.hits == self.hits {
                     // BUILDING: no strike this step (a placement destroyed it): the death cue at the prop, no impact
                     out.push(AudioMoment::PropDestroyed { surface: match p.kind { Kind::Tree => HitSurface::Tree, Kind::Rock => HitSurface::Rock }, pos: Vec3::new(p.pos.x, p.pos.y + CHEST_HEIGHT, p.pos.z), proto: p.proto });
@@ -195,7 +195,7 @@ impl MomentDetector {
                     for k in 0..n { out.push(AudioMoment::Harvest { surface: match p.kind { Kind::Tree => HitSurface::Tree, Kind::Rock => HitSurface::Rock }, destroyed: !p.alive() && k + 1 == n, pos, proto: p.proto }); }
                 }
             }
-            self.hits = g.world.hits; self.misses = g.world.misses; self.snapshot_props(g);
+            self.hits = g.world.hits; self.misses = g.world.misses;
         }
         // CRACK AUDIO HOOK: the weak-spot effect. `Fx::events` is drained by the presentation once per presented frame (after the audio observed every sim step), so the events of this
         // step are the newest `emitted - seen` entries; nothing is drained here. The first observation only takes the counter (events before the detector started are not replayed).

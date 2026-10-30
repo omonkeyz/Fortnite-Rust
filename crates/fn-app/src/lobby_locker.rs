@@ -18,20 +18,25 @@ pub const RANDOM_CHARACTERS: [&str; 8] = [
     "CID_005_Athena_Commando_M_Default", "CID_006_Athena_Commando_M_Default", "CID_007_Athena_Commando_M_Default", "CID_008_Athena_Commando_M_Default",
 ];
 
-pub struct LockerGlue { pub catalog: Catalog }
+static SESSION_RANDOM_HERO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub struct LockerGlue { pub catalog: Catalog, pub random_hero: String }
 
 impl LockerGlue {
-    pub fn load(set: &fn_pak::PakSet) -> LockerGlue { LockerGlue { catalog: Catalog::load(set) } }
+    pub fn load(set: &fn_pak::PakSet) -> LockerGlue {
+        let catalog = Catalog::load(set);
+        let random_hero = SESSION_RANDOM_HERO.get_or_init(|| {
+            let recruits: Vec<&str> = RANDOM_CHARACTERS.iter().copied().filter(|id| catalog.find(id).is_some()).collect();
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| (d.as_nanos() / 1000) as usize ^ (d.as_secs() as usize));
+            recruits.get(if recruits.is_empty() { 0 } else { seed % recruits.len() }).and_then(|id| catalog.find(id)).and_then(|c| c.hero.clone()).unwrap_or_else(|| fn_pose::br_character::DEFAULT_HERO.to_owned())
+        }).clone();
+        LockerGlue { catalog, random_hero }
+    }
 
     /// The items a fresh offline profile owns: the Athena default outfits (`CID_*_Default`), `DefaultPickaxe`, `DefaultGlider` (the 1.8 account starts with the
     /// default items). The first outfit is `CID_005_Athena_Commando_M_Default` (the hero the lobby has always used).
     pub fn default_loadout(&self) -> Vec<(PSlot, String)> {
         let mut out = vec![];
-        let recruits: Vec<String> = RANDOM_CHARACTERS.iter().filter(|id| self.catalog.find(id).is_some()).map(|s| s.to_string()).collect();
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| (d.as_nanos() / 1000) as usize ^ (d.as_secs() as usize));
-        let first = recruits.get(if recruits.is_empty() { 0 } else { seed % recruits.len() }).cloned().unwrap_or_else(|| "CID_005_Athena_Commando_M_Default".to_owned());
-        if self.catalog.find(&first).is_some() { out.push((PSlot::Outfit, first.clone())); }
-        for c in self.catalog.of(Category::Outfit, false) { if c.id.ends_with("_Default") && c.id != first { out.push((PSlot::Outfit, c.id.clone())); } }
         for (slot, id) in [(PSlot::Pickaxe, "DefaultPickaxe"), (PSlot::Glider, "DefaultGlider")] { if self.catalog.find(id).is_some() { out.push((slot, id.to_owned())); } }
         out
     }
@@ -46,7 +51,11 @@ impl LockerGlue {
 
     /// The owned items of a slot in catalog order (the 1.8 picker order comes from the profile's item iteration and cannot be recovered: this is the asset-name
     /// order, i.e. the item number).
-    pub fn owned(&self, profile: &Profile, slot: PSlot) -> Vec<&Cosmetic> { self.catalog.of(category(slot), false).into_iter().filter(|c| profile.owns(&c.id)).collect() }
+    pub fn owned(&self, profile: &Profile, slot: PSlot) -> Vec<&Cosmetic> {
+        let mut v: Vec<&Cosmetic> = self.catalog.of(category(slot), false).into_iter().filter(|c| profile.owns(&c.id)).collect();
+        v.sort_by_key(|c| c.rarity_index());
+        v
+    }
 
     /// Refresh the picker lists and the equipped markers of `view` from the profile.
     pub fn sync(&self, profile: &Profile, view: &mut LockerView) {
@@ -55,11 +64,14 @@ impl LockerGlue {
             let i = to_ui(s).index();
             view.items[i] = owned.iter().map(|c| Self::item(c)).collect();
             view.equipped[i] = profile.equipped(s).and_then(|e| owned.iter().position(|c| c.id == e));
+            view.null_tile[i] = s == PSlot::Outfit;
         }
+        if let Some((icon, color)) = profile.banner() { view.banner_icon = icon.to_owned(); view.banner_color = color.to_owned(); }
     }
 
     /// A picker tile was clicked: equip the item (the profile checks ownership). Returns the equipped cosmetic.
     pub fn equip(&self, profile: &mut Profile, slot: USlot, view: &LockerView, index: usize) -> Option<&Cosmetic> {
+        if index == usize::MAX { profile.unequip(to_profile(slot)); return None; }
         let item = view.items[slot.index()].get(index)?;
         let ps = to_profile(slot);
         profile.equip(ps, &item.id).ok()?;
@@ -68,7 +80,8 @@ impl LockerGlue {
 
     /// `HID_*` path of the outfit equipped in `profile` (falls back to the default hero).
     pub fn equipped_hero(&self, profile: &Profile) -> String {
-        profile.equipped(PSlot::Outfit).and_then(|id| self.catalog.find(id)).and_then(|c| c.hero.clone()).unwrap_or_else(|| fn_pose::br_character::DEFAULT_HERO.to_owned())
+        fn_live::var("FN_LOBBY_OUTFIT").ok().and_then(|id| self.catalog.find(&id)).and_then(|c| c.hero.clone())
+            .or_else(|| profile.equipped(PSlot::Outfit).and_then(|id| self.catalog.find(id)).and_then(|c| c.hero.clone())).unwrap_or_else(|| self.random_hero.clone())
     }
 }
 
@@ -84,16 +97,17 @@ mod tests {
     fn the_fresh_profile_owns_only_the_defaults_and_equipping_swaps_the_loadout() {
         let Some(g) = glue() else { return };
         let defs = g.default_loadout();
-        assert_eq!(defs[0], (PSlot::Outfit, "CID_005_Athena_Commando_M_Default".to_owned()));
-        assert!(defs.iter().filter(|d| d.0 == PSlot::Outfit).count() >= 8);
-        let mut p = Profile::new(defs);
+        assert!(defs.iter().all(|d| d.0 != PSlot::Outfit));
+        let mut p = Profile::new(defs).with_starting_items(RANDOM_CHARACTERS.iter().map(|s| s.to_string()).collect());
         let mut view = LockerView::default();
         g.sync(&p, &mut view);
         let outfits = &view.items[USlot::Outfit.index()];
         assert_eq!(outfits.len(), 8, "{:?}", outfits.iter().map(|i| &i.id).collect::<Vec<_>>());
         assert_eq!(view.items[USlot::Pickaxe.index()].len(), 1);
         assert_eq!(view.items[USlot::Glider.index()].len(), 1);
-        assert_eq!(view.equipped[0].map(|i| outfits[i].id.as_str()), Some("CID_005_Athena_Commando_M_Default"));
+        assert_eq!(view.equipped[0], None);
+        assert!(view.null_tile[0]);
+        assert!(RANDOM_CHARACTERS.iter().any(|id| g.catalog.find(id).and_then(|c| c.hero.as_deref()) == Some(g.equipped_hero(&p).as_str())));
         // buy Skull Trooper (what the shop does) and equip it from the picker
         p.grant("CID_030_Athena_Commando_M_Halloween");
         g.sync(&p, &mut view);

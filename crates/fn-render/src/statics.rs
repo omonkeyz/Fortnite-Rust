@@ -295,6 +295,52 @@ impl StaticRenderer {
         StaticMeshHandle(self.meshes.len() - 1)
     }
 
+    pub fn release_meshes(&mut self, meshes: &[StaticMeshHandle]) -> (usize, u64) {
+        let gone: std::collections::HashSet<usize> = meshes.iter().map(|h| h.0).filter(|&i| i < self.meshes.len()).collect();
+        if gone.is_empty() { return (0, 0); }
+        let mut keep = vec![false; self.materials.len()];
+        let mut drop = vec![false; self.materials.len()];
+        for (i, m) in self.meshes.iter().enumerate() {
+            let flag = if gone.contains(&i) { &mut drop } else { &mut keep };
+            for l in &m.lods { for s in &l.sections { if let Some(f) = flag.get_mut(s.material) { *f = true; } } }
+        }
+        let mut bytes = 0u64;
+        let tiny = || self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("static released"), size: 16, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX, mapped_at_creation: false });
+        for &i in &gone {
+            for l in self.meshes[i].lods.iter_mut() {
+                bytes += l.vb.size() + l.ib.size();
+                l.vb.destroy();
+                l.ib.destroy();
+                l.vb = tiny();
+                l.ib = tiny();
+                l.sections.clear();
+                l.tris = 0;
+            }
+        }
+        let mut n = 0;
+        for (mi, m) in self.materials.iter_mut().enumerate() {
+            if !drop[mi] || keep[mi] { continue; }
+            let mut changed = false;
+            if m.base != self.white {
+                let t = m.base.texture();
+                bytes += (t.width() as u64 * t.height() as u64 * 4 * 4) / 3;
+                t.destroy();
+                m.base = self.white.clone();
+                changed = true;
+            }
+            if m.normal != self.flat_normal {
+                let t = m.normal.texture();
+                bytes += (t.width() as u64 * t.height() as u64 * 4 * 4) / 3;
+                t.destroy();
+                m.normal = self.flat_normal.clone();
+                changed = true;
+            }
+            if changed { n += 1; }
+        }
+        let bgs: Vec<(usize, wgpu::BindGroup)> = self.materials.iter().enumerate().filter(|(i, _)| drop[*i] && !keep[*i]).map(|(i, m)| (i, self.material_bg(&m.buf, &m.base, &m.normal))).collect();
+        for (i, bg) in bgs { self.materials[i].bg = bg; }
+        (n, bytes)
+    }
     pub fn mesh_count(&self) -> usize { self.meshes.len() }
     pub fn material_count(&self) -> usize { self.materials.len() }
     pub fn stats(&self) -> &StaticStats { &self.stats }

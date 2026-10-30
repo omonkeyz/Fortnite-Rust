@@ -444,12 +444,12 @@ pub(crate) fn parse_notifies(pkg: &Package, props: &PropList) -> Vec<Notify> {
                 n.notify_class = Some(pkg.export_class(o as usize - 1));
                 // the properties of the two notify classes that make weapon sound (play-sound, reload FX stage)
                 let class = n.notify_class.as_deref().unwrap_or("");
-                if class == "AnimNotify_PlaySound" || class == "AnimNotify_PlayReloadFX_C" {
+                if class == "AnimNotify_PlaySound" || class == "FortAnimNotify_PlayEmoteMusic" || class == "AnimNotify_PlayReloadFX_C" {
                     let (start, end) = pkg.export_range(o as usize - 1);
                     let mut r = Reader::at(&pkg.data[..end], start);
                     let ctx = Ctx { names: &pkg.names, file_version: pkg.summary.file_version };
                     if let Ok(p) = read_props(&mut r, &ctx) {
-                        if class == "AnimNotify_PlaySound" {
+                        if class == "AnimNotify_PlaySound" || class == "FortAnimNotify_PlayEmoteMusic" {
                             n.sound = p.object("Sound").filter(|s| *s < 0).map(|s| pkg.import_path(s));
                             n.sound_pitch = p.float("PitchMultiplier").map(|x| x as f32).unwrap_or(1.0);
                             n.sound_volume = p.float("VolumeMultiplier").map(|x| x as f32).unwrap_or(1.0);

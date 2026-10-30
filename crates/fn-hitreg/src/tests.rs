@@ -545,3 +545,21 @@ fn bullets_hit_the_complex_triangles_and_pass_the_opening_the_simple_box_covers(
     assert!(ray(&[p.clone()], 0., 2.5).is_some(), "the lintel");
     p.health = 0.; assert!(ray(&[p], 1.5, 1.).is_none(), "a destroyed prop stops nothing");
 }
+
+#[test]
+fn tracer_classes_are_read_from_the_install() {
+    let Some(g) = guns() else { eprintln!("FN_TEST_ROOT not set, skipping"); return };
+    let ar = g[0].tracer.as_ref().expect("AR tracer");
+    let sg = g[1].tracer.as_ref().expect("shotgun tracer");
+    eprintln!("AR {ar:?}
+SG {sg:?}");
+    assert!(ar.mesh.contains("SM_tracer_01") && sg.mesh.contains("SM_Shotgun_Tracer"));
+    assert_eq!((ar.mesh_scale_mult, ar.mesh_scale_time, ar.speed_scale_mult), ([8., 1., 1.], 0.05, (2., 2.)));
+    assert_eq!((sg.mesh_scale_mult[0], sg.speed_scale_mult, sg.scale_speed, sg.scale_on_death), (5., crate::tracer::DEFAULT_SPEED_SCALE_MULT, true, true));
+    assert!((ar.mesh_min_x + 162.66).abs() < 0.01 && ar.mesh_max_x.abs() < 0.01);
+    assert!(ar.speed > 1000. && ar.speed_row == "TracerGeneric_Speed");
+    assert!(ar.pass_by_far_sound.as_deref().unwrap().contains("bullet_whip_Cue") && ar.pass_by_radii == (100., 400.));
+    assert!(g[2].pres.impact_sound(1).is_none() && g[2].pres.impact_sound(0).is_none() && g[0].pres.impact_sound(1).is_some(), "the sniper CDO nulls the surface sounds: {:?}", g[2].pres.impact_sounds);
+    let sn = &g[2].projectile_particles;
+    assert!(sn.iter().any(|(t, l)| t.contains("P_SR_Ribbon_SmokeTrail") && l[0] == -4.) && sn.iter().any(|(t, _)| t.contains("P_Throwing_Star_HandTrail")), "{sn:?}");
+}

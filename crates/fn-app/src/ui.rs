@@ -105,6 +105,7 @@ impl UiLayer {
     }
     /// FRONT END: lays out and paints the cooked picker once off screen (its full-window background material is rastered on the CPU: done behind the login
     /// screen, not on the picker's first frame).
+    pub fn warm_picker_step(&mut self, w: f32, h: f32, k: usize) -> Option<bool> { match self.front.as_mut().and_then(|f| f.picker.as_mut()) { Some(c) => c.warm_step(&mut self.ctx, w, h, k), None => Some(true) } }
     pub fn warm_picker(&mut self, w: f32, h: f32) { if let Some(c) = self.front.as_mut().and_then(|f| f.picker.as_mut()) { c.warm(&mut self.ctx, w, h); } }
     /// Pixel layout of the picker's current page (for hit-testing; same text metrics as the drawing).
     pub fn picker_layout(&self, page: picker::Page, w: f32, h: f32) -> picker::Layout {

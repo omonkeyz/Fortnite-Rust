@@ -457,8 +457,7 @@ impl StreamedWave {
             })
             .collect();
         let shared = Arc::new(Shared { src, slots, stop: AtomicBool::new(false), stats: Arc::new(StreamStats::default()), preroll });
-        let w = shared.clone();
-        std::thread::Builder::new().name("fn-audio-stream".into()).spawn(move || worker(w)).map_err(|e| AudioError::Device(format!("stream worker: {e}")))?;
+        register(shared.clone())?;
         Ok(Arc::new(StreamedWave { shared }))
     }
 
@@ -609,11 +608,37 @@ impl StreamCursor {
     }
 }
 
-fn worker(sh: Arc<Shared>) {
+static PENDING: std::sync::Mutex<Vec<Arc<Shared>>> = std::sync::Mutex::new(Vec::new());
+static WORKER: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
+
+fn register(sh: Arc<Shared>) -> Result<()> {
+    PENDING.lock().unwrap_or_else(|p| p.into_inner()).push(sh);
+    WORKER
+        .get_or_init(|| std::thread::Builder::new().name("fn-audio-stream".into()).spawn(worker).map(|_| ()).map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| AudioError::Device(format!("stream worker: {e}")))
+}
+
+fn worker() {
+    let mut live: Vec<(Arc<Shared>, Vec<Work>)> = Vec::new();
+    let mut tmp: Vec<f32> = Vec::new();
+    loop {
+        {
+            let mut p = PENDING.lock().unwrap_or_else(|p| p.into_inner());
+            for sh in p.drain(..) { live.push((sh, (0..SLOTS).map(|_| Work { dec: None, gen: 0, seq: 0, ended: false, pass_frames: 0 }).collect())); }
+        }
+        live.retain(|(sh, _)| !sh.stop.load(Acquire));
+        let mut busy = false;
+        for (sh, work) in live.iter_mut() { busy |= service(sh, work, &mut tmp); }
+        if !busy {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+fn service(sh: &Shared, work: &mut [Work], tmp: &mut Vec<f32>) -> bool {
     let ch = sh.src.channels as usize;
-    let mut work: Vec<Work> = (0..SLOTS).map(|_| Work { dec: None, gen: 0, seq: 0, ended: false, pass_frames: 0 }).collect();
-    let mut tmp: Vec<f32> = Vec::with_capacity(MAX_UNIT as usize * ch);
-    while !sh.stop.load(Acquire) {
+    {
         let mut busy = false;
         for (slot, w) in sh.slots.iter().zip(work.iter_mut()) {
             match slot.owner.load(Acquire) {
@@ -675,7 +700,7 @@ fn worker(sh: Arc<Shared>) {
                     }
                     let Some(d) = w.dec.as_mut() else { continue };
                     tmp.clear();
-                    let more = match d.next(&mut tmp) {
+                    let more = match d.next(tmp) {
                         Ok(m) => m,
                         Err(_) => {
                             sh.stats.decode_errors.fetch_add(1, Relaxed);
@@ -718,8 +743,6 @@ fn worker(sh: Arc<Shared>) {
                 _ => {}
             }
         }
-        if !busy {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        busy
     }
 }

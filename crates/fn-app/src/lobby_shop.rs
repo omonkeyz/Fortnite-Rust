@@ -325,6 +325,9 @@ impl ShopScreen {
     /// Loads the cosmetic catalog and composes the widgets (a few hundred ms; do it once).
     pub fn load(store: std::rc::Rc<fn_ui::screens::athena_lobby::store::Store>) -> Result<ShopScreen, String> {
         let shop = Shop::load(&store);
+        Self::from_parts(shop, store)
+    }
+    pub fn from_parts(shop: Shop, store: std::rc::Rc<fn_ui::screens::athena_lobby::store::Store>) -> Result<ShopScreen, String> {
         let ui = fn_ui::screens::athena_shop::AthenaShopUi::from_store(store)?;
         let state = fn_ui::screens::athena_shop::ShopState { selected_tab: ui.item_shop_tab, ..Default::default() };
         Ok(ShopScreen { shop, ui, state, hits: Default::default() })
@@ -383,7 +386,7 @@ impl ShopScreen {
         match Affordability::of(&offer, profile.balance()) {
             Affordability::Owned => ShopEvent::None,
             // the button reads "Get V-bucks" when the V-Bucks price cannot be paid (SetupPrice: IsPriceInMTX): offline there is no store
-            Affordability::CannotAfford => ShopEvent::Message(format!("Not enough V-Bucks ({} needed, {} available). There is no V-Bucks store offline: use the F2 command bar (addvbucks <n>).", offer.price, profile.balance())),
+            Affordability::CannotAfford => ShopEvent::Message(format!("Not enough V-Bucks ({} needed, {} available). There is no V-Bucks store offline: use the ~ command bar (addvbucks <n>).", offer.price, profile.balance())),
             Affordability::Can => match self.shop.buy(profile, &offer.offer_id, now) {
                 Ok(r) => {
                     // HandlePurchaseOfferComplete(true): push the purchased widget, AutoEquip
@@ -416,7 +419,7 @@ pub(crate) mod tests {
 
     fn cos(id: &str, cat: Category, rarity: &str) -> Cosmetic {
         Cosmetic { package: format!("/Game/Athena/Items/Cosmetics/{id}"), id: id.into(), class: "x".into(), category: cat, name: Some(format!("Name {id}")), description: None, short_description: None,
-            rarity: rarity.into(), test_asset: false, hero: None, hero_package: None, weapon: None, skeletal_mesh: None, small_icon: Some(format!("/Game/T/{id}.{id}")), large_icon: Some(format!("/Game/T/{id}.{id}")) }
+            rarity: rarity.into(), test_asset: false, hero: None, hero_package: None, weapon: None, skeletal_mesh: None, small_icon: Some(format!("/Game/T/{id}.{id}")), large_icon: Some(format!("/Game/T/{id}.{id}")), animation: None }
     }
     pub fn synthetic() -> ShopCatalog {
         let mut c = Catalog::default();
@@ -598,7 +601,7 @@ pub(crate) mod tests {
         assert!(frame.missing.is_empty(), "{:?}", frame.missing);
         assert_eq!(frame.offers.len(), WEEKLY_SLOTS + DAILY_SLOTS, "every storefront tile is on screen");
         // the tab list is the 1.8 one and the shop tab is selected
-        assert_eq!(frame.tabs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["LOBBY", "LOCKER", "ITEM SHOP", "SEASON SHOP", "STATS", "LEADERBOARDS", "STORE"]);
+        assert_eq!(frame.tabs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["LOBBY", "LOCKER", "ITEM SHOP", "SEASON SHOP", "STATS", "LEADERBOARDS"]);
         assert_eq!(screen.ui.item_shop_tab, 2);
         // weekly tiles are the large ones, daily the small ones (SBTileSize 384x608 / 256x292 at the layout scale). An offer rect is the whole tile
         // button (its hit area), not SBTileSize: AthenaDirectAcquisitionOfferWidget is a UCommonButton whose widget-tree root is SBTileSize, and the

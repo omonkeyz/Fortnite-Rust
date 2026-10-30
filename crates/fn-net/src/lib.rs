@@ -1,6 +1,7 @@
 pub mod caps;
 pub mod chat;
 pub mod interp;
+pub mod modes;
 pub mod proto;
 pub mod session;
 

@@ -85,11 +85,12 @@ pub struct LoadedWave {
     /// Incremental decode of a long looping wave (ambience, music): see [`crate::stream`].
     pub stream: Option<Arc<StreamedWave>>,
     pub pcm16: Vec<i16>,
+    pub lazy: Option<Arc<crate::soundwave::SoundWaveAsset>>,
 }
 
 impl LoadedWave {
     pub fn new(pcm: DecodedWave) -> LoadedWave {
-        LoadedWave { pcm, volume: 1.0, pitch: 1.0, stream: None, pcm16: Vec::new() }
+        LoadedWave { pcm, volume: 1.0, pitch: 1.0, stream: None, pcm16: Vec::new(), lazy: None }
     }
     /// A wave decoded on the fly by `stream` (no samples held).
     pub fn streamed(stream: Arc<StreamedWave>, looping_asset: bool) -> LoadedWave {
@@ -98,7 +99,7 @@ impl LoadedWave {
             pcm.loop_start = Some(0);
             pcm.loop_end = Some(stream.frames());
         }
-        LoadedWave { pcm, volume: 1.0, pitch: 1.0, stream: Some(stream), pcm16: Vec::new() }
+        LoadedWave { pcm, volume: 1.0, pitch: 1.0, stream: Some(stream), pcm16: Vec::new(), lazy: None }
     }
     /// Length in frames (of the stream when streamed).
     pub fn frames(&self) -> usize {
@@ -106,6 +107,9 @@ impl LoadedWave {
             Some(s) => s.frames() as usize,
             None => if self.pcm16.is_empty() { self.pcm.frames() } else { self.pcm16.len() / (self.pcm.channels.max(1) as usize) },
         }
+    }
+    pub fn encoded(asset: crate::soundwave::SoundWaveAsset, volume: f32, pitch: f32) -> LoadedWave {
+        LoadedWave { pcm: DecodedWave::new(Vec::new(), asset.info.sample_rate.unwrap_or(44100), asset.info.channels.unwrap_or(1)), volume, pitch, stream: None, pcm16: Vec::new(), lazy: Some(Arc::new(asset)) }
     }
     pub fn compact(mut self) -> LoadedWave {
         if self.stream.is_none() && !self.pcm.samples.is_empty() {
@@ -272,6 +276,7 @@ struct Ctx {
     class: Arc<ClassInfo>,
     fades: Vec<FadeRange>,
     env: Option<Arc<Envelope>>,
+    params: Vec<(String, FadeRange, f32)>,
 }
 
 #[derive(Debug)]
@@ -324,6 +329,7 @@ struct Voice {
     position: Option<Vec3>,
     fades: Vec<FadeRange>,
     env: Option<Arc<Envelope>>,
+    params: Vec<(String, FadeRange, f32)>,
     gl: f32,
     gr: f32,
     lpf: [f32; 2],
@@ -332,6 +338,7 @@ struct Voice {
     started: bool,
     done: bool,
     last_gain: f32,
+    pending: Option<usize>,
 }
 
 struct Scheduled {
@@ -412,8 +419,15 @@ pub struct Mixer {
     ctl: Vec<PlayCtl>,
     /// AMBIENCE HOOK: per-play live adjustments (`playadj`).
     adj: Vec<crate::playadj::PlayAdj>,
+    decoded: HashMap<usize, (Arc<LoadedWave>, u64)>,
+    decoded_bytes: usize,
+    decoding: std::collections::HashSet<usize>,
+    decode_tx: Option<std::sync::mpsc::Sender<(usize, Arc<crate::soundwave::SoundWaveAsset>, f32, f32)>>,
+    decode_done: Arc<std::sync::Mutex<Vec<(usize, Option<Arc<LoadedWave>>)>>>,
     pub stats: MixerStats,
 }
+
+const DECODED_BUDGET: usize = 48 << 20;
 
 /// Create a connected handle + mixer.
 pub fn engine_pair(out_rate: u32) -> (EngineHandle, Mixer) {
@@ -439,6 +453,11 @@ impl Mixer {
             rng: 0x9E3779B97F4A7C15,
             max_voices: DEFAULT_MAX_VOICES,
             clock: 0,
+            decoded: HashMap::new(),
+            decoded_bytes: 0,
+            decoding: std::collections::HashSet::new(),
+            decode_tx: None,
+            decode_done: Arc::new(std::sync::Mutex::new(Vec::new())),
             suspended: false,
             suspend_gain: 1.0,
             quality: 0,
@@ -603,6 +622,7 @@ impl Mixer {
             class: Arc::new(cue.class.clone()),
             fades: Vec::new(),
             env: None,
+            params: Vec::new(),
         };
         if let Some(root) = &cue.root {
             let mut path = Vec::new();
@@ -620,9 +640,6 @@ impl Mixer {
         Some(n)
     }
 
-    fn param_int(play: &PlayInfo, name: &str) -> i32 {
-        play.ints.iter().find(|(n, _)| n == name).map(|(_, v)| *v).unwrap_or(0)
-    }
     fn param_float(play: &PlayInfo, name: &str) -> f32 {
         play.floats.iter().find(|(n, _)| n == name).map(|(_, v)| *v).unwrap_or(0.0)
     }
@@ -730,7 +747,16 @@ impl Mixer {
                 if node.children.is_empty() {
                     return delay;
                 }
-                let i = (Self::param_int(play, param).max(0) as usize).min(node.children.len() - 1);
+                let set = play.ints.iter().find(|(n, _)| n.eq_ignore_ascii_case(param)).map(|(_, v)| *v);
+                let i = match (&node.kind, set) {
+                    (NodeKind::Switch { .. }, Some(v)) if v >= 0 && (v as usize + 1) < node.children.len() => v as usize + 1,
+                    (NodeKind::Switch { .. }, _) => 0,
+                    (_, Some(v)) => if v != 0 { 0 } else { 1 },
+                    (_, None) => 2,
+                };
+                if i >= node.children.len() {
+                    return delay;
+                }
                 path.push(i);
                 let e = self.expand(cue, &node.children[i], path, ctx, delay, play);
                 path.pop();
@@ -748,14 +774,18 @@ impl Mixer {
             }
             NodeKind::ParamCrossFade { param, inputs } => {
                 let x = Self::param_float(play, param);
+                let live = play.floats.iter().any(|(n, _)| n == param);
                 let mut end = delay;
                 for (i, c) in node.children.iter().enumerate() {
                     let g = inputs.get(i).map(|r| r.gain(x)).unwrap_or(1.0);
-                    if g <= 0.0 {
+                    if g <= 0.0 && !live {
                         continue;
                     }
                     let mut cc = ctx.clone();
-                    cc.volume *= g;
+                    match (live, inputs.get(i)) {
+                        (true, Some(r)) => cc.params.push((param.clone(), *r, x)),
+                        _ => cc.volume *= g,
+                    }
                     path.push(i);
                     end = end.max(self.expand(cue, c, path, &cc, delay, play));
                     path.pop();
@@ -827,7 +857,63 @@ impl Mixer {
         end
     }
 
+    fn decode_lazy(a: &crate::soundwave::SoundWaveAsset, volume: f32, pitch: f32) -> Option<Arc<LoadedWave>> {
+        let pcm = crate::codec::decode_asset(a).ok()?;
+        Some(Arc::new(LoadedWave { pcm, volume, pitch, stream: None, pcm16: Vec::new(), lazy: None }.compact()))
+    }
+    fn keep_decoded(&mut self, key: usize, lw: Arc<LoadedWave>) {
+        self.decoded_bytes += lw.pcm16.len() * 2 + lw.pcm.samples.len() * 4;
+        self.decoded.insert(key, (lw, self.clock));
+        while self.decoded_bytes > DECODED_BUDGET && self.decoded.len() > 1 {
+            let Some((&k, _)) = self.decoded.iter().filter(|(k, _)| **k != key).min_by_key(|(_, v)| v.1) else { break };
+            if let Some((w, _)) = self.decoded.remove(&k) { self.decoded_bytes = self.decoded_bytes.saturating_sub(w.pcm16.len() * 2 + w.pcm.samples.len() * 4); }
+        }
+    }
+    fn collect_decoded(&mut self) {
+        let done = std::mem::take(&mut *self.decode_done.lock().unwrap_or_else(|p| p.into_inner()));
+        for (key, r) in done {
+            self.decoding.remove(&key);
+            match r {
+                Some(lw) => {
+                    for v in self.voices.iter_mut().filter(|v| v.pending == Some(key)) { v.wave = lw.clone(); v.pending = None; }
+                    self.keep_decoded(key, lw);
+                }
+                None => { for v in self.voices.iter_mut().filter(|v| v.pending == Some(key)) { v.done = true; v.pending = None; } }
+            }
+        }
+    }
+    fn decoded_wave(&mut self, wave: &Arc<LoadedWave>) -> std::result::Result<Arc<LoadedWave>, Option<usize>> {
+        let Some(a) = wave.lazy.clone() else { return Ok(wave.clone()) };
+        let key = Arc::as_ptr(&a) as usize;
+        if let Some(e) = self.decoded.get_mut(&key) {
+            e.1 = self.clock;
+            return Ok(e.0.clone());
+        }
+        if self.wait_streams {
+            if let Some(lw) = Self::decode_lazy(&a, wave.volume, wave.pitch) { self.keep_decoded(key, lw.clone()); return Ok(lw); }
+            return Err(None);
+        }
+        if self.decoding.insert(key) {
+            if self.decode_tx.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel::<(usize, Arc<crate::soundwave::SoundWaveAsset>, f32, f32)>();
+                let out = self.decode_done.clone();
+                if std::thread::Builder::new().name("fn-audio-decode".into()).spawn(move || {
+                    while let Ok((k, a, v, p)) = rx.recv() { let r = Self::decode_lazy(&a, v, p); out.lock().unwrap_or_else(|p| p.into_inner()).push((k, r)); }
+                }).is_ok() { self.decode_tx = Some(tx); }
+            }
+            let sent = self.decode_tx.as_ref().is_some_and(|tx| tx.send((key, a.clone(), wave.volume, wave.pitch)).is_ok());
+            if !sent {
+                self.decoding.remove(&key);
+                if let Some(lw) = Self::decode_lazy(&a, wave.volume, wave.pitch) { self.keep_decoded(key, lw.clone()); return Ok(lw); }
+                return Err(None);
+            }
+        }
+        Err(Some(key))
+    }
+
     fn spawn_voice(&mut self, wave: Arc<LoadedWave>, looping: bool, ctx: &Ctx, delay: u64, play: &PlayInfo) -> u64 {
+        let (wave, pending) = match self.decoded_wave(&wave) { Ok(w) => (w, None), Err(Some(k)) => (wave, Some(k)), Err(None) => return delay };
+        if pending.is_some() && wave.lazy.as_ref().map_or(true, |a| a.info.sample_rate.is_none()) { return delay; }
         if self.voices.iter().filter(|v| !v.done).count() >= self.max_voices {
             // steal: lowest priority, then oldest; never a voice with higher priority than the newcomer
             let victim = self
@@ -857,7 +943,8 @@ impl Mixer {
         };
         let pitch = ctx.pitch * wave.pitch * ctx.class.pitch;
         let rate = wave.pcm.sample_rate as f64 / self.out_rate as f64 * pitch.max(0.01) as f64;
-        let end = if looping { FOREVER } else { delay + (wave.frames() as f64 / rate) as u64 };
+        let frames = match (&pending, &wave.lazy) { (Some(_), Some(a)) => a.info.duration.unwrap_or(0.) * wave.pcm.sample_rate as f64, _ => wave.frames() as f64 };
+        let end = if looping { FOREVER } else { delay + (frames / rate) as u64 };
         let base_gain = ctx.volume * wave.volume * ctx.class.base_volume * play.concurrency_scale;
         let spatial = ctx.atten.is_some() && play.position.is_some();
         self.stats.voices_started += 1;
@@ -879,6 +966,7 @@ impl Mixer {
             position: if spatial { play.position } else { None },
             fades: ctx.fades.clone(),
             env: ctx.env.clone(),
+            params: ctx.params.clone(),
             gl: 0.0,
             gr: 0.0,
             lpf: [0.0; 2],
@@ -887,6 +975,7 @@ impl Mixer {
             started: false,
             done: false,
             last_gain: 0.0,
+            pending,
         });
         end
     }
@@ -966,6 +1055,10 @@ impl Mixer {
         if let Some(a) = adj {
             gain *= a.cur;
         }
+        for (n, r, x0) in &v.params {
+            let x = adj.and_then(|a| a.floats.iter().find(|f| f.0 == *n)).map_or(*x0, |f| f.1);
+            gain *= r.gain(x);
+        }
         if let (Some(p), Some(a)) = (vpos, &vatt) {
             let rel = p.sub(self.listener.position);
             let dist_pan = rel.length();
@@ -1020,6 +1113,7 @@ impl Mixer {
         while done < frames {
             let n = (frames - done).min(BLOCK);
             self.drain_commands();
+            self.collect_decoded();
             self.fire_scheduled(n as u64);
             self.render_block(&mut out[done * 2..(done + n) * 2], n);
             done += n;
@@ -1067,7 +1161,7 @@ impl Mixer {
         let sr = self.out_rate as f32;
         let mut voices = std::mem::take(&mut self.voices);
         for v in &mut voices {
-            if v.done {
+            if v.done || v.pending.is_some() {
                 continue;
             }
             let (tl, tr, cutoff, pitch_mul) = self.voice_targets(v, dt);
@@ -1591,7 +1685,7 @@ mod tests {
         add(&e, "/Game/b", wave(0.4, 4800, 48000));
         let s = node(NodeKind::Switch { param: "FS_Surfaces".into() }, vec![player("/Game/a"), player("/Game/b")]);
         e.handle().add_cue("/Game/s", Arc::new(cue(s))).unwrap();
-        e.handle().play_cue("/Game/s", PlayParams { ints: vec![("FS_Surfaces".into(), 1)], ..Default::default() }).unwrap();
+        e.handle().play_cue("/Game/s", PlayParams { ints: vec![("FS_Surfaces".into(), 0)], ..Default::default() }).unwrap();
         assert!((e.render_offline(64, 1)[0] - 0.4).abs() < 1e-5);
         e.render_offline(8000, 1);
         let fr = |a: f32, b: f32| FadeRange { fade_in_start: a, fade_in_end: a, fade_out_start: b, fade_out_end: b + 0.0001, volume: 1.0 };
@@ -1599,6 +1693,22 @@ mod tests {
         e.handle().add_cue("/Game/p", Arc::new(cue(p))).unwrap();
         e.handle().play_cue("/Game/p", PlayParams { floats: vec![("P".into(), 0.0)], ..Default::default() }).unwrap();
         assert!((e.render_offline(64, 1)[0] - 0.2).abs() < 1e-5, "only the first input is active at 0");
+    }
+
+    #[test]
+    fn param_crossfade_follows_live_parameter_updates() {
+        let mut e = engine();
+        add(&e, "/Game/a", wave(0.2, 48000, 48000));
+        add(&e, "/Game/b", wave(0.4, 48000, 48000));
+        let fr = |a: f32, b: f32| FadeRange { fade_in_start: a, fade_in_end: a, fade_out_start: b, fade_out_end: b + 0.0001, volume: 1.0 };
+        let p = node(NodeKind::ParamCrossFade { param: "P".into(), inputs: vec![fr(-1.0, 0.5), fr(0.5, 2.0)] }, vec![player("/Game/a"), player("/Game/b")]);
+        e.handle().add_cue("/Game/p", Arc::new(cue(p))).unwrap();
+        let id = e.handle().play_cue("/Game/p", PlayParams { floats: vec![("P".into(), 0.0)], ..Default::default() }).unwrap();
+        assert!((e.render_offline(64, 1)[0] - 0.2).abs() < 1e-5);
+        e.handle().adjust_play(id, crate::playadj::Adjust { floats: vec![("P".into(), 1.0)], ..Default::default() });
+        e.render_offline(4800, 1);
+        let o = e.render_offline(64, 1);
+        assert!((o[0] - 0.4).abs() < 1e-3, "{}", o[0]);
     }
 
     #[test]

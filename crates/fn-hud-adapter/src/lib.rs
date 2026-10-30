@@ -44,9 +44,10 @@ pub struct HudInputs {
     pub level_offset_cm: [f32; 2],
     pub player_name: String,
     pub teammates: Vec<fn_ui::screens::team_info::TeamMember>,
+    pub team_map: Vec<(u8, f32, f32, f32, bool)>,
 }
 impl Default for HudInputs {
-    fn default() -> Self { HudInputs { vitals: (100, 0), items: None, selected: 0, kills: 0, players_left: None, backpack: None, metal: 0, frame: HudFrameStats::default(), loading: None, ammo: None, equip: None, slot_cooldowns: [None; 6], firearm_reticle: None, firearm_hit: false, level_offset_cm: [0.; 2], player_name: String::new(), teammates: Vec::new() } }
+    fn default() -> Self { HudInputs { vitals: (100, 0), items: None, selected: 0, kills: 0, players_left: None, backpack: None, metal: 0, frame: HudFrameStats::default(), loading: None, ammo: None, equip: None, slot_cooldowns: [None; 6], firearm_reticle: None, firearm_hit: false, level_offset_cm: [0.; 2], player_name: String::new(), teammates: Vec::new(), team_map: Vec::new() } }
 }
 
 /// Smoothed frames-per-second counter that feeds `HudInputs::frame` (the old runtime's `FpsMeter`).
@@ -125,12 +126,14 @@ pub fn hud_state(sim: &GameSim, settings: &Settings, inputs: &HudInputs) -> HudS
         ..HudState::default()
     };
     s.world.ammo = inputs.ammo.clone();
+    s.energy = sim.controller.enhanced.as_ref().filter(|e| e.tac.active() || e.tac.energy < fn_game::movement::enhanced::tac::ENERGY_MAX).map(|e| e.tac.energy);
     s.world.equip = inputs.equip;
     s.world.slot_cooldowns = inputs.slot_cooldowns; // WIDGETS3
     s.world.firearm_reticle = inputs.firearm_reticle.clone();
     s.world.firearm_hit = inputs.firearm_hit;
     s.player_name = inputs.player_name.clone();
     s.team = team_rows(&inputs.player_name, inputs.vitals, &inputs.teammates);
+    s.team_map = inputs.team_map.iter().map(|(i, x, z, yaw, dbno)| fn_ui::screens::hud_extra::TeamMapIcon { uv: minimap_uv(*x, *z, inputs.level_offset_cm), yaw_deg: ue_yaw_deg(*yaw), tint: fn_ui::screens::team_info::PLAYER_TINTS[(*i as usize).min(3)], dbno: *dbno }).collect();
     // an empty or missing selection falls back to the first filled slot (HudState::select never lands on an empty one)
     if s.items.get(s.selected).map_or(true, |i| i.is_none()) { s.selected = s.items.iter().position(|i| i.is_some()).unwrap_or(0); }
     s

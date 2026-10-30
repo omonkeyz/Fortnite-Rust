@@ -2,7 +2,6 @@
 //! assembled original programs ([`crate::program::assemble`]) and the material flags, and describes the vertex streams of the two vertex factories used here.
 use crate::material::{Material, MaterialFlags};
 use crate::program::{assemble, Assembled, ResKind, Stage, PIXEL_BINDING_BASE};
-use fn_dxbc::Opcode;
 use fn_pak::PakSet;
 use fn_render::fx::*;
 use std::collections::HashMap;
@@ -11,6 +10,7 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vf { MeshParticle, Local, Sprite, /// `TGPUSkinVertexFactory<false>` (the name is stored without the template brackets).
     Skin,
+    SkinExtra,
     /// GRASS (2026-10-06): `FInstancedStaticMeshVertexFactory` (instanced / hierarchical instanced static meshes: the foliage), the local vertex stream +
     /// the per-instance `FInstanceStream16` ([`ism_instance`], [`ISM_INSTANCE_STRIDE`]).
     InstancedStatic,
@@ -20,12 +20,13 @@ pub enum Vf { MeshParticle, Local, Sprite, /// `TGPUSkinVertexFactory<false>` (t
     /// ROADS / SPLINES (2026-10-08): `FSplineMeshVertexFactory` (UE4.16 SplineMeshComponent.cpp:109: LocalVertexFactory.usf compiled with USE_SPLINEDEFORM):
     /// the same vertex stream as [`Vf::Local`] (`FSplineMeshSceneProxy::InitVertexFactory` builds `FLocalVertexFactory::FDataType`, :120-260), the deformation
     /// in the vertex programs from the per-component `$Globals` (fn-app spline_mesh.rs).
-    SplineMesh }
+    SplineMesh,
+    BeamTrail }
 /// LANDSCAPE MATERIAL: bytes per landscape vertex in the FX path (`FLandscapeVertex` = 4 x uint8 `VET_UByte4`, LandscapeRender.cpp; carried as Float32x4 with the
 /// same integer values: the programs read ATTRIBUTE0 as a float4).
 pub const LANDSCAPE_VERTEX_STRIDE: u32 = 16;
 impl Vf {
-    pub fn type_name(self) -> &'static str { match self { Vf::MeshParticle => "FMeshParticleVertexFactory", Vf::Local => "FLocalVertexFactory", Vf::Sprite => "FParticleSpriteVertexFactory", Vf::Skin => "TGPUSkinVertexFactoryfalse", Vf::InstancedStatic => "FInstancedStaticMeshVertexFactory", Vf::Landscape => "FLandscapeVertexFactory", Vf::SplineMesh => "FSplineMeshVertexFactory" } }
+    pub fn type_name(self) -> &'static str { match self { Vf::MeshParticle => "FMeshParticleVertexFactory", Vf::Local => "FLocalVertexFactory", Vf::Sprite => "FParticleSpriteVertexFactory", Vf::Skin => "TGPUSkinVertexFactoryfalse", Vf::SkinExtra => "TGPUSkinVertexFactorytrue", Vf::InstancedStatic => "FInstancedStaticMeshVertexFactory", Vf::Landscape => "FLandscapeVertexFactory", Vf::SplineMesh => "FSplineMeshVertexFactory", Vf::BeamTrail => "FParticleBeamTrailVertexFactory" } }
 }
 
 /// GRASS: bytes per `FInstanceStream16` (UE4.16 StaticMeshResources.h:883; the D3D11 RHI supports `VET_Half2`, so `FStaticMeshInstanceData` uses the half
@@ -66,16 +67,29 @@ pub const INSTANCE_STRIDE: u32 = 128;
 pub mod inst_attr { pub const TRANSFORM0: u32 = 8; pub const TRANSFORM1: u32 = 9; pub const TRANSFORM2: u32 = 10; pub const SUBUV: u32 = 11; pub const SUBUV_LERP_REL_TIME: u32 = 12; pub const DYNAMIC_PARAMETER: u32 = 13; pub const COLOR: u32 = 14; pub const VELOCITY: u32 = 15; }
 
 /// Interleaved mesh vertex: position f32x3, TangentX / TangentZ / colour unorm8x4 as stored, then the UV sets.
-pub fn mesh_stride(vf: Vf, num_uv: usize) -> u32 { if vf == Vf::Landscape { return LANDSCAPE_VERTEX_STRIDE; } if vf == Vf::Sprite { return SPRITE_VERTEX_STRIDE; } if vf == Vf::Skin { return SKIN_VERTEX_STRIDE; } 24 + match vf { Vf::MeshParticle => 8 * num_uv as u32, _ => 16 * num_uv.div_ceil(2) as u32 } }
+pub fn mesh_stride(vf: Vf, num_uv: usize) -> u32 { if vf == Vf::BeamTrail { return BEAM_TRAIL_VERTEX_STRIDE; } if vf == Vf::Landscape { return LANDSCAPE_VERTEX_STRIDE; } if vf == Vf::Sprite { return SPRITE_VERTEX_STRIDE; } if vf == Vf::Skin { return SKIN_VERTEX_STRIDE; } if vf == Vf::SkinExtra { return SKIN_EXTRA_VERTEX_STRIDE; } 24 + match vf { Vf::MeshParticle => 8 * num_uv as u32, _ => 16 * num_uv.div_ceil(2) as u32 } }
 /// Bytes per GPU-skin vertex (`fn_matshader::mesh::STRIDE`): position f32x3, TangentX, TangentZ, bone indices (u8x4, section local), bone weights (unorm8x4), UV0 f32x2, vertex colour (BGRA).
 /// Vertex declaration of the vertex factories: at most 4 UV attributes (`ATTRIBUTE4..7`); the mesh-particle instance stream starts at `ATTRIBUTE8` (MeshParticleVertexFactory.usf), a mesh with more UV sets keeps the rest in its stride only.
 pub const MAX_UV_ATTRS: usize = 4;
 pub const SKIN_VERTEX_STRIDE: u32 = 40;
+pub const SKIN_EXTRA_VERTEX_STRIDE: u32 = 48;
 /// `FParticleSpriteVertex` + corner texture coordinate: Position+RelativeTime, OldPosition+ParticleId, Size.xy+Rotation+SubImageIndex, Color (4 x float4), TexCoord (float2).
 pub const SPRITE_VERTEX_STRIDE: u32 = 72;
 
+pub const BEAM_TRAIL_VERTEX_STRIDE: u32 = 96;
 pub fn vertex_buffers(vf: Vf, num_uv: usize, instanced: bool) -> Vec<FxVertexBuffer> {
+    if vf == Vf::BeamTrail {
+        return vec![FxVertexBuffer { stride: BEAM_TRAIL_VERTEX_STRIDE, instance: false, attrs: vec![FxAttr { location: 0, offset: 0, format: FxFmt::Float32x4 }, FxAttr { location: 1, offset: 16, format: FxFmt::Float32x3 }, FxAttr { location: 2, offset: 32, format: FxFmt::Float32x4 },
+            FxAttr { location: 3, offset: 48, format: FxFmt::Float32x4 }, FxAttr { location: 4, offset: 64, format: FxFmt::Float32x4 }, FxAttr { location: 5, offset: 80, format: FxFmt::Float32x4 }] }];
+    }
     if vf == Vf::Landscape { return vec![FxVertexBuffer { stride: LANDSCAPE_VERTEX_STRIDE, instance: false, attrs: vec![FxAttr { location: 0, offset: 0, format: FxFmt::Float32x4 }] }]; }
+    if vf == Vf::SkinExtra {
+        let mut v = vertex_buffers(Vf::Skin, num_uv, instanced);
+        v[0].stride = SKIN_EXTRA_VERTEX_STRIDE;
+        v[0].attrs.push(FxAttr { location: 14, offset: 40, format: FxFmt::Uint8x4 });
+        v[0].attrs.push(FxAttr { location: 15, offset: 44, format: FxFmt::Unorm8x4 });
+        return v;
+    }
     if vf == Vf::Skin { return vec![FxVertexBuffer { stride: SKIN_VERTEX_STRIDE, instance: false, attrs: vec![
         FxAttr { location: 0, offset: 0, format: FxFmt::Float32x3 }, FxAttr { location: 1, offset: 12, format: FxFmt::Unorm8x4 }, FxAttr { location: 2, offset: 16, format: FxFmt::Unorm8x4 }, FxAttr { location: 3, offset: 20, format: FxFmt::Uint8x4 },
         FxAttr { location: 4, offset: 24, format: FxFmt::Unorm8x4 }, FxAttr { location: 5, offset: 28, format: FxFmt::Float32x2 }, FxAttr { location: 13, offset: 36, format: FxFmt::Unorm8x4Bgra }] }]; }
@@ -180,7 +194,7 @@ pub fn load_mesh(set: &PakSet, fx: &mut FxRenderer, vf: Vf, object_path: &str) -
 
 /// Textures of the original packages uploaded with their stored mip chain.
 #[derive(Default)]
-pub struct TextureCache { map: HashMap<String, (FxTexId, TexInfo)>, dummy_cube: Option<FxTexId>, dummy_3d: Option<FxTexId>, dummy_2d: Option<FxTexId>, tracked: bool }
+pub struct TextureCache { map: HashMap<String, (FxTexId, TexInfo)>, dummy_cube: Option<FxTexId>, dummy_3d: Option<FxTexId>, dummy_2d: Option<FxTexId>, tracked: bool, defer: bool }
 #[derive(Clone, Debug)]
 pub struct TexInfo { pub filter: String, pub address_x: String, pub address_y: String, pub srgb: bool, pub width: usize, pub height: usize, pub levels: usize, pub compression: String }
 
@@ -229,15 +243,37 @@ fn decode_tiered(set: &PakSet, object_path: &str) -> Result<(Decoded, bool), Str
     decode_texture(set, object_path).map(|d| (d, false))
 }
 
-struct Upgrades { queue: std::collections::VecDeque<(FxTexId, String)>, ready: std::collections::VecDeque<(FxTexId, Decoded)>, ready_bytes: usize, enabled: bool, threads: usize, done: usize, bytes: u64 }
-static UPGRADES: std::sync::Mutex<Upgrades> = std::sync::Mutex::new(Upgrades { queue: std::collections::VecDeque::new(), ready: std::collections::VecDeque::new(), ready_bytes: 0, enabled: false, threads: 0, done: 0, bytes: 0 });
+struct Upgrades { queue: std::collections::VecDeque<(FxTexId, String)>, ready: std::collections::VecDeque<(FxTexId, Decoded)>, ready_bytes: usize, enabled: bool, threads: usize, done: usize, bytes: u64, busy: usize }
+static UPGRADES: std::sync::Mutex<Upgrades> = std::sync::Mutex::new(Upgrades { queue: std::collections::VecDeque::new(), ready: std::collections::VecDeque::new(), ready_bytes: 0, enabled: false, threads: 0, done: 0, bytes: 0, busy: 0 });
+static PLAY_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DEFERRED_IN_PLAY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub fn note_play_started() { PLAY_STARTED.store(true, std::sync::atomic::Ordering::Relaxed); }
+pub fn deferred_in_play() -> usize { DEFERRED_IN_PLAY.load(std::sync::atomic::Ordering::Relaxed) }
+fn note_deferred(object_path: &str) {
+    if !PLAY_STARTED.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    let n = DEFERRED_IN_PLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 24 || (n + 1) % 25 == 0 { eprintln!("[webtex] deferred in play #{}: {object_path}", n + 1); }
+}
+pub fn upgrades_idle() -> bool { let g = UPGRADES.lock().unwrap_or_else(|e| e.into_inner()); g.queue.is_empty() && g.ready.is_empty() && g.busy == 0 }
 static UPGRADE_WAKE: std::sync::Condvar = std::sync::Condvar::new();
-const UPGRADE_READY_CAP: usize = 128 << 20;
+const UPGRADE_READY_CAP: usize = 48 << 20;
 const UPGRADE_THREADS: usize = if cfg!(target_arch = "wasm32") { 4 } else { 2 };
 static UPGRADE_PAKS: std::sync::OnceLock<std::sync::Arc<PakSet>> = std::sync::OnceLock::new();
 pub fn set_upgrade_paks(set: std::sync::Arc<PakSet>) { let _ = UPGRADE_PAKS.set(set); }
 fn deferred_misses() -> bool { cfg!(target_arch = "wasm32") && UPGRADE_PAKS.get().is_some() }
 
+static TEX_SOURCE: std::sync::Mutex<Option<HashMap<usize, String>>> = std::sync::Mutex::new(None);
+fn register_source(fx: &mut FxRenderer, id: FxTexId, object_path: &str) {
+    if !cfg!(target_arch = "wasm32") || object_path.contains("Terrain") || object_path.contains("/Maps/") { return; }
+    if let Ok(mut g) = TEX_SOURCE.lock() { g.get_or_insert_with(HashMap::new).insert(id.0, object_path.to_owned()); }
+    fx.set_evictable(id);
+}
+fn queue_wanted(fx: &mut FxRenderer) {
+    let w = fx.take_wanted_textures();
+    if w.is_empty() { return; }
+    let paths: Vec<(FxTexId, String)> = TEX_SOURCE.lock().ok().and_then(|g| g.as_ref().map(|m| w.iter().filter_map(|id| m.get(&id.0).map(|p| (*id, p.clone()))).collect())).unwrap_or_default();
+    for (id, p) in paths { queue_upgrade(id, &p); }
+}
 fn queue_upgrade(id: FxTexId, object_path: &str) {
     let mut g = UPGRADES.lock().unwrap_or_else(|e| e.into_inner());
     if g.enabled { g.queue.push_front((id, object_path.to_owned())); } else { g.queue.push_back((id, object_path.to_owned())); }
@@ -257,13 +293,14 @@ fn upgrade_worker() {
         let (id, path) = {
             let mut g = UPGRADES.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if g.ready_bytes < UPGRADE_READY_CAP { if let Some(j) = g.queue.pop_front() { break j; } }
+                if g.ready_bytes < UPGRADE_READY_CAP { if let Some(j) = g.queue.pop_front() { g.busy += 1; break j; } }
                 g = UPGRADE_WAKE.wait(g).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let d = match crate::webtex::load(&path) { Some(Ok(d)) => d, _ => match UPGRADE_PAKS.get().map(|s| decode_texture_from_paks(s, &path)) { Some(Ok(d)) => d, _ => continue } };
+        let d = match crate::webtex::load(&path) { Some(Ok(d)) => d, _ => match UPGRADE_PAKS.get().map(|s| decode_texture_from_paks(s, &path)) { Some(Ok(d)) => d, _ => { let mut g = UPGRADES.lock().unwrap_or_else(|e| e.into_inner()); g.busy = g.busy.saturating_sub(1); continue } } };
         let n: usize = d.3.iter().map(|l| l.rgba8.len()).sum();
         let mut g = UPGRADES.lock().unwrap_or_else(|e| e.into_inner());
+        g.busy = g.busy.saturating_sub(1);
         g.ready_bytes += n;
         g.ready.push_back((id, d));
     }
@@ -278,6 +315,7 @@ pub fn enable_upgrades() {
 }
 /// Swaps in up to `budget` bytes of full-resolution textures read by the upgrade threads; returns how many were swapped.
 pub fn upgrade_step(fx: &mut FxRenderer, budget: usize) -> usize {
+    queue_wanted(fx);
     let mut n = 0;
     let mut used = 0usize;
     while used < budget {
@@ -343,8 +381,9 @@ pub fn decode_texture_from_paks(set: &PakSet, object_path: &str) -> Result<Decod
 /// loading screen (browser agent, 2026-10-06).
 /// BROWSER PORT (2026-10-07): 768 MB in the browser: the POI streaming prefetch (fn-web stream_web.rs) decodes the textures of the kinds it reads ahead
 /// here, so the main thread only uploads them (the shader maps no longer fill the heap: fn-fx cooked.rs decodes programs on first use).
-const PREDECODE_BUDGET: usize = if cfg!(target_arch = "wasm32") { 768 << 20 } else { 512 << 20 };
+const PREDECODE_BUDGET: usize = if cfg!(target_arch = "wasm32") { 256 << 20 } else { 512 << 20 };
 static PREDECODED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub fn predecoded_bytes() -> usize { PREDECODED_BYTES.load(std::sync::atomic::Ordering::Relaxed) }
 fn decoded_bytes(r: &Result<(Decoded, bool), String>) -> usize { r.as_ref().map_or(0, |((_, _, _, l), _)| l.iter().map(|x| x.rgba8.len()).sum()) }
 
 /// LOAD TIME (2026-10-06): decodes `object_path`'s stored mip chain (TEXTURE MEMORY: or copies its BC blocks, [`raw_bc_levels`]) on the calling (worker) thread so that a later [`TextureCache::load`] of the same
@@ -352,9 +391,11 @@ fn decoded_bytes(r: &Result<(Decoded, bool), String>) -> usize { r.as_ref().map_
 /// Bounded by [`PREDECODE_BUDGET`].
 pub fn predecode_texture(set: &PakSet, object_path: &str) { predecode(set, object_path, false) }
 pub fn predecode_texture_full(set: &PakSet, object_path: &str) { predecode(set, object_path, true) }
-fn predecode(set: &PakSet, object_path: &str, full: bool) {
+pub fn predecode_texture_urgent(set: &PakSet, object_path: &str) { predecode_inner(set, object_path, false, true) }
+fn predecode(set: &PakSet, object_path: &str, full: bool) { predecode_inner(set, object_path, full, false) }
+fn predecode_inner(set: &PakSet, object_path: &str, full: bool, urgent: bool) {
     use std::sync::atomic::Ordering::Relaxed;
-    if PREDECODED_BYTES.load(Relaxed) >= PREDECODE_BUDGET { return; }
+    if !urgent && PREDECODED_BYTES.load(Relaxed) >= PREDECODE_BUDGET { return; }
     if PREDECODED.lock().ok().and_then(|g| g.as_ref().map(|m| m.contains_key(object_path))).unwrap_or(false) { return; }
     let r = if full { decode_texture(set, object_path).map(|d| (d, false)).or_else(|_| decode_tiered(set, object_path)) } else { decode_tiered(set, object_path) };
     if let Ok(mut g) = PREDECODED.lock() {
@@ -375,17 +416,29 @@ fn take_predecoded(object_path: &str) -> Option<Result<(Decoded, bool), String>>
     Some(r)
 }
 
+static SHARED_TEX: std::sync::Mutex<Option<HashMap<(u64, String), (FxTexId, TexInfo)>>> = std::sync::Mutex::new(None);
+fn shared_get(fx: &FxRenderer, object_path: &str) -> Option<(FxTexId, TexInfo)> { SHARED_TEX.lock().ok()?.as_ref()?.get(&(fx.instance(), object_path.to_owned())).cloned() }
+fn shared_put(fx: &FxRenderer, object_path: &str, v: &(FxTexId, TexInfo)) {
+    if let Ok(mut g) = SHARED_TEX.lock() { g.get_or_insert_with(HashMap::new).entry((fx.instance(), object_path.to_owned())).or_insert_with(|| v.clone()); }
+    if let Ok(mut g) = UPLOADED.lock() { g.get_or_insert_with(Default::default).insert(object_path.to_owned()); }
+}
+
 impl TextureCache {
     pub fn tracked() -> TextureCache { TextureCache { tracked: true, ..Default::default() } }
+    pub fn deferred() -> TextureCache { TextureCache { defer: true, ..Default::default() } }
     pub fn load(&mut self, set: &PakSet, fx: &mut FxRenderer, object_path: &str) -> Result<(FxTexId, TexInfo), String> {
-        if let Some(t) = self.map.get(object_path) { return Ok(t.clone()); }
+        if let Some(t) = self.map.get(object_path) { if PREDECODED_BYTES.load(std::sync::atomic::Ordering::Relaxed) > 0 { let _ = take_predecoded(object_path); } return Ok(t.clone()); }
+        if let Some(t) = shared_get(fx, object_path) { let _ = take_predecoded(object_path); self.map.insert(object_path.to_owned(), t.clone()); return Ok(t); }
         let pre = take_predecoded(object_path);
-        if pre.is_none() && self.tracked && deferred_misses() {
-            let info = TexInfo { filter: "TF_Default".into(), address_x: "TA_Wrap".into(), address_y: "TA_Wrap".into(), srgb: false, width: 4, height: 4, levels: 1, compression: String::new() };
-            let id = fx.create_texture(&FxTextureDesc { label: object_path.rsplit('.').next().unwrap_or(object_path).to_owned(), dim: FxTexDim::D2, srgb: false, levels: vec![FxLevel { width: 4, height: 4, depth: 1, rgba8: [128u8, 128, 128, 255].repeat(16) }], format: FxTexFormat::Rgba8 });
+        if pre.is_none() && (self.tracked || self.defer) && deferred_misses() {
+            let info = crate::webtex::index().and_then(|i| i.find(object_path)).map(|e| e.info.clone()).unwrap_or_else(|| TexInfo { filter: "TF_Default".into(), address_x: "TA_Wrap".into(), address_y: "TA_Wrap".into(), srgb: false, width: 4, height: 4, levels: 1, compression: String::new() });
+            note_deferred(object_path);
+            let id = fx.create_texture(&FxTextureDesc { label: object_path.rsplit('.').next().unwrap_or(object_path).to_owned(), dim: FxTexDim::D2, srgb: info.srgb, levels: vec![FxLevel { width: 4, height: 4, depth: 1, rgba8: [128u8, 128, 128, 255].repeat(16) }], format: FxTexFormat::Rgba8 });
             queue_upgrade(id, object_path);
+            if self.tracked { register_source(fx, id, object_path); }
             if let Ok(mut g) = UPLOADED.lock() { g.get_or_insert_with(Default::default).insert(object_path.to_owned()); }
             self.map.insert(object_path.to_owned(), (id, info.clone()));
+            shared_put(fx, object_path, &(id, info.clone()));
             return Ok((id, info));
         }
         let ((label, info, format, levels), upgrade) = match pre { Some(r) => r?, None => { let t0 = std::time::Instant::now(); let r = decode_tiered(set, object_path)?; let ms = t0.elapsed().as_secs_f32() * 1000.; if ms > 20. { eprintln!("[texmiss] {} {object_path} {ms:.0} ms, predecoded {} MB", if self.tracked { "statics" } else { "other" }, PREDECODED_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20); } r } };
@@ -393,8 +446,10 @@ impl TextureCache {
         let (format, levels) = if format.is_bc() && !fx.accepts_bc(FxTexDim::D2, levels[0].width, levels[0].height) { (FxTexFormat::Rgba8, decode_bc_levels(format, &levels).map_err(|e| format!("{label}: {e}"))?) } else { (format, levels) };
         let id = fx.create_texture(&FxTextureDesc { label, dim: FxTexDim::D2, srgb: info.srgb, levels, format });
         if upgrade { queue_upgrade(id, object_path); }
+        if self.tracked { register_source(fx, id, object_path); }
         if self.tracked { if let Ok(mut g) = UPLOADED.lock() { g.get_or_insert_with(Default::default).insert(object_path.to_owned()); } }
         self.map.insert(object_path.to_owned(), (id, info.clone()));
+        shared_put(fx, object_path, &(id, info.clone()));
         Ok((id, info))
     }
     /// `GWhiteTexture` (`FColoredTexture<255,255,255,255>`, UE4.16 RenderUtils.cpp:208, 1x1 RGBA8 white): what `FUniformExpressionSet::FillUniformBuffer` binds for
@@ -516,7 +571,7 @@ impl MaterialGpu {
         crate::uniform::write_per_frame(&mut floats, &mat.uniform, &mat.overrides, &g.params, g.slot, t);
         write_base_pass_velocity(&mut floats, g, prev_local_to_world);
         write_instancing(&mut floats, g, &InstancingParams::default()); // GRASS: an instanced program without batch data draws as SetMesh without user data
-        Some(floats.iter().flat_map(|f| f.to_le_bytes()).collect())
+        Some(crate::view::f32_bytes(&floats))
     }
     /// GRASS: [`Self::vs_globals_bytes`] of an `FInstancedStaticMeshVertexFactory` program for one batch element: + the vertex factory's `SetMesh` values.
     pub fn vs_globals_bytes_instanced(&self, mat: &Material, t: crate::uniform::MaterialTime, prev_local_to_world: Option<glam::Mat4>, inst: &InstancingParams) -> Option<Vec<u8>> {
@@ -525,7 +580,7 @@ impl MaterialGpu {
         crate::uniform::write_per_frame(&mut floats, &mat.uniform, &mat.overrides, &g.params, g.slot, t);
         write_base_pass_velocity(&mut floats, g, prev_local_to_world);
         write_instancing(&mut floats, g, inst);
-        Some(floats.iter().flat_map(|f| f.to_le_bytes()).collect())
+        Some(crate::view::f32_bytes(&floats))
     }
     /// Bind groups of this material that read `primitive` as their `Primitive` uniform buffer.
     pub fn bind_variant(&self, fx: &mut FxRenderer, primitive: FxBufId, material: Option<FxBufId>) -> Vec<(u32, FxBindId)> { self.bind_variant_ext(fx, primitive, material, None) }
@@ -749,7 +804,20 @@ pub fn build_material_ext(set: &PakSet, fx: &mut FxRenderer, cache: &mut Texture
 /// natively, verification/first_use/run5), the blueprint MID per piece class, the instances of one parent. The output is a pure function of the key.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct AsmKey { map: String, vf: &'static str, vs: usize, ps: Option<usize>, clip: Option<usize>, kind: u8, inst: bool, prelude: u64 }
-static ASSEMBLED: std::sync::Mutex<Option<HashMap<AsmKey, (std::sync::Arc<Assembled>, Option<u32>)>>> = std::sync::Mutex::new(None);
+static ASSEMBLED: std::sync::Mutex<Option<HashMap<AsmKey, (std::sync::Arc<Assembled>, std::sync::Arc<Vec<u8>>, Option<u32>)>>> = std::sync::Mutex::new(None);
+fn asm_meta(a: &Assembled) -> std::sync::Arc<Assembled> {
+    std::sync::Arc::new(Assembled { wgsl: String::new(), resources: a.resources.clone(), vs_inputs: a.vs_inputs.clone(), varyings: a.varyings.clone(), targets: a.targets, ps_uses_position: a.ps_uses_position })
+}
+fn asm_get(key: &AsmKey) -> Option<(std::sync::Arc<Assembled>, Option<u32>)> {
+    let (m, z, attr) = ASSEMBLED.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(key).cloned()))?;
+    let wgsl = String::from_utf8(miniz_oxide::inflate::decompress_to_vec(&z).ok()?).ok()?;
+    Some((std::sync::Arc::new(Assembled { wgsl, resources: m.resources.clone(), vs_inputs: m.vs_inputs.clone(), varyings: m.varyings.clone(), targets: m.targets, ps_uses_position: m.ps_uses_position }), attr))
+}
+fn asm_put(key: AsmKey, a: &Assembled, attr: Option<u32>) {
+    let mut z = miniz_oxide::deflate::compress_to_vec(a.wgsl.as_bytes(), 1);
+    z.shrink_to_fit();
+    if let Ok(mut g) = ASSEMBLED.lock() { g.get_or_insert_with(HashMap::new).insert(key, (asm_meta(a), std::sync::Arc::new(z), attr)); }
+}
 
 struct AsmOut<'a> { vs: &'a crate::cooked::Program, ps_opt: Option<&'a crate::cooked::Program>, clip: Option<&'a crate::cooked::Program>, lit: bool, scene: bool, asm: std::sync::Arc<Assembled>, inst_attr: Option<u32> }
 static SCENE_PRELUDE: std::sync::Mutex<Option<std::sync::Arc<String>>> = std::sync::Mutex::new(None);
@@ -773,7 +841,7 @@ fn assembled<'a>(mat: &'a Material, vf: Vf, vs_type: &str, ps_type: &str, shadow
     // MIRRORFIX: a shader map without it was compiled `WritesEveryPixel` (opaque): UE's depth pass then draws the default material's position-only VS with no
     // pixel shader (DepthRendering.cpp:652-669) and nothing clips, so the draw goes on unclipped instead of failing (logged; `Material::load` now resolves the
     // instance's real blend mode and shader map, the cause of the old `Wood_lvl1_Static` failure).
-    let clip = match ps_opt { Some(ps) if shadow.is_none() && mat.flags.blend == "BLEND_Masked" && !ps.shader.body().any(|i| i.op == Opcode::Discard) => {
+    let clip = match ps_opt { Some(ps) if shadow.is_none() && mat.flags.blend == "BLEND_Masked" && !ps.discards => {
         let d = mat.cooked.find(vf.type_name(), "FDepthOnlyPS");
         if d.is_none() && log { eprintln!("[fx] {}: masked flags but the shader map has no FDepthOnlyPS (compiled WritesEveryPixel): drawn unclipped like UE's position-only depth path", mat.path); }
         d
@@ -791,7 +859,7 @@ fn assembled<'a>(mat: &'a Material, vf: Vf, vs_type: &str, ps_type: &str, shadow
     let key_i = AsmKey { map: mat.shader_map_package.clone(), vf: vf.type_name(), vs: vs.stream, ps: ps_opt.map(|p| p.stream), clip: clip.map(|c| c.stream), kind, inst: false, prelude: scene_prelude.as_deref().map_or(0, |p| { use std::hash::{Hash, Hasher}; let mut h = std::collections::hash_map::DefaultHasher::new(); p.hash(&mut h); h.finish() }) };
     let key = key_i.clone();
     // `FN_FX_NO_ASM_CACHE=1`: translate every time (A/B check of the cache)
-    let cached = if fn_live::var_os("FN_FX_NO_ASM_CACHE").is_some() { None } else { ASSEMBLED.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&key).map(|x| x.0.clone()))) };
+    let cached = if fn_live::var_os("FN_FX_NO_ASM_CACHE").is_some() { None } else { asm_get(&key).map(|x| x.0) };
     let asm: std::sync::Arc<Assembled> = match cached {
         Some(a) => a,
         None => {
@@ -803,13 +871,13 @@ fn assembled<'a>(mat: &'a Material, vf: Vf, vs_type: &str, ps_type: &str, shadow
                 },
                 _ => crate::program::assemble_shadow(vs, ps_opt, FX_SHADOW_WGSL)?,
             });
-            if let Ok(mut g) = ASSEMBLED.lock() { g.get_or_insert_with(HashMap::new).insert(key, (a.clone(), None)); }
+            asm_put(key, &a, None);
             a
         }
     };
     // INSTANCING (2026-10-07): the module with its `Primitive` cbuffers read per instance (`crate::program::instance_primitive`), and the instance id's attribute
     let ikey = AsmKey { inst: true, ..key_i };
-    if instance_primitive { if let Some(a) = ASSEMBLED.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&ikey).cloned())) { return Ok(AsmOut { vs, ps_opt, clip, lit, scene, asm: a.0.clone(), inst_attr: a.1 }); } }
+    if instance_primitive { if let Some(a) = asm_get(&ikey) { return Ok(AsmOut { vs, ps_opt, clip, lit, scene, asm: a.0, inst_attr: a.1 }); } }
     let (asm, inst_attr) = if instance_primitive {
         let prog_of = |st: Stage| match st { Stage::Vertex => Some(vs), Stage::Pixel => ps_opt, Stage::ClipPixel => clip };
         let prim: Vec<String> = asm.resources.iter().filter(|r| r.kind == ResKind::Uniform && prog_of(r.stage).and_then(|p| p.uniform_buffer_names.as_ref()).and_then(|n| n.get(r.slot as usize)).is_some_and(|n| n == "Primitive"))
@@ -820,7 +888,7 @@ fn assembled<'a>(mat: &'a Material, vf: Vf, vs_type: &str, ps_type: &str, shadow
         let prev_name = prev.map(|p| (format!("vcb{}", p.buffer_index), (p.float_index() / 4) as u32));
         let (wgsl, attr) = crate::program::instance_primitive(&asm, &prim, prev_name.as_ref().map(|(n, r)| (n.as_str(), *r))).map_err(|e| format!("{}: not instanced ({e})", mat.path))?;
         let a = std::sync::Arc::new(Assembled { wgsl, resources: asm.resources.clone(), vs_inputs: asm.vs_inputs.clone(), varyings: asm.varyings.clone(), targets: asm.targets, ps_uses_position: asm.ps_uses_position });
-        if let Ok(mut g) = ASSEMBLED.lock() { g.get_or_insert_with(HashMap::new).insert(ikey, (a.clone(), Some(attr))); }
+        asm_put(ikey, &a, Some(attr));
         (a, Some(attr))
     } else { (asm, None) };
     Ok(AsmOut { vs, ps_opt, clip, lit, scene, asm, inst_attr })
@@ -901,7 +969,7 @@ pub fn build_material_layout(set: &PakSet, fx: &mut FxRenderer, cache: &mut Text
                     let mut floats = vec![0f32; sg.float4s * 4];
                     crate::uniform::write_per_frame(&mut floats, &mat.uniform, &mat.overrides, &sg.params, sg.slot, crate::uniform::MaterialTime::default());
                     write_base_pass_velocity(&mut floats, &sg, None); write_instancing(&mut floats, &sg, &InstancingParams::default()); write_landscape_ps(&mut floats, &sg); // GRASS: instanced VF defaults
-                    fx.write_buffer(b, &floats.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
+                    fx.write_buffer(b, &crate::view::f32_bytes(&floats));
                     if r.stage == Stage::Pixel && per_frame.is_none() { per_frame = Some((b, 0, r.size as usize)); }
                     globals.push(sg);
                 }
@@ -1022,10 +1090,15 @@ pub fn build_material_layout(set: &PakSet, fx: &mut FxRenderer, cache: &mut Text
         }
     }
     let _ = PIXEL_BINDING_BASE;
+    let mut wgsl = asm.wgsl.clone();
+    if cfg!(target_arch = "wasm32") {
+        let n_groups = if lit { 4 } else { 3 };
+        merge_equal_samplers(&mut wgsl, &mut layouts, &mut entries, n_groups, WEB_FRAGMENT_SAMPLERS, &mut [&mut primitive_slots, &mut material_slots, &mut spritevf_slots, &mut vs_globals_slots], &mut landscape_slots);
+    }
     let translucent = blend != FxBlend::Opaque;
     let desc = FxPipelineDesc {
         label: format!("fx {} {}", mat.base_path.rsplit('.').next().unwrap_or(""), vf.type_name()),
-        wgsl: asm.wgsl.clone(), vs_entry: "vs_main".into(), fs_entry: "fs_main".into(),
+        wgsl, vs_entry: "vs_main".into(), fs_entry: "fs_main".into(),
         vertex_buffers: { let mut v = vertex_layout.unwrap_or_else(|| vertex_buffers(vf, num_uv, instanced)); if let Some(l) = inst_attr { v.push(FxVertexBuffer { stride: 4, instance: true, attrs: vec![FxAttr { location: l, offset: 0, format: FxFmt::Uint32 }] }); } v }, // INSTANCING: the instance ids
         groups: layouts.iter().take(if lit { 4 } else { 3 }).cloned().collect(),
         // DEPTH TEST (water agent, 2026-10-07): `bDisableDepthTest` is read only by the TRANSLUCENT pass (`FTranslucencyDrawingPolicyFactory::DrawMesh`,
@@ -1063,7 +1136,7 @@ pub fn build_material_layout(set: &PakSet, fx: &mut FxRenderer, cache: &mut Text
     let mut binds = vec![];
     for (g, e) in entries.iter().enumerate().take(if lit { 4 } else { 3 }) { binds.push((g as u32, fx.create_bind_group(pipe, g as u32, e.clone()))); }
     fx.write_buffer(material_buf, &crate::view::bytes(&packed.cb));
-    Ok(MaterialGpu { pipe, binds, material_buf, material_registers: packed.registers, per_frame, globals, vs_globals_slots, assembled: asm, flags, translucent, entries: entries.into_iter().collect(), primitive_slots, material_slots, spritevf_slots, group_count: if lit { 4 } else { 3 }, vs_fog, landscape_slots })
+    Ok(MaterialGpu { pipe, binds, material_buf, material_registers: packed.registers, per_frame, globals, vs_globals_slots, assembled: asm_meta(&asm), flags, translucent, entries: entries.into_iter().collect(), primitive_slots, material_slots, spritevf_slots, group_count: if lit { 4 } else { 3 }, vs_fog, landscape_slots })
 }
 
 
@@ -1082,13 +1155,13 @@ impl MaterialGpu {
         if let Some(g) = self.globals.iter().find(|g| !g.vertex) {
             let mut floats = vec![0f32; g.float4s * 4];
             crate::uniform::write_per_frame(&mut floats, &mat.uniform, &mat.overrides, &g.params, g.slot, crate::uniform::MaterialTime::single(time)); write_landscape_ps(&mut floats, g);
-            return Some((g.buf, floats.iter().flat_map(|f| f.to_le_bytes()).collect()));
+            return Some((g.buf, crate::view::f32_bytes(&floats)));
         }
         let (buf, base, size) = self.per_frame?;
         let (scalars, _) = crate::uniform::evaluate_per_frame(&mat.uniform, &mat.overrides, time);
         let mut floats = vec![0f32; size * 4];
         for (i, v) in scalars.iter().enumerate() { if let Some(s) = floats.get_mut(base + i) { *s = *v; } }
-        Some((buf, floats.iter().flat_map(|f| f.to_le_bytes()).collect()))
+        Some((buf, crate::view::f32_bytes(&floats)))
     }
     /// Every material-owned globals buffer of this frame (pixel AND vertex stage, scalars, vectors and the previous-frame expressions) at the UE material times
     /// `t` (world time / real time / world delta, ShaderBaseClasses.cpp:287). The vertex buffer written here is the material's own (no per-primitive velocity
@@ -1099,7 +1172,7 @@ impl MaterialGpu {
             let mut floats = vec![0f32; g.float4s * 4];
             crate::uniform::write_per_frame(&mut floats, &mat.uniform, &mat.overrides, &g.params, g.slot, t);
             if g.vertex { write_base_pass_velocity(&mut floats, g, None); write_instancing(&mut floats, g, &InstancingParams::default()); } else { write_landscape_ps(&mut floats, g); }
-            out.push((g.buf, floats.iter().flat_map(|f| f.to_le_bytes()).collect()));
+            out.push((g.buf, crate::view::f32_bytes(&floats)));
         }
         if self.globals.iter().all(|g| g.vertex) { if let Some(w) = self.per_frame_write(mat, t.world) { out.push(w); } } // inferred fallback
         out
@@ -1172,7 +1245,7 @@ impl MaterialGpu {
                 put(s.shadow_params, &[0., 1.]);
                 put(s.clamp_to_near_plane, &[0.]);
             }
-            out.push((g.buf, floats.iter().flat_map(|f| f.to_le_bytes()).collect()));
+            out.push((g.buf, crate::view::f32_bytes(&floats)));
         }
         out
     }
@@ -1317,7 +1390,7 @@ impl MaterialGpu {
         crate::uniform::write_per_frame(&mut floats, &mat.uniform, &mat.overrides, &g.params, g.slot, t);
         write_base_pass_velocity(&mut floats, g, prev_local_to_world);
         write_landscape_vs(&mut floats, g, l);
-        Some(floats.iter().flat_map(|f| f.to_le_bytes()).collect())
+        Some(crate::view::f32_bytes(&floats))
     }
     /// LANDSCAPE MATERIAL: the bind groups of one landscape component: its Primitive buffer, its VS globals ([`Self::vs_globals_bytes_landscape`]), its
     /// `LandscapeParameters` uniform buffer, its heightmap (vertex stage, point sampler) and normal map (= the heightmap, pixel stage, `normal_sampler`).
@@ -1337,4 +1410,57 @@ impl MaterialGpu {
         }
         out
     }
+}
+
+pub const WEB_FRAGMENT_SAMPLERS: usize = 16;
+
+fn merge_equal_samplers(wgsl: &mut String, layouts: &mut [Vec<FxLayoutEntry>], entries: &mut [Vec<FxBindEntry>], n_groups: usize, limit: usize, slots: &mut [&mut Vec<(usize, usize)>], landscape: &mut Vec<(usize, usize, LandscapeSlot)>) {
+    let is_sampler = |e: &FxLayoutEntry| matches!(e.ty, FxBindTy::Sampler { .. });
+    let count = |w: &str, ls: &[Vec<FxLayoutEntry>]| { let tag = format!("@group({}) ", fn_render::fx::FX_SCENE_GROUP); ls.iter().take(n_groups).flatten().filter(|e| e.fragment && matches!(e.ty, FxBindTy::Sampler { .. })).count() + w.lines().map(str::trim_start).filter(|l| l.starts_with(&tag) && l.contains(" var ") && l.contains(": sampler")).count() };
+    if count(wgsl, layouts) <= limit { return; }
+    let var_name = |wgsl: &str, g: usize, b: u32| -> Option<String> {
+        let tag = format!("@group({g}) @binding({b}) var ");
+        wgsl.lines().map(str::trim_start).find(|l| l.starts_with(&tag) && l.contains(": sampler;")).and_then(|l| l[tag.len()..].split(':').next()).map(|n| n.trim().to_string())
+    };
+    for g in 0..n_groups.min(layouts.len()).min(entries.len()) {
+        if layouts[g].len() != entries[g].len() { continue; }
+        let mut i = 0;
+        while i < layouts[g].len() {
+            if count(wgsl, layouts) <= limit { return; }
+            let (l, e) = (layouts[g][i].clone(), entries[g][i].clone());
+            let FxRes::Sampler(desc) = e.res else { i += 1; continue };
+            if !is_sampler(&l) || landscape.iter().any(|x| x.0 == g && x.1 == i) { i += 1; continue; }
+            let keep = (0..i).find(|&k| layouts[g][k].ty == l.ty && layouts[g][k].vertex == l.vertex && layouts[g][k].fragment == l.fragment && matches!(entries[g][k].res, FxRes::Sampler(d) if d == desc) && !landscape.iter().any(|x| x.0 == g && x.1 == k));
+            let (Some(k), Some(dup)) = (keep, var_name(wgsl, g, l.binding)) else { i += 1; continue };
+            let Some(kept) = var_name(wgsl, g, layouts[g][k].binding) else { i += 1; continue };
+            let decl = format!("@group({g}) @binding({}) var {dup}:", l.binding);
+            let mut out = String::with_capacity(wgsl.len());
+            for line in wgsl.split_inclusive('\n') { if !line.trim_start().starts_with(&decl) { out.push_str(line); } }
+            *wgsl = replace_word(&out, &dup, &kept);
+            layouts[g].remove(i);
+            entries[g].remove(i);
+            for v in slots.iter_mut() { for s in v.iter_mut() { if s.0 == g && s.1 > i { s.1 -= 1; } } }
+            for s in landscape.iter_mut() { if s.0 == g && s.1 > i { s.1 -= 1; } }
+        }
+    }
+    if count(wgsl, layouts) > limit {
+        let descs: Vec<String> = entries.iter().enumerate().take(n_groups).flat_map(|(g, v)| v.iter().filter_map(move |e| if let FxRes::Sampler(d) = e.res { Some(format!("g{g}b{} {:?}", e.binding, d)) } else { None })).collect();
+        let decls: Vec<&str> = wgsl.lines().map(str::trim_start).filter(|l| l.starts_with("@group(") && l.contains(": sampler;")).collect();
+        eprintln!("[fx samplers] still {} > {limit}: {descs:?} decls {decls:?}", count(wgsl, layouts));
+    }
+}
+
+fn replace_word(s: &str, from: &str, to: &str) -> String {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find(from) {
+        let before = rest[..p].chars().next_back();
+        let after = rest[p + from.len()..].chars().next();
+        out.push_str(&rest[..p]);
+        if before.map_or(false, ident) || after.map_or(false, ident) { out.push_str(from); } else { out.push_str(to); }
+        rest = &rest[p + from.len()..];
+    }
+    out.push_str(rest);
+    out
 }

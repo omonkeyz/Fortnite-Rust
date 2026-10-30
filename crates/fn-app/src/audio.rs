@@ -347,7 +347,9 @@ impl GameplayAudio {
         if !self.ambience_started { self.ambience_started = true; sink.set_ambience(true); } // the island bed starts when the world is up (as soon as its loops are decoded)
         self.buf.clear();
         self.det.observe(g, self.table.as_deref().or_else(|| STEP_TABLE.get()), dt, &mut self.buf);
+        let enhanced_steps = crate::enhanced_sound::replaces_steps(g);
         for m in &self.buf {
+            if enhanced_steps && matches!(m, AudioMoment::Step { .. }) { continue; }
             let e = to_sound(m);
             if let SoundEvent::PropHit { sound, .. } | SoundEvent::PropDeath { sound, .. } = &e { if fn_live::var("FN_HARVEST_AUDIO_LOG").is_ok_and(|v| v == "1") { eprintln!("[harvest audio] {} {}: {:?}", if matches!(e, SoundEvent::PropDeath { .. }) { "death" } else { "hit" }, sound.id, fn_audio_sink::crack_event_cues(&e)); } }
             sink.event(e);

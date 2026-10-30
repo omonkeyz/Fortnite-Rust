@@ -28,13 +28,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const within = (p, ms, what) => Promise.race([p, sleep(ms).then(() => { throw new Error('no answer within ' + ms + ' ms: ' + what); })]);
 
 const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fnweb-script-'));
-const server = await startServer({ www: path.join(REPO, 'dist', 'web'), port: 8795 });
+const server = await startServer({ www: opt('--www', null) ? path.resolve(opt('--www')) : path.join(REPO, 'dist', 'web'), port: 8795 });
 const lines = [];
 let ctx = null, status = 0, cdp = null;
 try {
     ctx = await chromium.launchPersistentContext(profileDir, {
         executablePath: BRAVE, headless: true, viewport: null,
-        args: ['--headless=new', `--window-size=${W},${H}`, '--enable-unsafe-webgpu', '--no-first-run', '--no-default-browser-check', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'],
+        args: ['--headless=new', '--mute-audio', `--window-size=${W},${H}`, '--enable-unsafe-webgpu', '--no-first-run', '--no-default-browser-check', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'],
     });
     const page = ctx.pages()[0] || await ctx.newPage();
     page.on('console', (m) => lines.push(`[${((Date.now() - t0) / 1000).toFixed(2)}] [page:${m.type()}] ${m.text()}`));

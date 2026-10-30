@@ -33,7 +33,7 @@ pub fn keys_from_winit(event: &winit::event::KeyEvent, shift: bool) -> Vec<fn_co
     use fn_console::Key;
     use winit::keyboard::{Key as WKey, KeyCode, NamedKey, PhysicalKey};
     let text = || event.text.as_ref().map(|t| t.chars().filter(|c| (' '..='~').contains(c)).map(Key::Char).collect()).unwrap_or_default();
-    if let PhysicalKey::Code(KeyCode::F2) = event.physical_key { return vec![Key::ToggleConsole]; }
+    if let PhysicalKey::Code(KeyCode::Backquote) = event.physical_key { return vec![Key::ToggleConsole]; }
     if let WKey::Named(n) = &event.logical_key {
         let k = match n {
             NamedKey::Backspace => Key::Backspace, NamedKey::Delete => Key::Delete, NamedKey::ArrowLeft => Key::Left, NamedKey::ArrowRight => Key::Right,
@@ -133,6 +133,8 @@ pub fn apply(reqs: &[Request], arms: &mut Arms, cards: Option<&mut [Option<HudIt
             Request::GiveWeapon { .. } | Request::EquipWeapon { .. } => {} // handled by the app through `WeaponRuntime` (see `weapon_requests`)
             Request::SpawnPickup { .. } => {} // PICKUPS HOOK: handled by `pickups_hook::requests`
             Request::StartBus => {}
+            Request::Win => crate::kill_feed_hook::set_won(true),
+            Request::PlayEmote { ref query } => { if !crate::emote_hook::force_play(query, glam::Vec3::ZERO) { eprintln!("[emote] playemote: no emote item {query}"); } }
             Request::AddKillFeedMessage => crate::kill_feed_hook::add_cheat_messages(),
             Request::Die { ref cause } => match fn_ui::screens::kill_feed::DeathCause::parse(cause) { Some(c) => { crate::kill_feed_hook::force_local_death(c); } None => out.push((LineKind::Error, format!("unknown death cause {cause}"))) },
             Request::GiveGun { gun, select } => {
@@ -210,7 +212,7 @@ mod tests {
         eprintln!("catalog: {:?}\nnotes: {:?}", built.catalog.items.iter().map(|i| (&i.id, &i.name, i.rarity, i.max_stack)).collect::<Vec<_>>(), built.notes);
         assert_eq!(built.catalog.guns().count(), 3);
         assert!(built.catalog.items.iter().all(|i| !i.name.is_empty()));
-        assert!(built.catalog.items.iter().filter(|i| matches!(i.kind, ItemKind::Healable(_))).count() == 4);
+        assert!(built.catalog.items.iter().filter(|i| matches!(i.kind, ItemKind::Healable(_))).count() == 5);
         let mut sim = fn_game::GameSim::new();
         let mut con = Console::new(); con.open();
         let mut cards: [Option<HudItem>; 6] = Default::default();

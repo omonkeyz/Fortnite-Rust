@@ -62,6 +62,8 @@ pub enum Request {
     AddKillFeedMessage,
     Die { cause: String },
     StartBus,
+    Win,
+    PlayEmote { query: String },
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -162,6 +164,8 @@ pub fn execute(line: &str, env: &mut Env, flags: &mut Flags) -> Effects {
         "walk" => { env.sim.fly = fn_game::sim::FlyMode::Walk; fx.ok("walking (falls from where you are)"); }
         "addkillfeedmessage" => { fx.requests.push(Request::AddKillFeedMessage); fx.ok("five test lines added to the elimination feed"); }
         "startbus" => { fx.ok("a fresh Battle Bus takes off".to_owned()); fx.requests.push(Request::StartBus); }
+        "playemote" => { let q = args.join(" "); if q.is_empty() { fx.err("usage: playemote <emote>"); } else { fx.ok(format!("ServerPlayEmoteItem({q})")); fx.requests.push(Request::PlayEmote { query: q }); } }
+        "win" => { fx.ok("Victory Royale".to_owned()); fx.requests.push(Request::Win); }
         "die" => match args.first().map(|a| a.to_ascii_lowercase()).filter(|a| registry::DIE_ARGS.contains(&a.as_str())) { Some(a) => { fx.ok(format!("eliminated ({a})")); fx.requests.push(Request::Die { cause: a }); } None => usage_err(&mut fx, c) },
         other => fx.err(format!("'{other}' is registered but has no handler")),
     }
@@ -171,7 +175,7 @@ pub fn execute(line: &str, env: &mut Env, flags: &mut Flags) -> Effects {
 fn help(fx: &mut Effects, args: &[String]) {
     match args.first() {
         None => {
-            fx.info("commands (Tab completes, Up / Down = history, PageUp / PageDown = scroll, Esc / F2 closes; help <command> for details):");
+            fx.info("commands (Tab completes, Up / Down = history, PageUp / PageDown = scroll, Esc / ~ closes; help <command> for details):");
             for c in COMMANDS { fx.info(format!("  {} {}  - {}", c.name, c.usage, c.help).replace("  -", " -")); }
         }
         Some(n) => match registry::find(n) {
@@ -343,6 +347,7 @@ fn pos(fx: &mut Effects, s: &GameSim) {
     let f = s.feet();
     let (lo, hi) = s.world_box();
     fx.info(format!("feet x {:.2} y {:.2} z {:.2}, ground y {:.2} (metres, y up; the world is x {:.0}..{:.0}, z {:.0}..{:.0})", f.x, f.y, f.z, s.ground_y(f.x, f.z), lo.x, hi.x, lo.y, hi.y));
+    fx.info(format!("camera eye {:.3} {:.3} {:.3} forward {:.4} {:.4} {:.4}", s.cam_view.eye.x, s.cam_view.eye.y, s.cam_view.eye.z, s.cam_view.forward.x, s.cam_view.forward.y, s.cam_view.forward.z));
     fx.info(format!("yaw {:.1} pitch {:.1}  velocity {:.2} {:.2} (m/s)  vertical {:.2}  {}", s.yaw, s.pitch, s.controller.velocity.x, s.controller.velocity.y, s.controller.vertical_speed, if s.controller.airborne() { "airborne" } else { "grounded" }));
 }
 

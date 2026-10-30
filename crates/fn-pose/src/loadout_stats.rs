@@ -52,6 +52,7 @@ pub enum HealRule {
     Shield { shielding_amount: f32 },
     /// `GA_Athena_PurpleStuff`: always usable (cooldown permitting); one stack of a duration effect.
     Purple,
+    Throw { initial_speed: f32, gravity_scale: f32, projectile: String, activation_sound: Option<String> },
 }
 /// One `GameplayEffect` modifier: attribute name (`Healing`, `CurrentShield`) and its additive `ScalableFloat` magnitude (no curve in the data).
 #[derive(Clone, Debug, PartialEq)]
@@ -107,11 +108,12 @@ pub const HUD_PAK_TEXTURES: [&str; 12] = [
 ];
 
 /// Item definitions of every healing consumable in the 1.8 data (`/Game/Athena/Items/Consumables`: Bandage, Medkit, Shields, PurpleStuff).
-pub const HEALABLE_ITEMS: [&str; 4] = [
+pub const HEALABLE_ITEMS: [&str; 5] = [
     "/Game/Athena/Items/Consumables/Bandage/Athena_Bandage",
     "/Game/Athena/Items/Consumables/Medkit/Athena_Medkit",
     "/Game/Athena/Items/Consumables/Shields/Athena_Shields",
     "/Game/Athena/Items/Consumables/PurpleStuff/Athena_PurpleStuff",
+    "/Game/Athena/Items/Consumables/Grenade/Athena_Grenade",
 ];
 fn package_name(r: &str) -> &str { r.split('.').next().unwrap_or(r) }
 fn f32_of(p: &PropList, key: &str) -> Result<f32, String> { p.get(key).and_then(PropValue::as_f64).map(|v| v as f32).ok_or_else(|| format!("stat row lacks {key}")) }
@@ -242,6 +244,8 @@ pub fn healable_stats(src: &ClipSourceDir, item_path: &str, item_pkg: &Package, 
         "GA_Athena_Medkit" => (HealRule::Medkit { healing_amount: f32_of(&p, "HealingAmount")? }, "/Game/Athena/Items/Consumables/Bandage/GE_Athena_Bandage_Heal"),
         "GA_Athena_Shields" => (HealRule::Shield { shielding_amount: f32_of(&p, "ShieldingAmount")? }, "/Game/Athena/Items/Consumables/Shields/GE_Athena_Shields"),
         "GA_Athena_PurpleStuff" => (HealRule::Purple, "/Game/Athena/Items/Consumables/PurpleStuff/GE_Athena_PurpleStuff"),
+        "GA_Athena_Grenade" => (HealRule::Throw { initial_speed: f32_of(&p, "InitialSpeed")?, gravity_scale: f32_of(&p, "Athena_Grenade_Gravity")?,
+            projectile: ref_path(&pkg, &p, "Prj_Athena_Grenade").ok_or("GA_Athena_Grenade lacks Prj_Athena_Grenade")?, activation_sound: ref_path(&pkg, &p, "ActivationSound") }, ""),
         other => return Err(format!("unsupported healing ability {other}")),
     };
     let info = p.fields("MontageInfo").ok_or("ability lacks MontageInfo")?;
@@ -252,7 +256,7 @@ pub fn healable_stats(src: &ClipSourceDir, item_path: &str, item_pkg: &Package, 
     let cooldown = match ref_path(&pkg, &p, "CooldownGameplayEffectClass") { Some(c) => effect_def(src, package_name(&c))?.duration, None => None };
     Ok(HealableStats {
         item: item_path.to_owned(), name: package_name(item_path).rsplit('/').next().unwrap_or_default().to_owned(), ability: package_name(&ability).to_owned(), rule,
-        trigger_duration: f32_of(&p, "TriggerDuration")?, montage: package_name(&montage).to_owned(), montage_rate, cost,
-        effect: effect_def(src, effect_pkg)?, cooldown, max_stack: item.int("MaxStackSize").map_or(1, |v| v.max(1) as u32),
+        trigger_duration: if effect_pkg.is_empty() { 0. } else { f32_of(&p, "TriggerDuration")? }, montage: package_name(&montage).to_owned(), montage_rate, cost,
+        effect: if effect_pkg.is_empty() { EffectDef { class: String::new(), mods: vec![], duration: None, period: None } } else { effect_def(src, effect_pkg)? }, cooldown, max_stack: item.int("MaxStackSize").map_or(1, |v| v.max(1) as u32),
     })
 }

@@ -1,6 +1,6 @@
 diff -ruN a/src/api/device.rs b/src/api/device.rs
---- a/src/api/device.rs	2026-10-06 10:42:17.773444500 -0500
-+++ b/src/api/device.rs	2026-10-06 10:42:51.288787100 -0500
+--- a/src/api/device.rs	2026-10-25 21:12:40.768660100 -0500
++++ b/src/api/device.rs	2026-10-25 21:12:40.970721400 -0500
 @@ -258,6 +258,24 @@
          RenderPipeline { inner: pipeline }
      }
@@ -44,9 +44,82 @@ diff -ruN a/src/api/device.rs b/src/api/device.rs
 +    }
 +}
 diff -ruN a/src/backend/webgpu.rs b/src/backend/webgpu.rs
---- a/src/backend/webgpu.rs	2026-10-06 10:42:17.781713100 -0500
-+++ b/src/backend/webgpu.rs	2026-10-06 10:42:51.288263800 -0500
-@@ -1970,6 +1970,11 @@
+--- a/src/backend/webgpu.rs	2026-10-25 21:12:40.778049300 -0500
++++ b/src/backend/webgpu.rs	2026-10-25 21:13:18.192780400 -0500
+@@ -1291,6 +1291,7 @@
+ #[derive(Debug, Clone)]
+ pub struct WebBindGroup {
+     pub(crate) inner: webgpu_sys::GpuBindGroup,
++    fnweb_keep: Vec<Rc<FnwebLife>>,
+     /// Unique identifier for this BindGroup.
+     ident: crate::cmp::Identifier,
+ }
+@@ -1327,6 +1328,7 @@
+ pub struct WebBuffer {
+     /// The associated GPU buffer.
+     pub(crate) inner: webgpu_sys::GpuBuffer,
++    fnweb_life: Option<Rc<FnwebLife>>,
+     /// The mapped array buffer and mapped range.
+     mapping: Rc<RefCell<WebBufferMapState>>,
+     /// Unique identifier for this Buffer.
+@@ -1337,6 +1339,7 @@
+     /// Creates a new web buffer for the given Javascript object and description.
+     fn new(inner: webgpu_sys::GpuBuffer, desc: &crate::BufferDescriptor<'_>) -> Self {
+         Self {
++            fnweb_life: Some(Rc::new(FnwebLife(Some(FnwebRes::B(inner.clone()))))),
+             inner,
+             mapping: Rc::new(RefCell::new(WebBufferMapState {
+                 mapped_buffer: None,
+@@ -1391,10 +1394,40 @@
+     ///   this `WebTexture` is dropped, signalling that wgpu is done with the
+     ///   handle.
+     drop_guard: Option<Rc<DropGuard>>,
++    fnweb_life: Option<Rc<FnwebLife>>,
+     /// Unique identifier for this Texture.
+     ident: crate::cmp::Identifier,
+ }
+ 
++#[derive(Debug)]
++pub(crate) enum FnwebRes { T(webgpu_sys::GpuTexture), B(webgpu_sys::GpuBuffer) }
++#[derive(Debug)]
++pub(crate) struct FnwebLife(Option<FnwebRes>);
++std::thread_local! {
++    static FNWEB_PENDING: RefCell<Vec<(u64, FnwebRes)>> = const { RefCell::new(Vec::new()) };
++    static FNWEB_SUBMITS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
++}
++impl Drop for FnwebLife {
++    fn drop(&mut self) {
++        if let Some(r) = self.0.take() {
++            let s = FNWEB_SUBMITS.with(|c| c.get());
++            let _ = FNWEB_PENDING.try_with(|p| p.borrow_mut().push((s, r)));
++        }
++    }
++}
++fn fnweb_after_submit() {
++    let n = FNWEB_SUBMITS.with(|c| { c.set(c.get() + 1); c.get() });
++    let due: Vec<FnwebRes> = FNWEB_PENDING.with(|p| {
++        let mut p = p.borrow_mut();
++        if p.is_empty() || p[0].0 + 3 > n { return Vec::new(); }
++        let k = p.iter().position(|e| e.0 + 3 > n).unwrap_or(p.len());
++        p.drain(..k).map(|e| e.1).collect()
++    });
++    for r in due {
++        match r { FnwebRes::T(t) => t.destroy(), FnwebRes::B(b) => b.destroy() }
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct WebExternalTexture {
+     /// Unique identifier for this ExternalTexture.
+@@ -1876,6 +1909,7 @@
+         WebTexture {
+             inner: texture,
+             drop_guard: Some(Rc::new(DropGuard::new(drop_callback))),
++            fnweb_life: None,
+             ident: crate::cmp::Identifier::create(),
+         }
+         .into()
+@@ -1970,6 +2004,11 @@
              }
              #[cfg(feature = "wgsl")]
              crate::ShaderSource::Wgsl(ref code) => {
@@ -58,7 +131,30 @@ diff -ruN a/src/backend/webgpu.rs b/src/backend/webgpu.rs
                  let shader_module = webgpu_sys::GpuShaderModuleDescriptor::new(code);
                  Ok((
                      shader_module,
-@@ -2291,106 +2296,7 @@
+@@ -2194,6 +2233,14 @@
+         &self,
+         desc: &crate::BindGroupDescriptor<'_>,
+     ) -> dispatch::DispatchBindGroup {
++        let mut fnweb_keep: Vec<Rc<FnwebLife>> = Vec::new();
++        for e in desc.entries.iter() {
++            match e.resource {
++                crate::BindingResource::Buffer(crate::BufferBinding { buffer, .. }) => { if let Some(l) = &buffer.inner.as_webgpu().fnweb_life { fnweb_keep.push(l.clone()); } }
++                crate::BindingResource::TextureView(v) => { if let Some(l) = &v.texture.inner.as_webgpu().fnweb_life { fnweb_keep.push(l.clone()); } }
++                _ => {}
++            }
++        }
+         let mapped_entries = desc
+             .entries
+             .iter()
+@@ -2256,6 +2303,7 @@
+ 
+         WebBindGroup {
+             inner: bind_group,
++            fnweb_keep,
+             ident: crate::cmp::Identifier::create(),
+         }
+         .into()
+@@ -2291,106 +2339,7 @@
          &self,
          desc: &crate::RenderPipelineDescriptor<'_>,
      ) -> dispatch::DispatchRenderPipeline {
@@ -166,7 +262,40 @@ diff -ruN a/src/backend/webgpu.rs b/src/backend/webgpu.rs
          let render_pipeline = self.inner.create_render_pipeline(&mapped_desc).unwrap();
  
          WebRenderPipeline {
-@@ -4487,3 +4393,129 @@
+@@ -2486,6 +2435,7 @@
+ 
+         let texture = self.inner.create_texture(&mapped_desc).unwrap();
+         WebTexture {
++            fnweb_life: Some(Rc::new(FnwebLife(Some(FnwebRes::T(texture.clone()))))),
+             inner: texture,
+             drop_guard: None,
+             ident: crate::cmp::Identifier::create(),
+@@ -2847,6 +2797,7 @@
+             .collect::<Vec<webgpu_sys::GpuCommandBuffer>>();
+ 
+         self.inner.submit(&array);
++        fnweb_after_submit();
+ 
+         0
+     }
+@@ -4175,7 +4126,7 @@
+             present_modes: vec![wgt::PresentMode::Fifo],
+             alpha_modes: vec![wgt::CompositeAlphaMode::Opaque],
+             // Statically set to RENDER_ATTACHMENT for now. See https://gpuweb.github.io/gpuweb/#dom-gpucanvasconfiguration-usage
+-            usages: wgt::TextureUsages::RENDER_ATTACHMENT,
++            usages: wgt::TextureUsages::RENDER_ATTACHMENT | wgt::TextureUsages::COPY_SRC,
+         }
+     }
+ 
+@@ -4359,6 +4310,7 @@
+         let web_surface_texture = WebTexture {
+             inner: surface_texture,
+             drop_guard: None,
++            fnweb_life: None,
+             ident: crate::cmp::Identifier::create(),
+         };
+ 
+@@ -4487,3 +4439,129 @@
  
      JsValue::from(obj)
  }

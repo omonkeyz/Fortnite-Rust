@@ -289,7 +289,15 @@ impl Driver for Script {
     fn arms(&mut self, frame: u32) -> crate::arms::ArmsInput { self.arms_at(frame) }
     fn assume_unrecovered(&self) -> bool { self.assume }
     fn standin_gun(&self) -> bool { self.standin_gun }
-    fn shots(&mut self, frame: u32, _g: &GameSim) -> Vec<String> { self.shots_at(frame) }
+    fn shots(&mut self, frame: u32, _g: &GameSim) -> Vec<String> {
+        let shots = self.shots_at(frame);
+        if cfg!(target_arch = "wasm32") && !shots.is_empty() {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) { eprintln!("[script] shot {} at frame {frame} skipped: the browser build cannot read the GPU back synchronously on the main thread (mapAsync resolves only after the frame returns), so script shots are off there; take page screenshots from the driver instead", shots[0]); }
+            return vec![];
+        }
+        shots
+    }
     fn resize(&self, frame: u32) -> Option<(u32, u32)> { self.resize_at(frame) }
     fn quit(&self, frame: u32) -> bool { self.quit_at(frame) }
     fn inventory(&mut self, frame: u32) -> Vec<InvCmd> { self.inventory_at(frame) }

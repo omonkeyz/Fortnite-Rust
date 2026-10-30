@@ -130,9 +130,9 @@ pub fn eval(keys: &[Key], t: f32) -> f32 {
 pub const OUTRO_LEN: f32 = 1.0;
 pub const OUTRO_HBOX_TY: [Key; 2] = [k(0., 0.), k(1., -120.)];
 pub const OUTRO_HBOX_SCALE: [Key; 4] = [k(0., 1.), k(0.05, 1.3), k(0.15, 1.), k(1., 1.)];
-pub const OUTRO_TEXT_ALPHA: [Key; 4] = [k(0., 1.), k(0.05, 1.), Key { t: 0.45, v: 1., arrive: -1.05263, leave: 0. }, k(1., 0.)];
-pub const OUTRO_ICON_ALPHA: [Key; 3] = [k(0., 1.), Key { t: 0.45, v: 1., arrive: -1., leave: 0. }, k(1., 0.)];
-pub const OUTRO_SHADOW_ALPHA: [Key; 4] = [k(0., 0.5), k(0.05, 0.5), Key { t: 0.45, v: 0.5, arrive: -0.52632, leave: 0. }, k(1., 0.)];
+pub const OUTRO_TEXT_ALPHA: [Key; 4] = [k(0., 1.), k(0.05, 1.), Key { t: 0.45, v: 1., arrive: -1.05263, leave: -1.05263 }, k(1., 0.)];
+pub const OUTRO_ICON_ALPHA: [Key; 3] = [k(0., 1.), Key { t: 0.45, v: 1., arrive: -1., leave: -1. }, k(1., 0.)];
+pub const OUTRO_SHADOW_ALPHA: [Key; 4] = [k(0., 0.5), k(0.05, 0.5), Key { t: 0.45, v: 0.5, arrive: -0.52632, leave: -0.52632 }, k(1., 0.)];
 /// ResourceIconPulseAnim (0.35 s): icon scale peaks 1.5 at 0.1 s, texts 1.3.
 pub const PULSE_LEN: f32 = 0.35;
 pub const PULSE_ICON_SCALE: [Key; 3] = [k(0., 1.), k(0.1, 1.5), k(0.35, 1.)];
@@ -481,7 +481,7 @@ mod tests {
         assert!((eval(&POTENTIAL_TY, 0.5) - -50.).abs() < 1e-4 && (eval(&POTENTIAL_TY, 0.25) - -15.625).abs() < 1e-3, "smoothstep: 3s^2-2s^3 at .25 = .15625");
         assert_eq!(eval(&POTENTIAL_TY, 2.), -100.); assert_eq!(eval(&POTENTIAL_TY, -1.), 0.);
         assert!((eval(&PULSE_ICON_SCALE, 0.1) - 1.5).abs() < 1e-6 && (eval(&PULSE_ICON_SCALE, 0.35) - 1.).abs() < 1e-6 && eval(&PULSE_ICON_SCALE, 0.225) > 1.2);
-        assert!((eval(&OUTRO_TEXT_ALPHA, 0.45) - 1.).abs() < 1e-6 && eval(&OUTRO_TEXT_ALPHA, 1.).abs() < 1e-6 && (eval(&OUTRO_TEXT_ALPHA, 0.725) - 0.5).abs() < 1e-3, "0.45..1.0 is a smoothstep down to 0");
+        assert!((eval(&OUTRO_TEXT_ALPHA, 0.45) - 1.).abs() < 1e-6 && eval(&OUTRO_TEXT_ALPHA, 1.).abs() < 1e-6 && (eval(&OUTRO_TEXT_ALPHA, 0.725) - 0.42763).abs() < 1e-3, "0.45..1.0 leaves 0.45 with the cooked tangent -1.05263");
         assert!(eval(&OUTRO_TEXT_ALPHA, 0.3) >= 1., "the arrive tangent overshoots slightly above 1 (clamped when applied)");
         assert!((eval(&OUTRO_HBOX_SCALE, 0.05) - 1.3).abs() < 1e-6 && (eval(&OUTRO_HBOX_SCALE, 0.15) - 1.).abs() < 1e-6 && (eval(&OUTRO_HBOX_TY, 1.) + 120.).abs() < 1e-5);
     }

@@ -26,6 +26,23 @@ impl Tf {
 #[derive(Clone, Debug)]
 pub struct BlurRegion { pub rect: Rect, pub strength: f32 }
 
+thread_local! {
+    static RASTER_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static RASTER_PARTIAL: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Vec<u8>>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+thread_local! {
+    static RASTER_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RASTER_LAST: std::cell::RefCell<HashMap<String, TextureId>> = std::cell::RefCell::new(HashMap::new());
+}
+pub fn with_raster_budget<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+    RASTER_DEFERRED.with(|d| d.set(false));
+    RASTER_DEADLINE.with(|d| d.set(Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))));
+    let r = f();
+    RASTER_DEADLINE.with(|d| d.set(None));
+    r
+}
+pub fn raster_pending() -> bool { RASTER_DEFERRED.with(|d| d.get()) || RASTER_PARTIAL.with(|p| !p.borrow().is_empty()) }
+
 pub struct Painter<'a> {
     pub c: Ctx<'a>,
     pub out: RenderList,
@@ -65,8 +82,11 @@ impl<'a> Painter<'a> {
         let mut color = color;
         // RenderTransform (pivot 0.5, 0.5): scale / translate about the centre of the widget
         let t = w.transform.clone();
+        let pv = jvec::<2>(w.props.get("RenderTransformPivot")).unwrap_or([0.5, 0.5]);
+        let outer = tf;
+        let start = self.out.cmds.len();
         if !t.is_identity() {
-            let (cx, cy) = ((rect[0] + rect[2] * 0.5) * self.scale, (rect[1] + rect[3] * 0.5) * self.scale);
+            let (cx, cy) = ((rect[0] + rect[2] * pv[0]) * self.scale, (rect[1] + rect[3] * pv[1]) * self.scale);
             let (sx, sy) = (t.scale[0], t.scale[1]);
             tf = Tf { sx: tf.sx * sx, sy: tf.sy * sy, tx: tf.sx * (cx - sx * cx + t.translation[0] * self.scale) + tf.tx, ty: tf.sy * (cy - sy * cy + t.translation[1] * self.scale) + tf.ty };
         }
@@ -110,6 +130,10 @@ impl<'a> Painter<'a> {
         // widgets that do not take space are never painted
         for k in active { if self.c.ui.w[k].vis != Vis::Collapsed { self.paint(k, tf, child_color); } }
         if clip { self.out.pop_clip(); }
+        if t.angle != 0.0 {
+            let (px, py) = ((rect[0] + rect[2] * pv[0] + t.translation[0]) * self.scale, (rect[1] + rect[3] * pv[1] + t.translation[1]) * self.scale);
+            crate::screens::xform::rotate_quads_since(&mut self.out, start, (outer.sx * px + outer.tx, outer.sy * py + outer.ty), t.angle);
+        }
     }
 
     fn paint_border(&mut self, id: usize, tf: Tf, color: [f32; 4]) {
@@ -133,13 +157,16 @@ impl<'a> Painter<'a> {
 
     fn paint_image(&mut self, id: usize, tf: Tf, color: [f32; 4]) {
         let Some(b) = self.c.brush_of(id) else { return };
-        let ci = jvec::<4>(self.c.ui.w[id].props.get("ColorAndOpacity")).unwrap_or([1.0; 4]);
+        let cp = self.c.ui.w[id].props.get("ColorAndOpacity");
+        let ci = jvec::<4>(cp).or_else(|| jvec::<4>(cp.filter(|c| !c.get("ColorUseRule").and_then(|r| r.as_str()).map_or(false, |r| r.contains("Foreground"))).and_then(|c| c.get("SpecifiedColor")))).unwrap_or([1.0; 4]);
         let rect = self.c.lay.rect[id];
         self.c.ui.cur_scalars = self.c.ui.w[id].mat_scalars.clone();
         self.c.ui.cur_vectors = self.c.ui.w[id].mat_vectors.clone(); // INVENTORY FIX2
+        self.c.ui.cur_textures = self.c.ui.w[id].mat_textures.clone();
         self.draw_brush(&b, rect, mul4(ci, color), tf, false);
         self.c.ui.cur_scalars.clear();
         self.c.ui.cur_vectors.clear();
+        self.c.ui.cur_textures.clear();
     }
 
     /// `UButton` (`SButton`): the `WidgetStyle` brush of the current state (Normal / Hovered / Pressed / Disabled).
@@ -167,8 +194,10 @@ impl<'a> Painter<'a> {
         };
         let (lines, st, px, lh) = self.c.text_lines(id, ww);
         let m = super::store::jmargin(self.c.ui.w[id].props.get("Margin"));
-        let ci = jvec::<4>(self.c.ui.w[id].props.get("ColorAndOpacity")).unwrap_or([1.0; 4]);
-        let mut lin = mul4(mul4(st.color, ci), color);
+        let cp = self.c.ui.w[id].props.get("ColorAndOpacity");
+        let ci = jvec::<4>(cp).or_else(|| jvec::<4>(cp.filter(|c| !c.get("ColorUseRule").and_then(|r| r.as_str()).map_or(false, |r| r.contains("Foreground"))).and_then(|c| c.get("SpecifiedColor")))).unwrap_or([1.0; 4]);
+        let base = if cp.is_some() && super::umg::is_styled_common_text(&self.c.ui.w[id].class, &self.c.ui.w[id].props) { [1.0; 4] } else { st.color };
+        let mut lin = mul4(mul4(base, ci), color);
         if self.disabled { lin = disabled_effect(lin); }
         let col = srgb4(lin);
         if col[3] <= 0.0 { return; }
@@ -231,12 +260,15 @@ impl<'a> Painter<'a> {
     }
 
     fn draw_material(&mut self, b: &Brush, res: &str, r: Rect, tint: [f32; 4], flip: bool, disabled: bool) {
+        let deadline = RASTER_DEADLINE.with(|d| d.get());
         let rs = self.c.ui.mat_res.iter().find(|(m, _)| m == res).map_or(1.0, |(_, k)| *k);
         let (w, h) = ((r.w * rs).round().max(1.0) as u32, (r.h * rs).round().max(1.0) as u32);
         let boxed = b.draw == DrawAs::Box && b.margin.iter().any(|m| *m != 0.0);
         let sc: Vec<(String, f32)> = self.c.ui.cur_scalars.clone();
         let vc: Vec<(String, [f32; 4])> = self.c.ui.cur_vectors.clone(); // INVENTORY FIX2: MID vector parameters
-        let vkey: Vec<(String, [u32; 4])> = vc.iter().map(|(k, v)| (k.clone(), v.map(f32::to_bits))).collect();
+        let mut vkey: Vec<(String, [u32; 4])> = vc.iter().map(|(k, v)| (k.clone(), v.map(f32::to_bits))).collect();
+        let tc: Vec<(String, String)> = self.c.ui.cur_textures.clone();
+        for (k, v) in &tc { vkey.push((format!("{k}={v}"), [0; 4])); }
         let key = format!("lobbymat:{res}:{w}x{h}:{}:{:?}:{:?}:{:?}:{:?}:{}:{:?}{}", boxed, b.margin, b.image_size, tint.map(f32::to_bits), self.scale.to_bits(), disabled, sc.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect::<Vec<_>>(), if vkey.is_empty() { String::new() } else { format!(":{vkey:?}") });
         let timed = self.c.ui.timed_mats.iter().any(|m| m == res);
         let tid = match self.c.uic.assets.store.named(&key) {
@@ -252,10 +284,12 @@ impl<'a> Painter<'a> {
             Some(t) => t,
             None => {
                 // a material with runtime scalar parameters (a dynamic material instance) is its own material object
-                let mkey = if sc.is_empty() && vc.is_empty() { res.to_owned() } else { format!("{res}|{:?}|{vkey:?}", sc.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect::<Vec<_>>()) };
+                let mkey = if sc.is_empty() && vkey.is_empty() { res.to_owned() } else { format!("{res}|{:?}|{vkey:?}", sc.iter().map(|(k, v)| (k.clone(), v.to_bits())).collect::<Vec<_>>()) };
                 if !self.mats.contains_key(&mkey) {
+                    if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) { RASTER_DEFERRED.with(|d| d.set(true)); return; }
                     let ov = fn_dxbc_cli::uniform::Overrides { vectors: vc.iter().cloned().collect(), scalars: sc.iter().cloned().collect() };
-                    let subst = self.c.ui.tex_subst.clone();
+                    let mut subst = self.c.ui.tex_subst.clone();
+                    for (k, v) in &tc { subst.insert(k.clone(), v.clone()); }
                     let m = SlateMat::load_with(&self.c.ui.store.clone(), &mut self.c.uic.assets, res, &ov, &subst);
                     let m = match m { Ok(m) => Some(Rc::new(m)), Err(e) => { self.missing.push(format!("material {res}: {e}")); None } };
                     if let Some(m) = &m { for wmsg in &m.warnings { self.missing.push(format!("material {res}: {wmsg}")); } }
@@ -264,10 +298,38 @@ impl<'a> Painter<'a> {
                 let Some(m) = self.mats.get(&mkey).cloned().flatten() else { return };
                 if !m.is_ready() { return; }
                 let size = (r.w / self.scale, r.h / self.scale);
-                let px = m.raster(w, h, size, (b.image_size[0], b.image_size[1]), b.margin, boxed, tint, disabled, if timed { self.c.ui.mat_time } else { 0.0 });
+                let time = if timed { self.c.ui.mat_time } else { 0.0 };
+                let px = match deadline {
+                    None => m.raster(w, h, size, (b.image_size[0], b.image_size[1]), b.margin, boxed, tint, disabled, time),
+                    Some(_) => {
+                        let mut done = None;
+                        RASTER_PARTIAL.with(|p| {
+                            let mut p = p.borrow_mut();
+                            let rx = p.entry(key.clone()).or_insert_with(|| {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let (job, native, margin) = (m.job(), (b.image_size[0], b.image_size[1]), b.margin);
+                                let _ = std::thread::Builder::new().name("ui raster".into()).spawn(move || { let _ = tx.send(job.raster_rows(w, h, size, native, margin, boxed, tint, disabled, time, 0, h)); });
+                                rx
+                            });
+                            match rx.try_recv() {
+                                Ok(px) => { p.remove(&key); done = Some(px); }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => { p.remove(&key); }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                        });
+                        match done {
+                            Some(px) => px,
+                            None => {
+                                if let Some(t) = RASTER_LAST.with(|l| l.borrow().get(&format!("{res}:{w}x{h}")).copied()) { self.out.quad(t, r, if flip { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.0, 1.0, 1.0] }, [1.0, 1.0, 1.0, 1.0]); }
+                                return;
+                            }
+                        }
+                    }
+                };
                 self.c.uic.assets.store.insert_named(&key, Texture::new(w, h, px, Sampler::LINEAR))
             }
         };
+        if deadline.is_some() { RASTER_LAST.with(|l| { l.borrow_mut().insert(format!("{res}:{w}x{h}"), tid); }); }
         self.out.quad(tid, r, if flip { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.0, 1.0, 1.0] }, [1.0, 1.0, 1.0, 1.0]);
     }
 }

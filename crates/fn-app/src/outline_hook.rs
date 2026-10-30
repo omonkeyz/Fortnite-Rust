@@ -12,6 +12,31 @@ use std::sync::{mpsc, Mutex};
 
 struct State { assets: Option<OutlineAssets>, loading: Option<mpsc::Receiver<Result<OutlineAssets, String>>>, installed: bool, failed: bool }
 static STATE: Mutex<State> = Mutex::new(State { assets: None, loading: None, installed: false, failed: false });
+static PIECE_MESHES: Mutex<Option<std::collections::HashMap<String, Option<fn_render::StaticMeshHandle>>>> = Mutex::new(None);
+
+fn piece_mesh(renderer: &mut Renderer, path: &str) -> Option<fn_render::StaticMeshHandle> {
+    let mut g = PIECE_MESHES.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = g.get_or_insert_with(Default::default);
+    if let Some(h) = cache.get(path) { return *h; }
+    let lod = crate::building_hook::with_set(|set| {
+        let set = set?;
+        let (a, x, b) = fn_fx::data::package_files(set, fn_fx::data::long_package(path)).ok()?;
+        let p = fn_ueio::Package::parse(&a, &x, &b).ok()?;
+        let m = fn_mesh::StaticMesh::parse_named(&p, path.split_once('.').map(|x| x.1)).ok()?;
+        let lod = m.lods.into_iter().next()?;
+        Some((lod.positions, lod.indices))
+    });
+    let h = lod.map(|(positions, indices)| {
+        let vertices: Vec<fn_render::static_mesh::StaticVertex> = positions.iter().map(|p| fn_render::static_mesh::StaticVertex { pos: (fn_building::visual::ue_to_game(glam::Vec3::from(*p))).to_array(), normal: [0., 1., 0.], uv: [0., 0.], color: [255; 4] }).collect();
+        let n = indices.len() as u32;
+        let data = fn_render::static_mesh::StaticMeshData { name: path.to_owned(), lods: vec![fn_render::static_mesh::StaticLod { vertices, indices, sections: vec![fn_render::static_mesh::StaticSection { first_index: 0, index_count: n, material: 0 }], max_distance: f32::MAX }], ..Default::default() };
+        let mat = renderer.create_static_material(&fn_render::static_mesh::StaticMaterialData { name: format!("{path} custom depth"), two_sided: true, ..Default::default() });
+        renderer.create_static_mesh(&data, &[mat])
+    });
+    if h.is_none() { eprintln!("[outline] {path}: piece mesh not loaded, the occupant is not outlined"); }
+    cache.insert(path.to_owned(), h);
+    h
+}
 
 /// Starts decoding the outline material from the paks (once).
 pub fn start(install_dir: &std::path::Path) {
@@ -56,6 +81,15 @@ pub fn submit(renderer: &mut Renderer, real: Option<&crate::props::Real>, props:
         hl = Some((mode, mode != 0, near.iter().take(3).map(|x| x.1).collect()));
     } }
     let mut instances = vec![];
+    if hl.is_none() {
+        if let Some((mesh, loc, yaw, mirrored)) = crate::building_hook::highlight_piece() {
+            drop(s);
+            let h = piece_mesh(renderer, &mesh);
+            s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = h { instances.push(StaticMeshInstance::new(h, fn_building::visual::ue_to_game(loc)).with_yaw(-yaw.to_radians()).with_mirror_x(mirrored)); hl = Some((0, true, vec![])); }
+        }
+    }
+    let Some(a) = s.assets.as_ref() else { return };
     if let (Some((_, _, list)), Some(real)) = (&hl, real) {
         for &i in list {
             let Some(p) = props.get(i).filter(|p| p.alive()) else { continue };

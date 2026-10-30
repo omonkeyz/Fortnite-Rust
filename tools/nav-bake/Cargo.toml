@@ -1,0 +1,25 @@
+[package]
+name = "nav-bake"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Offline bake of the Athena navmesh (crates/fn-nav format) from the exported 1.8 collision: landscape, POI actors, layout props"
+
+[workspace]
+exclude = ["vendor"]
+
+[dependencies]
+rerecast = "0.5"
+glam33 = { package = "glam", version = "0.33" }
+glam = "0.32.1"
+serde_json = "1"
+fn-terrain = { path = "../../crates/fn-terrain" }
+fn-hull = { path = "../../crates/fn-hull" }
+fn-nav = { path = "../../crates/fn-nav" }
+
+[profile.release]
+opt-level = 3
+debug = false
+
+[patch.crates-io]
+rerecast = { path = "vendor/rerecast-0.5.0" }

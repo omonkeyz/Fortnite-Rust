@@ -45,6 +45,12 @@ pub struct Sequence {
 }
 /// CONTAINERS: `GA_DefaultPlayer_InteractSearch.MontageInfo.MontageToPlay` (slot UpperBody: Default = Search_Start -> Loop = Search_Loop, looping; End = Search_End).
 pub const SEARCH_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Montages/General/Search";
+pub const DOOR_OPEN_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Montages/General/DoorOpen";
+pub const DEATH_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Reacts/Deaths/PlayerDeath_Athena";
+pub const DEATH_DBNO_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Reacts/Deaths/PlayerDeath_DBNO_Athena";
+pub const HIT_REACTS_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Montages/General/AdditiveHitReacts";
+pub const DBNO_INTRO_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Montages/General/DBNO_Athena_Intro";
+pub const DBNO_OUTRO_MONTAGE: &str = "/Game/Animation/Game/MainPlayer/Montages/General/DBNO_Athena_Outro";
 pub struct Resources {
     /// Serialized player skeleton socket used by the native pawn default.
     pub player_hand_socket: fn_mesh::Socket,
@@ -76,6 +82,7 @@ pub struct Resources {
     pub inventory: Vec<crate::loadout_inventory::CatalogItem>,
     /// Firearms installed after start-up (`loadout_gun`): gun index `STARTER_GUNS + position`. `inventory` gets one entry per pack, in the same order (after the starters / pickaxe / resources).
     pub extra_guns: Vec<crate::loadout_gun::ExtraGun>,
+    pub montage_curves: HashMap<String, Vec<(String, Vec<(f32, f32)>)>>,
 }
 pub(crate) fn package_name(reference: &str) -> &str { reference.split('.').next().unwrap_or(reference) }
 pub(crate) fn props(pkg: &Package, class: &str) -> Result<PropList, String> {
@@ -156,7 +163,7 @@ impl Resources {
         let mut hands=skeleton.sockets.into_iter().filter(|s|s.name=="RightHand");
         let player_hand_socket=hands.next().ok_or("original player skeleton has no RightHand socket")?;
         if hands.next().is_some(){return Err("duplicate original RightHand socket".into());}
-        let mut resources = Self { player_hand_socket, items: vec![], bindings: vec![], montages: HashMap::new(), composites: HashMap::new(), sequences: HashMap::new(), blendspaces: HashMap::new(), core_anims: HashMap::new(), core_asset_paths: HashMap::new(), materials:HashMap::new(), material_textures:HashMap::new(), definitions: vec![], stat_extras: vec![], healables: vec![], inventory: vec![], ui_images: vec![], ammo: Default::default(), extra_guns: vec![], ads: match crate::loadout_ads::load(src, &ITEMS[..crate::loadout_gun::STARTER_GUNS]) { Ok(a) => a, Err(e) => { eprintln!("[ads] aim-down-sights data unavailable: {e}"); vec![] } } }; // ADS HOOK
+        let mut resources = Self { player_hand_socket, items: vec![], bindings: vec![], montages: HashMap::new(), composites: HashMap::new(), sequences: HashMap::new(), blendspaces: HashMap::new(), core_anims: HashMap::new(), core_asset_paths: HashMap::new(), materials:HashMap::new(), material_textures:HashMap::new(), definitions: vec![], stat_extras: vec![], healables: vec![], inventory: vec![], ui_images: vec![], ammo: Default::default(), extra_guns: vec![], montage_curves: HashMap::new(), ads: match crate::loadout_ads::load(src, &ITEMS[..crate::loadout_gun::STARTER_GUNS]) { Ok(a) => a, Err(e) => { eprintln!("[ads] aim-down-sights data unavailable: {e}"); vec![] } } }; // ADS HOOK
         for (i, path) in ITEMS.iter().enumerate() {
             if i < crate::loadout_gun::STARTER_GUNS {
                 // the starter firearms go through the same item reader as every other BR weapon (loadout_gun)
@@ -256,7 +263,10 @@ impl Resources {
         for h in &resources.healables { queue.push_back(h.montage.clone()); }
         // CONTAINERS: GA_DefaultPlayer_InteractSearch (GAS_DefaultPlayer = DefaultGameData.GenericPlayerAbilitySet) plays MontageInfo = Search during a search hold
         queue.push_back(SEARCH_MONTAGE.to_owned());
+        for m in [DEATH_MONTAGE, DEATH_DBNO_MONTAGE, HIT_REACTS_MONTAGE, DBNO_INTRO_MONTAGE, DBNO_OUTRO_MONTAGE] { queue.push_back(m.to_owned()); }
         resources.absorb(src, queue)?;
+        if let Err(e) = resources.absorb(src, VecDeque::from([DOOR_OPEN_MONTAGE.to_owned()])) { eprintln!("[interact] {DOOR_OPEN_MONTAGE}: not loaded ({e})"); }
+        for m in [SEARCH_MONTAGE, DOOR_OPEN_MONTAGE] { match crate::loadout_build::montage_curves(src, m) { Ok(c) => { resources.montage_curves.insert(m.to_owned(), c); } Err(e) => eprintln!("[interact] {m}: montage curves unavailable ({e})") } }
         // WIDGETS3 HOOK: the inventory screen's item texts (starter items from their serialized properties, pickaxe + resources read from their definitions)
         for it in &resources.items { resources.inventory.push(crate::loadout_inventory::entry(&it.definition, "FortWeaponRangedItemDefinition", &it.properties, &it.icon_path)); }
         match crate::loadout_inventory::read_extras(src) { Ok(v) => resources.inventory.extend(v), Err(e) => eprintln!("[inventory] item texts unavailable for the pickaxe / resources: {e}") }
@@ -344,8 +354,8 @@ mod tests {
         assert_eq!(r.items.iter().map(|i| i.rarity).collect::<Vec<_>>(), [0, 0, 2, 0]);
         assert_eq!(r.items[3].quantity, 5);
         assert_eq!(r.bindings.len(), 21);
-        assert_eq!(r.sequences.len(),180,"original locomotion/aim dependency fixture (138 starter + the Medkit / Shield / PurpleStuff use montages + the 36 TrapPlacement (unarmed NoWep) consumable core-set assets + Search_Start / Search_Loop / Search_End)");
-        assert_eq!(r.sequences.values().map(|s|s.source.num_frames).sum::<usize>(),3808);
+        assert_eq!(r.sequences.len(),181,"original locomotion/aim dependency fixture (138 starter + the Medkit / Shield / PurpleStuff / Grenade use montages + the 36 TrapPlacement (unarmed NoWep) consumable core-set assets + Search_Start / Search_Loop / Search_End)");
+        assert_eq!(r.sequences.values().map(|s|s.source.num_frames).sum::<usize>(),3839);
         // The held-firearm idle poses must be available under the exact names
         // the recovered player AnimBlueprint requests.  Without these, the
         // graph silently falls back to its unarmed reference pose and leaves
@@ -492,7 +502,7 @@ mod tests {
         assert_eq!((d[1].clip_size, d[1].bullets_per_cartridge, d[1].firing_rate, d[1].damage_pb, d[1].individual_reload, d[1].trigger.clone()), (5, 10, 0.7, 9., true, fn_weapons::Trigger::OnPress));
         assert_eq!((d[2].clip_size, d[2].firing_rate, d[2].reload_time, d[2].damage_pb, d[2].trigger.clone()), (1, 0.33, 3., 105., fn_weapons::Trigger::OnPress));
         use crate::loadout_stats::HealRule;
-        assert_eq!(r.healables.len(), 4);
+        assert_eq!(r.healables.len(), 5);
         let b = &r.healables[0];
         assert_eq!((b.rule.clone(), b.trigger_duration, b.montage_rate, b.cost), (HealRule::Bandage { healing_cap: 75., max_healing_amount: 15. }, 3.5, 1., 1.));
         assert!(b.montage.ends_with("WrapBandages_Athena") && b.effect.mods.len() == 1 && b.effect.mods[0].attribute == "Healing" && b.effect.mods[0].magnitude == 1.);

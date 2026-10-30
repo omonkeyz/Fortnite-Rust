@@ -68,6 +68,7 @@ pub struct FrameInput<'a> {
     /// `fn_render::lighting::sky_radiance()`.
     pub sky_radiance: [f32; 3],
     pub time: f32,
+    pub vectors: &'a [(&'a str, [f32; 4])],
 }
 
 /// FIRST USE (2026-10-06): the CPU half of [`GunScene::build_gun`], done on a worker thread before the UI thread builds: the mesh parse, the material instances
@@ -276,16 +277,20 @@ impl GunModel {
         };
         // the scene's own sky light SH (fn_render::lighting::sky_sh, as lit_common.wgsl `sky_lookup`); `input.sky_radiance` was the hemisphere stand-in
         let _ = input.sky_radiance;
-        out.buffer_writes.push((self.shared.view, view::bytes(&input.view.view_buffer_sh(&fn_render::lighting::sky_sh()))));
-        out.buffer_writes.push((self.shared.shadow_view, view::bytes(&input.view.shadow_view_buffer_sh(&fn_render::lighting::sky_sh())))); // GUN SHADOW
-        out.buffer_writes.push((self.shared.fade, bytes(&fade_buffer())));
+        if !out.buffer_writes.iter().any(|(b, _)| *b == self.shared.view) {
+            let sh = fn_render::lighting::sky_sh();
+            out.buffer_writes.push((self.shared.view, view::bytes(&input.view.view_buffer_sh(&sh))));
+            out.buffer_writes.push((self.shared.shadow_view, view::bytes(&input.view.shadow_view_buffer_sh(&sh)))); // GUN SHADOW
+            out.buffer_writes.push((self.shared.fade, bytes(&fade_buffer())));
+        }
         out.buffer_writes.push((self.prim_buf, bytes(&primitive_buffer(&l2w, &self.bounds))));
         let per_bone_motion_blur = self.sections.iter().any(|s| s.prev_bone_buf.is_some());
         out.buffer_writes.push((self.vf_buf, bytes(&frame::vf_buffer_velocity(&l2w, &prev_l2w, per_bone_motion_blur, self.mesh_origin, self.mesh_extension))));
         for (k, s) in self.sections.iter().enumerate() {
             out.buffer_writes.push((s.bone_buf, bytes(&bones[k])));
             if let Some(pb) = s.prev_bone_buf { out.buffer_writes.push((pb, bytes(prev_bones.get(k).unwrap_or(&bones[k])))); } // VELOCITY: PreviousBoneMatrices
-            let mut cb = s.material.packed(input.time).cb;
+            let mut cb = Vec::with_capacity(s.material_registers);
+            s.material.cb_into(input.time, input.vectors, &mut cb);
             cb.resize(s.material_registers, [0.0; 4]);
             out.buffer_writes.push((s.material_buf, bytes(&cb)));
             out.draws.push(GunDraw { pipe: s.pipe, bind: s.bind, mesh: self.mesh, first_index: s.first_index, index_count: s.index_count, shadow_bind: Some(s.shadow_bind) });

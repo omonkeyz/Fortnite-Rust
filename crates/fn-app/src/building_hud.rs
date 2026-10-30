@@ -76,7 +76,7 @@ pub fn prop_aim_hit(sim: &GameSim, eye: Vec3, fwd: Vec3) -> Option<fn_combat::Tr
 /// FUN_1408537d0 for this frame (see the module docs). `eye` / `fwd` = the camera view (sim metres), `pawn` = the pawn's chest point.
 pub fn aim(sim: &GameSim, tool: Tool, eye: Vec3, fwd: Vec3, pawn: Vec3) -> Aim {
     // 1. the edit tool's building
-    if let Some(id) = crate::building_hook::editing_piece() { return Aim { focus: Some(Focus::Piece(id)), reticle_building: false }; }
+    if let Some(id) = crate::building_hook::editing_piece().or_else(crate::building_hook::preview_focus) { return Aim { focus: Some(Focus::Piece(id)), reticle_building: false }; }
     // 2. / 3. build mode: the building tool's range is 0, so the preview marker
     if crate::building_hook::preview_status().is_some() { return Aim { focus: Some(Focus::Preview), reticle_building: false }; }
     let d = fwd.normalize_or_zero();

@@ -16,8 +16,16 @@ export function fnweb_console(level, text) {
 // Synchronous HTTP. Workers can ask for an ArrayBuffer; a Window may not set responseType on a synchronous request (InvalidAccessError), so the
 // main thread reads the body as x-user-defined text and converts each char back to its byte.
 // Returns: null for 404, else a Uint8Array (status 200 / 206). Throws an Error with the status text for anything else.
+export function fnweb_io_port() { return !!globalThis.__fnwebIoPort; }
+export function fnweb_io_request(id, url, rangeStart, rangeEnd, token, high) {
+    globalThis.__fnwebIoPort.postMessage({ id, url, a: rangeStart, b: rangeEnd, token: token || null, hi: !!high });
+}
+
+let httpXhr = null;
+let httpLast = null;
 export function fnweb_http(method, url, rangeStart, rangeEnd, body, token) {
-    const x = new XMLHttpRequest();
+    if (httpLast) { try { if (httpLast.transfer && !httpLast.detached) httpLast.transfer(0); } catch (_) {} httpLast = null; }
+    const x = httpXhr || (httpXhr = new XMLHttpRequest());
     x.open(method, url, false);
     if (rangeStart >= 0) x.setRequestHeader('Range', 'bytes=' + rangeStart + '-' + rangeEnd);
     // remote mode: the login's bearer token (a header: never part of a URL)
@@ -33,9 +41,12 @@ export function fnweb_http(method, url, rangeStart, rangeEnd, body, token) {
         const n = s.length;
         const out = new Uint8Array(n);
         for (let i = 0; i < n; i++) out[i] = s.charCodeAt(i) & 0xff;
+        httpLast = out.buffer;
         return out;
     }
-    return new Uint8Array(x.response || new ArrayBuffer(0));
+    const ab = x.response || new ArrayBuffer(0);
+    httpLast = ab;
+    return new Uint8Array(ab);
 }
 
 export function fnweb_hardware_concurrency() {
@@ -58,7 +69,9 @@ export function fnweb_url_params() {
 
 // heap attribution (debug): the current call stack, wasm frames only, as compact text
 export function fnweb_stack() {
+    const lim = Error.stackTraceLimit; Error.stackTraceLimit = 22;
     const s = new Error().stack || '';
+    Error.stackTraceLimit = lim;
     const out = [];
     for (const line of s.split('\n')) {
         const m = line.match(/at (.*?) \(wasm:/) || line.match(/at (.*?) \(.*wasm-function/);
@@ -66,7 +79,7 @@ export function fnweb_stack() {
         let f = m[1].replace(/\[[0-9a-f]{16}\]/g, '').replace(/^<|>$/g, '');
         if (/fn_web_rt::mem|__rust_alloc|__rdl_|alloc::raw_vec|alloc::alloc|RawVec|finish_grow|try_allocate|with_capacity|reserve|__rustc::/.test(f)) continue;
         out.push(f.slice(0, 120));
-        if (out.length >= 6) break;
+        if (out.length >= 9) break;
     }
     return out.join(' < ');
 }

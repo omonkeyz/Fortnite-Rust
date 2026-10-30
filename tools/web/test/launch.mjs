@@ -21,7 +21,8 @@ const argv = process.argv.slice(2);
 const opt = (name, def) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : def; };
 const out = path.resolve(REPO, opt('--out', 'verification/browser/launch'));
 const playSecs = Number(opt('--secs', '30'));
-const pageArgs = opt('--page-args', '');
+const pageArgs0 = opt('--page-args', '');
+const pageArgs = /(^|&)FN_LOBBY=/.test(pageArgs0) ? pageArgs0 : pageArgs0 + (pageArgs0 ? '&' : '') + 'FN_LOBBY=0';
 // --cpu-profile: a V8 CPU profile of the page's main thread from Enter on the picker to 2 s after the first in-game frame
 // (out/main-thread.cpuprofile + out/phases.json; summarise with tools/web/test/cpuprof.mjs, or open the profile in DevTools > Performance)
 const cpuProfile = argv.includes('--cpu-profile');
@@ -266,14 +267,14 @@ try {
     }
     await page.keyboard.up('KeyW');
     await page.screenshot({ path: path.join(out, '5-after-walk.png'), timeout: 90000 }).catch((e) => log('screenshot skipped: ' + String(e).split(String.fromCharCode(10))[0]));
-    // --console-test: F2 opens the dev console (fn-console); type commands, Enter runs each; F2 closes it. The game logs every reply as "[console] ...".
+    // --console-test: Tilde (Backquote) opens the dev console (fn-console); type commands, Enter runs each; Tilde closes it. The game logs every reply as "[console] ...".
     if (argv.includes('--console-test')) {
         const before = lines.length;
-        await page.keyboard.press('F2'); await sleep(400);
+        await page.keyboard.press('Backquote'); await sleep(400);
         log('console open: pointer locked ' + await page.evaluate(() => !!document.pointerLockElement));
         for (const cmd of ['fly', 'speed 2', 'storm']) { await page.keyboard.type(cmd, { delay: 20 }); await page.keyboard.press('Enter'); await sleep(500); }
         await page.screenshot({ path: path.join(out, '5b-console.png'), timeout: 90000 }).catch((e) => log('screenshot skipped: ' + String(e).split(String.fromCharCode(10))[0]));
-        await page.keyboard.press('F2'); await sleep(300);
+        await page.keyboard.press('Backquote'); await sleep(300);
         const replies = lines.slice(before).filter((l) => l.includes('[console]'));
         log('console replies (' + replies.length + '): ' + replies.slice(0, 8).map((l) => l.replace(/^[page:log] /, '')).join(' | '));
     }

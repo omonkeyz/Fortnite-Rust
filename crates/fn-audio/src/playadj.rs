@@ -22,6 +22,7 @@ pub struct Adjust {
     pub dist: Option<Option<f32>>,
     /// Extra low-pass cutoff (Hz), combined (min) with the attenuation's own.
     pub lpf_hz: Option<Option<f32>>,
+    pub floats: Vec<(String, f32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,7 @@ pub struct PlayAdj {
     pub atten: Option<Arc<Attenuation>>,
     pub dist: Option<f32>,
     pub lpf_hz: Option<f32>,
+    pub floats: Vec<(String, f32)>,
 }
 
 /// Apply `a` to the entry of `id` (created on first use).
@@ -43,7 +45,7 @@ pub fn apply(adj: &mut Vec<PlayAdj>, id: PlayId, a: Adjust) {
     let i = match adj.iter().position(|c| c.id == id) {
         Some(i) => i,
         None => {
-            adj.push(PlayAdj { id, cur: 1.0, target: 1.0, rate: 0.0, stop: false, position: None, atten: None, dist: None, lpf_hz: None });
+            adj.push(PlayAdj { id, cur: 1.0, target: 1.0, rate: 0.0, stop: false, position: None, atten: None, dist: None, lpf_hz: None, floats: Vec::new() });
             adj.len() - 1
         }
     };
@@ -72,6 +74,12 @@ pub fn apply(adj: &mut Vec<PlayAdj>, id: PlayId, a: Adjust) {
     }
     if let Some(l) = a.lpf_hz {
         c.lpf_hz = l;
+    }
+    for (n, v) in a.floats {
+        match c.floats.iter_mut().find(|f| f.0 == n) {
+            Some(f) => f.1 = v,
+            None => c.floats.push((n, v)),
+        }
     }
 }
 

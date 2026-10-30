@@ -90,8 +90,16 @@ impl ResolvedMaterial {
     }
     pub fn map(&self) -> &ShaderMap { &self.maps.maps[self.map_index] }
     /// The packed Material uniform buffer at `time` (the chosen shader map's uniform expression set with this instance's effective parameters).
-    pub fn packed(&self, time: f32) -> Packed {
-        let ov = fn_dxbc_cli::uniform::Overrides { vectors: self.fx.overrides.vectors.clone(), scalars: self.fx.overrides.scalars.clone() };
+    pub fn packed(&self, time: f32) -> Packed { self.packed_with(time, &[]) }
+    pub fn cb_into(&self, time: f32, vectors: &[(&str, [f32; 4])], out: &mut Vec<[f32; 4]>) {
+        let (ov_v, ov_s) = (&self.fx.overrides.vectors, &self.fx.overrides.scalars);
+        let v = |n: &str| vectors.iter().rev().find(|(k, _)| *k == n).map(|(_, x)| *x).or_else(|| ov_v.get(n).copied());
+        let sc = |n: &str| ov_s.get(n).copied();
+        fn_dxbc_cli::uniform::evaluate_cb_by(&self.map().uniform, &v, &sc, time, out)
+    }
+    pub fn packed_with(&self, time: f32, vectors: &[(&str, [f32; 4])]) -> Packed {
+        let mut ov = fn_dxbc_cli::uniform::Overrides { vectors: self.fx.overrides.vectors.clone(), scalars: self.fx.overrides.scalars.clone() };
+        for (k, v) in vectors { ov.vectors.insert((*k).to_owned(), *v); }
         evaluate(&self.map().uniform, &ov, time)
     }
     /// Object path + sampler source of 2D texture expression `k` (see `fn_fx::material::Material::texture_slot`).

@@ -1,0 +1,16 @@
+[package]
+name = "fn-nav"
+version.workspace = true
+edition.workspace = true
+description = "Navigation mesh for the Athena map: offline-baked Recast tiles (1.8 RecastNavMesh settings), Detour-style queries"
+
+[dependencies]
+glam.workspace = true
+fn-live = { path = "../fn-live" }
+fn-terrain = { path = "../fn-terrain" }
+
+[dev-dependencies]
+image.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

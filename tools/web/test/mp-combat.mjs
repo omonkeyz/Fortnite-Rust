@@ -25,7 +25,7 @@ let serverOut = '';
 server.stdout.on('data', (d) => { serverOut += d; });
 server.stderr.on('data', (d) => { serverOut += d; });
 while (!/127\.0\.0\.1:\d+/.test(serverOut)) { if (server.exitCode !== null) throw new Error(serverOut); await sleep(100); }
-const url = `http://127.0.0.1:${port}/?fnweb_fullscreen=off&fnweb_mp=1&fnweb_mp_url=${encodeURIComponent(mpUrl)}${extra ? '&' + extra : ''}`;
+const url = `http://127.0.0.1:${port}/?fnweb_fullscreen=off&FN_LOBBY=0&fnweb_mp=1&fnweb_mp_url=${encodeURIComponent(mpUrl)}${extra ? '&' + extra : ''}`;
 log('server ' + url);
 
 async function open(name, x) {
@@ -47,7 +47,7 @@ async function open(name, x) {
 const grep = (c, re) => fs.readFileSync(c.file, 'utf8').split('\n').filter((l) => re.test(l));
 async function shot(c, tag) { try { await c.page.screenshot({ path: path.join(out, `${c.name}-${tag}.png`), timeout: 15000 }); } catch (e) { log(c.name + ' screenshot ' + tag + ' failed'); } }
 const focus = async (c) => { await c.page.bringToFront(); await c.page.mouse.click(640, 380); await sleep(400); };
-const consoleCmd = async (c, cmd) => { await c.page.keyboard.press('F2'); await sleep(400); await c.page.keyboard.type(cmd, { delay: 20 }); await c.page.keyboard.press('Enter'); await sleep(400); await c.page.keyboard.press('F2'); await sleep(400); };
+const consoleCmd = async (c, cmd) => { await c.page.keyboard.press('Backquote'); await sleep(400); await c.page.keyboard.type(cmd, { delay: 20 }); await c.page.keyboard.press('Enter'); await sleep(400); await c.page.keyboard.press('Backquote'); await sleep(400); };
 const burst = async (c, ms) => { await c.page.mouse.down(); await sleep(ms); await c.page.mouse.up(); };
 
 let status = 1;
@@ -56,21 +56,19 @@ try {
   const host = await open('host', 0); clients.push(host);
   const guest = await open('guest', 1280); clients.push(guest);
   for (const c of clients) {
-    log(c.name + ' page: ' + await c.page.evaluate(() => JSON.stringify({ launch: getComputedStyle(document.getElementById('fnweb-launch')).display, start: document.getElementById('fnweb-page-start')?.className, phase: window.__fnwebPhase })));
-    await c.page.click('#fnweb-launch-go', { timeout: 60000 });
-    await c.page.fill('#fnweb-mp-name', c.name === 'host' ? 'HostOne' : 'GuestTwo');
+    for (let k = 0; k < 600 && !(await c.page.evaluate(() => !!window.__fnwebReady).catch(() => false)); k++) await sleep(500);
+    await c.page.mouse.click(200, 200);
   }
-  await host.page.click('#fnweb-mode-create');
-  await host.page.waitForFunction(() => /^[A-Z2-9]{6}$/.test(document.getElementById('fnweb-lobby-code').textContent), null, { timeout: 30000 });
-  const code = await host.page.textContent('#fnweb-lobby-code');
+  await host.page.evaluate(() => globalThis.__fnweb_mp_create('HostOne'));
+  await host.page.waitForFunction(() => /^[A-Z2-9]{6}$/.test(globalThis.__fnwebMp.state.code || ''), null, { timeout: 30000 });
+  const code = await host.page.evaluate(() => globalThis.__fnwebMp.state.code);
   log('lobby ' + code);
-  await guest.page.fill('#fnweb-mp-code', code);
-  await guest.page.click('#fnweb-mode-join');
-  await host.page.waitForFunction(() => document.querySelectorAll('#fnweb-lobby-players li').length === 2, null, { timeout: 30000 });
+  await guest.page.evaluate((c) => globalThis.__fnweb_mp_join(c, 'GuestTwo'), code);
+  await guest.page.waitForFunction(() => globalThis.__fnwebMp.state.slot >= 0, null, { timeout: 30000 });
   log('both in lobby');
   await host.page.waitForFunction(() => ['stage:GamePicker', 'stage:Lobby'].includes(window.__fnwebPhase), null, { timeout: 900000 }).catch(() => log('host picker wait timed out'));
   await guest.page.waitForFunction(() => ['stage:GamePicker', 'stage:Lobby'].includes(window.__fnwebPhase), null, { timeout: 900000 }).catch(() => log('guest picker wait timed out'));
-  await host.page.click('#fnweb-lobby-start');
+  await host.page.evaluate(() => globalThis.__fnweb_mp_text_send(JSON.stringify({ t: 'start' })));
   for (const c of clients) await c.page.waitForFunction(() => window.__fnwebPhase === 'playing', null, { timeout: 900000 });
   log('both playing');
   await sleep(10000);

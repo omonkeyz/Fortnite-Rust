@@ -15,8 +15,10 @@
 //! the native default of `MuzzleSocketName` (`Muzzle` is inferred), the `RarityColor` instance parameter some muzzle systems read (`Constant` of the parameter distribution is used),
 //! the dynamic `ParticleModuleLight` rendering (decoded + simulated, `Instance::lights`; the in-game renderer has no point lights yet).
 pub mod flash;
+pub mod shells;
 pub mod socket;
 pub mod table;
 
 pub use flash::{FireContext, MuzzleFlash};
-pub use table::{MuzzleTable, SocketInfo, WeaponMuzzle};
+pub use shells::{ReloadSmoke, ShellEject};
+pub use table::{MuzzleTable, ReloadSmokeData, ShellsData, SocketInfo, WeaponMuzzle};

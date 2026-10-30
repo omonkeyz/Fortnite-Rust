@@ -49,7 +49,7 @@ pub fn load(dir: &std::path::Path) -> Result<Data, String> {
         Ok((skeleton.clone(), FnClip::from_sequence(&source, &skeletons[&skeleton], SampleMode::Ue)))
     };
     let mut clips = ClipStore::new();
-    for p in fn_animgraph::skydive_clips() {
+    for p in fn_animgraph::skydive_clips().into_iter().chain(fn_animgraph::dbno_clips()) {
         match seq(&p, &mut skeletons) {
             Ok((sk, c)) if sk == fn_pose::loadout::PLAYER_SKELETON => clips.insert(&p, c),
             Ok((sk, _)) => notes.push(format!("{p}: skeleton {sk}, not the player's")),
@@ -138,20 +138,28 @@ fn skin(g: &GliderData, pose: &[Trs]) -> Vec<Mat4> {
     cs.iter().zip(&g.inv_ref_cs).map(|(m, i)| c * *m * *i * ci).collect()
 }
 
+fn receive_and_install(s: &mut State, scene: &mut crate::scene::Scene) {
+    if let Some(rx) = &s.load { if let Ok(r) = rx.try_recv() { s.load = None; match r { Ok(d) => { for n in &d.notes { eprintln!("[skydive-anim] {n}"); } eprintln!("[skydive-anim] skydive / glider animation set and glider mesh loaded"); s.data = Some(d); } Err(e) => { eprintln!("[skydive-anim] unavailable: {e}"); s.failed = true; } } } }
+    if let Some(d) = s.data.as_mut() {
+        if !s.installed {
+            s.installed = true;
+            if let Some(extra) = d.clips.take() {
+                let base = std::mem::replace(&mut scene.character.clips, Box::new(ClipStore::new()));
+                eprintln!("[skydive-anim] {} skydive clips added to the character library", extra.clips.len());
+                scene.character.clips = Box::new(crate::weapon_runtime::LayeredClips { base, extra });
+            }
+            if let Some(gd) = d.glider.as_ref() { s.glider = Some(Glider { model: scene.renderer.create_model(&gd.prims, gd.refs.len()) }); }
+        }
+    }
+}
+
+pub fn prebuild_step(scene: &mut crate::scene::Scene) -> bool {
+    with(|s| { receive_and_install(s, scene); s.load.is_none() })
+}
+
 pub fn frame(scene: &mut crate::scene::Scene, sim: &fn_game::GameSim, dt: f32) {
     with(|s| {
-        if let Some(rx) = &s.load { if let Ok(r) = rx.try_recv() { s.load = None; match r { Ok(d) => { for n in &d.notes { eprintln!("[skydive-anim] {n}"); } eprintln!("[skydive-anim] skydive / glider animation set and glider mesh loaded"); s.data = Some(d); } Err(e) => { eprintln!("[skydive-anim] unavailable: {e}"); s.failed = true; } } } }
-        if let Some(d) = s.data.as_mut() {
-            if !s.installed {
-                s.installed = true;
-                if let Some(extra) = d.clips.take() {
-                    let base = std::mem::replace(&mut scene.character.clips, Box::new(ClipStore::new()));
-                    eprintln!("[skydive-anim] {} skydive clips added to the character library", extra.clips.len());
-                    scene.character.clips = Box::new(crate::weapon_runtime::LayeredClips { base, extra });
-                }
-                if let Some(gd) = d.glider.as_ref() { s.glider = Some(Glider { model: scene.renderer.create_model(&gd.prims, gd.refs.len()) }); }
-            }
-        }
+        receive_and_install(s, scene);
         let open = sim.controller.component().is_parachute_open() && !sim.on_bus();
         if !open { s.open_t = None; return; }
         let t = s.open_t.map_or(0., |t| t + dt.max(0.));

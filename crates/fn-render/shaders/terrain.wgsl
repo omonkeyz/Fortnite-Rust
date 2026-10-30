@@ -39,6 +39,7 @@ fn fs_terrain(in: TerrainOut) -> LitOut {
         let spec_color = vec3<f32>(0.08 * s.a);
         amb = albedo * ambient_light(n);
         lit = albedo * light.sun_radiance.xyz * ndl * vis + amb + light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, sun, LANDSCAPE_ROUGHNESS, spec_color) * vis;
+        lit = lit + local_lighting(in.wp, n, v, albedo, spec_color, LANDSCAPE_ROUGHNESS, SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
         reflection_inputs(n, v, in.wp, spec_color, LANDSCAPE_ROUGHNESS, 1.0);   // REFLECTION APPLY, GBufferAO 1
         if (dbg_part_any()) { dbg_terms(albedo, n, ndl, vis, light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, sun, LANDSCAPE_ROUGHNESS, spec_color) * vis); }
     }

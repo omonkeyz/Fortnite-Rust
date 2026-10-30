@@ -72,6 +72,7 @@ pub struct HudLoading { pub done: usize, pub total: usize, pub label: String, pu
 pub struct HudState {
     /// 0..=100 each.
     pub health: u16, pub shield: u16,
+    pub energy: Option<f32>,
     /// Selected quickbar slot 0..=5 (an empty slot cannot be selected through [`HudState::select`]).
     pub selected: usize,
     /// The six primary quickbar slots; None = empty.
@@ -100,14 +101,21 @@ pub struct HudState {
     pub kill_feed: Vec<String>,
     pub game_phase: Option<(u8, f32)>,
     pub storm_map: Option<crate::screens::hud_extra::StormMap>,
+    pub bus_map: Option<crate::screens::hud_extra::MapIcon>,
+    pub game_over: Option<crate::screens::hud_cooked::GameOver>,
+    pub spectating: Option<(String, f32)>,
+    pub spectate_vitals: Option<(f32, f32)>,
+    pub team_map: Vec<crate::screens::hud_extra::TeamMapIcon>,
+    pub action_alert: Option<(crate::screens::hud_cooked::ActionAlert, String)>,
+    pub reticle_status: Option<crate::screens::hud_cooked::StatusEvent>,
 }
 impl Default for HudState {
     fn default() -> Self {
         let mut items: [Option<HudItem>; 6] = Default::default();
         items[0] = Some(HudItem::pickaxe());
         HudState {
-            health: 100, shield: 0, selected: 0, items, resources: [0; 3], backpack: (0, crate::screens::hud_extra::BACKPACK_MAX_ASSUMED), backpack_key: crate::screens::hud_extra::BACKPACK_KEY_DEFAULT.into(), slot_keys: crate::screens::quickbar::default_slot_keys(), kills: 0, players_left: None,
-            compass_yaw_deg: 0., minimap: HudMinimap::default(), show_fps: false, frame: HudFrameStats::default(), visible: HudVisibility::default(), loading: None, world: HudWorld::default(), player_name: String::new(), team: Vec::new(), kill_feed: Vec::new(), game_phase: None, storm_map: None,
+            health: 100, shield: 0, energy: None, selected: 0, items, resources: [0; 3], backpack: (0, crate::screens::hud_extra::BACKPACK_MAX_ASSUMED), backpack_key: crate::screens::hud_extra::BACKPACK_KEY_DEFAULT.into(), slot_keys: crate::screens::quickbar::default_slot_keys(), kills: 0, players_left: None,
+            compass_yaw_deg: 0., minimap: HudMinimap::default(), show_fps: false, frame: HudFrameStats::default(), visible: HudVisibility::default(), loading: None, world: HudWorld::default(), spectating: None, spectate_vitals: None, team_map: Vec::new(), player_name: String::new(), team: Vec::new(), kill_feed: Vec::new(), game_phase: None, storm_map: None, bus_map: None, game_over: None, action_alert: None, reticle_status: None,
         }
     }
 }
@@ -143,11 +151,15 @@ pub struct Hud { pub qb: Quickbar, pub vitals: Vitals, pub extra: HudExtra, pub 
     pub build: crate::screens::build_quickbar::BuildQuickbar,
     /// PICKUP CARD: the cooked `InteractionIndicator_C` of a pickup (set its install with `pickup.set_install`).
     pub pickup: crate::screens::interaction_cooked::PickupPrompt,
+    pub team_indicators: crate::screens::team_indicator_cooked::TeamIndicators,
     /// CONTAINERS: the KeybindWidget hold ring of a hold interaction (material read from the pickup prompt's install).
     pub hold_ring: crate::screens::hold_ring::HoldRing,
+    pub stream: crate::screens::pickup_stream::PickupStream,
     pub aerial: crate::screens::aerial_feedback::AerialFeedback,
+    pub radial: crate::screens::radial_picker_cooked::RadialPicker,
     pub team: TeamInfo,
     pub phase: crate::screens::game_phase::GamePhaseHud,
+    pub cooked: crate::screens::hud_cooked::HudCooked,
     pub full_map: bool }
 
 impl Hud {
@@ -157,6 +169,7 @@ impl Hud {
     pub fn set_state(&mut self, s: &HudState) {
         self.state = s.sanitized();
         for hit in std::mem::take(&mut self.state.world.harvest_hits) { self.reticle.on_hit(hit); }
+        for p in std::mem::take(&mut self.state.world.picked_up) { self.stream.push(&p); }
         if self.state.world.firearm_hit { self.reticle.on_firearm_hit(); }
         self.reticle.set_muzzle_blocked(self.state.world.firearm_reticle.as_ref().and_then(|r| r.muzzle_blocked_px));
     }
@@ -166,10 +179,13 @@ impl Hud {
         self.qb.tick(self.state.selected, dt);
         self.build.tick(dt); // BUILD HUD
         self.vitals.tick(dt, self.state.health, self.state.shield);
+        self.vitals.tick_energy(dt, self.state.energy);
         self.extra.count.step(self.state.resources, dt);
         self.reticle.tick(dt);
         self.target.tick(dt);
         self.phase.tick(self.state.game_phase, dt);
+        self.cooked.tick(dt);
+        self.stream.tick(dt);
     }
     /// Copy the quickbar / counters / minimap part of the state into the widgets (`present` does this; `build` leaves the widgets as the caller set them).
     fn sync_widgets(&mut self) {
@@ -184,7 +200,7 @@ impl Hud {
         self.qb.cooldown = st.world.slot_cooldowns; // WIDGETS3: QuickbarSlotCooldown
         self.extra.state = HudExtraState {
             players_alive: st.players_left, kills: st.kills, resources: st.resources, backpack: st.backpack, backpack_key: st.backpack_key.clone(), map_centre: st.minimap.pos, arrow_deg: Some(st.minimap.rotation_deg),
-            show_minimap: st.visible.minimap, show_pickups: st.visible.pickup_info, heading_override: None, current_resource: st.world.current_resource.index(), storm_map: st.storm_map,
+            show_minimap: st.visible.minimap, show_pickups: st.visible.pickup_info, heading_override: None, current_resource: st.world.current_resource.index(), storm_map: st.storm_map, bus: st.bus_map, teammates: st.team_map.clone(),
         };
     }
     /// Append the whole HUD from the widgets' current state. `yaw_deg` = camera yaw for the compass and the minimap arrow.
@@ -196,25 +212,72 @@ impl Hud {
         self.build.build(ctx, w, h, out); // BUILD HUD: AthenaQuickbarSecondary
         // VITALS (health/shield bars): all layout/draw lives in vitals.rs (AthenaLocalPlayerHitPointInfo / AthenaHitPointBar data).
         self.vitals.build(ctx, w, h, self.state.health, self.state.shield, out);
+        self.vitals.build_energy(ctx, w, h, self.state.energy, out);
         self.team.build(ctx, w, h, &self.state.player_name, true, &self.state.team, out);
         self.extra.build(ctx, w, h, yaw_deg, out);
-        if let (Some(p), Some(r)) = (self.state.game_phase, self.extra.alive_row) { let s = crate::layout::dpi_scale(w, h); let icon = crate::screens::game_phase::icon(ctx, p.0); self.phase.build_small(ctx, w, h, r.x - crate::screens::hud_extra::ROW_GAP * s, r.y, r.h, p, icon, out); }
-        if let Some(p) = self.state.game_phase { let icon = crate::screens::game_phase::icon(ctx, p.0); self.phase.build_banner(ctx, w, h, p, icon, out); }
+        self.build_game_phase(ctx, w, h, out);
+    }
+    fn build_game_phase(&mut self, ctx: &mut UiContext, w: f32, h: f32, out: &mut RenderList) {
+        let Some(p) = self.state.game_phase else { return };
+        let icon = crate::screens::game_phase::icon(ctx, p.0);
+        if let Some(r) = self.extra.alive_row { let s = crate::layout::dpi_scale(w, h); self.phase.build_small(ctx, w, h, r.x - crate::screens::hud_extra::ROW_GAP * s, r.y, r.h, p, icon.clone(), out); }
+        self.phase.build_banner(ctx, w, h, p, icon, out);
     }
     /// Draw the state set with [`Hud::set_state`]: the loading screen alone while `loading` is set, else the HUD with its element toggles applied
     /// plus the Show FPS counter. This is the one call a front-end makes per frame.
+    pub fn prewarm(&mut self, ctx: &mut UiContext) -> crate::draw::TextureId {
+        self.team.prewarm(ctx);
+        let map = self.extra.prewarm(ctx);
+        let _ = self.phase.texts(ctx);
+        map
+    }
+    pub fn prewarm_game_over(&mut self, ctx: &mut UiContext, w: f32, h: f32) -> bool {
+        let Some(i) = self.pickup.install() else { return true };
+        self.cooked.set_install(i);
+        self.cooked.share_store(self.aerial.store());
+        self.cooked.prewarm_game_over(ctx, w, h)
+    }
+    pub fn prewarm_aerial(&mut self, ctx: &mut UiContext, w: f32, h: f32) {
+        let Some(i) = self.pickup.install() else { return };
+        self.aerial.set_install(i);
+        let mut scratch = RenderList::new();
+        for action in [crate::screens::aerial_feedback::AerialAction::Jump, crate::screens::aerial_feedback::AerialAction::DeployGlider, crate::screens::aerial_feedback::AerialAction::Skydive] {
+            self.aerial.build(ctx, w, h, &crate::screens::aerial_feedback::AerialPrompt { key: "SpaceBar".into(), action }, "Glider", &mut scratch);
+        }
+    }
     pub fn present(&mut self, ctx: &mut UiContext, w: f32, h: f32, out: &mut RenderList) {
         if let Some(l) = self.state.loading.clone() {
             self.loading.build(ctx, w, h, Progress { total: l.total, done: l.done }, &l.label, l.tip, l.fade, out);
             return;
         }
         self.sync_widgets();
+        if let Some(i) = self.pickup.install() { self.cooked.set_install(i); }
+        self.cooked.share_store(self.aerial.store());
+        self.cooked.set_game_over(self.state.game_over.as_ref());
+        self.cooked.set_spectating(self.state.spectating.as_ref().map(|(n, t)| (n.as_str(), *t)));
+        self.cooked.set_view_target_vitals(self.state.spectate_vitals);
+        if let Some((a, d)) = self.state.action_alert.clone() { self.cooked.alert_player(a, &d); }
+        if let Some(e) = self.state.reticle_status { self.cooked.status_event(e); }
+        if self.cooked.game_over().is_some() {
+            let facts = crate::screens::hud_cooked::HudFacts { players_left: self.state.players_left, kills: self.state.kills, phase: self.state.game_phase };
+            if let Some(r) = self.cooked.build_game_over(ctx, w, h, &facts, out) {
+                if let (Some(ir), Some(p)) = (r.phase_icon, self.state.game_phase) { if let Some(m) = crate::screens::game_phase::icon(ctx, p.0) { out.material(m, crate::layout::Rect::new(ir[0], ir[1], ir[2], ir[3]), [1.; 4], false); } }
+                if let Some(m) = r.minimap { self.extra.draw_minimap_interior(ctx, crate::layout::Rect::new(m[0], m[1], m[2], m[3]), self.state.compass_yaw_deg, r.scale, out); }
+                crate::screens::kill_feed::build(ctx, w, h, &self.state.kill_feed, out);
+                return;
+            }
+        }
         let vis = self.state.visible;
         if vis.quick_bar { self.qb.build(ctx, w, h, self.state.selected, self.state.occupied(), out); self.build.build(ctx, w, h, out); } // BUILD HUD: both bars carry HUD.Quickbar.Build
-        if vis.player_health { self.vitals.build(ctx, w, h, self.state.health, self.state.shield, out); }
+        if vis.player_health { self.vitals.build(ctx, w, h, self.state.health, self.state.shield, out); self.vitals.build_energy(ctx, w, h, self.state.energy, out); }
         self.team.build(ctx, w, h, &self.state.player_name, vis.interaction_info, &self.state.team, out);
         let yaw = self.state.compass_yaw_deg;
+        if let Some(i) = self.pickup.install() { self.stream.set_install(i); }
+        let sh = if self.extra.state.show_pickups { self.stream.prepare(ctx, w, h) } else { 0. };
+        self.extra.stream = (sh, self.stream.width());
         self.extra.build(ctx, w, h, yaw, out);
+        if let Some((x, y)) = self.extra.stream_anchor { if sh > 0. { self.stream.draw(ctx, w, h, x, y, out); } }
+        self.build_game_phase(ctx, w, h, out);
         crate::screens::kill_feed::build(ctx, w, h, &self.state.kill_feed, out);
         // World feedback (old `render()` order: reticle then the harvest popup after hud_extra). The reticle shows while the pickaxe is equipped and `HUD.Center.Reticle` is on;
         // the `+N` popup (`HUD.Center.ResourceAggregation`) has no Settings row, so no toggle hides it.
@@ -228,6 +291,8 @@ impl Hud {
         self.target.update(target.as_ref(), w, h);
         self.target.prompt = self.state.world.building_prompt.clone(); self.target.ranged_targeting = self.state.world.ranged_targeting;
         if vis.target_info { self.target.build(ctx, w, h, out); }
+        crate::screens::health_bar::build(ctx, w, h, &self.state.world.health_bars, out);
+        if !self.state.world.team_indicators.is_empty() { if let Some(i) = self.pickup.install() { self.team_indicators.set_install(i); } let list = self.state.world.team_indicators.clone(); self.team_indicators.build(ctx, w, h, &list, out); }
         if vis.interaction_info { if let Some(p) = self.state.world.interaction.clone() {
             // PICKUP CARD: a pickup draws the cooked indicator (+ HUD-PickupItemWidget); the basic prompt otherwise or when the trees are unavailable
             let cooked = p.pickup.as_ref().map_or(false, |c| self.pickup.build(ctx, w, h, &p.key, c, p.screen, out));
@@ -240,9 +305,11 @@ impl Hud {
             }
         } }
         if let Some(a) = self.state.world.aerial.clone() { if let Some(i) = self.pickup.install() { self.aerial.set_install(i); } self.aerial.build(ctx, w, h, &a, "Glider", out); }
+        if let Some(r) = self.state.world.radial.clone() { if let Some(i) = self.pickup.install() { self.radial.set_install(i); } self.radial.build(ctx, w, h, &r, out); }
         if let Some(a) = self.state.world.ammo.clone() { crate::screens::equipped_item::build(ctx, w, h, &a, out); }
         if let Some(e) = self.state.world.equip { crate::screens::equip_progress::build(ctx, w, h, &e, out); }
         if self.state.show_fps { self.fps_counter(ctx, w, h, out); }
+        self.cooked.build_overlays(ctx, w, h, out);
         if self.full_map { self.extra.build_full_map(ctx, w, h, yaw, out); }
     }
     /// "{fps} FPS" in the top-right corner (old `Video.ShowFPS`), right aligned, above the minimap frame.

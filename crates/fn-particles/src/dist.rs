@@ -162,7 +162,7 @@ impl Dist {
 
 fn entry_pair(tb: &Table, t: f32) -> (usize, usize, f32) {
     if tb.entry_count <= 1 { return (0, 0, 0.0); }
-    let x = (t + tb.time_bias) * tb.time_scale;
+    let x = (t - tb.time_bias) * tb.time_scale;
     let last = (tb.entry_count - 1) as f32;
     let x = if x.is_finite() { x.clamp(0.0, last) } else { 0.0 };
     let i0 = (x.floor() as usize).min(tb.entry_count as usize - 1);
@@ -216,7 +216,8 @@ mod tests {
         // Erode of P_Pine_Tree_Med_Destruction smoke: bias 0.1859, scale 8.5985, 8 entries
         let v = [1.0189, 0.9071, 0.6186, 0.2243, -0.2054, -0.5997, -0.8881, -1.0];
         let d = table(1, 8, 1, 0, 8.598_514, 0.185_905_84, &v); let mut r = Rng::new(1);
-        let e = d.eval1(0.0, &mut r); assert!((e - (0.9071 + (0.6186 - 0.9071) * 0.598_6)).abs() < 1e-3, "{e}");
+        assert_eq!(d.eval1(0.0, &mut r), 1.0189);
+        let e = d.eval1(0.5, &mut r); let x: f32 = (0.5 - 0.185_905_84) * 8.598_514; let i = x.floor() as usize; let w = v[i] + (v[i + 1] - v[i]) * (x - i as f32); assert!((e - w).abs() < 1e-4, "{e} {w}");
         assert_eq!(d.eval1(1.0, &mut r), -1.0);
     }
     #[test] fn random_table_stays_between_min_and_max_and_is_reproducible() {

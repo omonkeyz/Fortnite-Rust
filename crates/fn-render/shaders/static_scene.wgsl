@@ -71,6 +71,7 @@ fn fs_static(in: VsOut) -> LitOut {
         if (ndl > 0.0) {
             lit = lit + light.sun_radiance.xyz * 3.14159265 * ggx_spec_color(n, v, sun, smat.p1.x, spec_color) * vis;
         }
+        lit = lit + local_lighting(in.world_pos, n, v, albedo, spec_color, smat.p1.x, SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
         // SKY REFLECTION HOOK (lit_common.wgsl reflection_inputs, applied by the deferred reflection pass)
         reflection_inputs(n, v, in.world_pos, spec_color, smat.p1.x, 1.0);
     }

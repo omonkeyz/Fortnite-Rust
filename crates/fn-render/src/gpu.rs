@@ -160,6 +160,7 @@ impl OffscreenTarget {
     }
     /// Copies the target to the CPU: RGBA8 (BGRA targets are swizzled), row-major, top row first.
     pub fn read_rgba8(&self, gpu: &Gpu) -> Vec<u8> {
+        if cfg!(target_arch = "wasm32") { let _ = gpu; eprintln!("[readback] read_rgba8 skipped on wasm (blocking map would deadlock)"); return vec![0; (self.width * self.height * 4) as usize]; }
         let bpr_unpadded = self.width * 4;
         let bpr = bpr_unpadded.div_ceil(256) * 256;
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bpr * self.height) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });

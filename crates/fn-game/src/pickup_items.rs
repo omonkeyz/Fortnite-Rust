@@ -50,6 +50,7 @@ pub struct ItemDef {
     pub drop_sound: Option<String>,
     pub mesh_transform: Option<MeshTransform>,
     pub gameplay: Gameplay,
+    pub small_icon: Option<String>,
 }
 
 pub const RARITY_NAMES: [&str; 10] = ["Handmade", "Ordinary", "Sturdy", "Quality", "Fine", "Elegant", "Masterwork", "Epic", "Badass", "Legendary"];
@@ -57,7 +58,7 @@ pub const RARITY_NAMES: [&str; 10] = ["Handmade", "Ordinary", "Sturdy", "Quality
 pub fn rarity_label(r: u8) -> &'static str { match r { 0 => "Common", 1 => "Uncommon", 2 => "Rare", 3 => "Epic", 4 => "Legendary", 5 => "Mythic", 6 => "Transcendent", _ => "Unknown" } }
 pub fn rarity_of(v: &str) -> u8 { let t = v.rsplit("::").next().unwrap_or(v); RARITY_NAMES.iter().position(|n| *n == t).unwrap_or(0) as u8 }
 
-const HEALABLES: [&str; 4] = ["Athena_Bandage", "Athena_Medkit", "Athena_Shields", "Athena_PurpleStuff"];
+const HEALABLES: [&str; 5] = ["Athena_Bandage", "Athena_Medkit", "Athena_Shields", "Athena_PurpleStuff", "Athena_Grenade"];
 const ROOTS: [&str; 6] = [
     "FortniteGame/Content/Athena/Items/Weapons/WID_*.uasset",
     "FortniteGame/Content/Athena/Items/Consumables/**/*.uasset",
@@ -106,6 +107,7 @@ fn read_one(set: &PakSet, long: &str) -> Option<ItemDef> {
         pickup_sound: path_of(p.get("PickupSound")), drop_sound: path_of(p.get("DropSound")),
         mesh_transform: if overridden { mesh_transform } else { None },
         gameplay,
+        small_icon: path_of(p.get("SmallPreviewImage")),
     })
 }
 

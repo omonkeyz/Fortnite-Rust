@@ -11,7 +11,7 @@ const www = opt('--www', 'D:/fn-site-mp');
 const exe = opt('--exe', 'D:/fn-verify/mp/fortnite-web.exe');
 const out = opt('--out', 'D:/fn-verify/mp/run');
 const port = Number(opt('--port', '8797'));
-const extra = opt('--page-args', 'fnweb_mp=1');
+const extra = opt('--page-args', 'fnweb_mp=1') + '&FN_LOBBY=0';
 fs.mkdirSync(out, { recursive: true });
 const t0 = Date.now();
 const log = (m) => { const l = `[${((Date.now() - t0) / 1000).toFixed(1).padStart(6)}] ${m}`; console.log(l); fs.appendFileSync(path.join(out, 'driver.log'), l + '\n'); };
@@ -51,30 +51,28 @@ try {
   const host = await open('host', 0); clients.push(host);
   const guest = await open('guest', 1280); clients.push(guest);
   for (const c of clients) {
-    await c.page.click('#fnweb-launch-go', { timeout: 60000 });
-    await c.page.click('#fnweb-notice-go', { timeout: 30000 });
-    await c.page.fill('#fnweb-mp-name', c.name === 'host' ? 'HostOne' : 'GuestTwo');
+    for (let k = 0; k < 600 && !(await c.page.evaluate(() => !!window.__fnwebReady).catch(() => false)); k++) await sleep(500);
+    await c.page.mouse.click(200, 200);
   }
-  await host.page.click('#fnweb-mode-create');
-  await host.page.waitForFunction(() => /^[A-Z2-9]{6}$/.test(document.getElementById('fnweb-lobby-code').textContent), null, { timeout: 30000 });
-  const code = await host.page.textContent('#fnweb-lobby-code');
+  await host.page.evaluate(() => globalThis.__fnweb_mp_create('HostOne'));
+  await host.page.waitForFunction(() => /^[A-Z2-9]{6}$/.test(globalThis.__fnwebMp.state.code || ''), null, { timeout: 30000 });
+  const code = await host.page.evaluate(() => globalThis.__fnwebMp.state.code);
   log('lobby ' + code);
-  await guest.page.fill('#fnweb-mp-code', code);
-  await guest.page.click('#fnweb-mode-join');
-  await host.page.waitForFunction(() => document.querySelectorAll('#fnweb-lobby-players li').length === 2, null, { timeout: 30000 });
+  await guest.page.evaluate((c) => globalThis.__fnweb_mp_join(c, 'GuestTwo'), code);
+  await guest.page.waitForFunction(() => globalThis.__fnwebMp.state.slot >= 0, null, { timeout: 30000 });
   await shot(host, 'lobby'); await shot(guest, 'lobby');
   log('both in lobby');
   await host.page.waitForFunction(() => window.__fnwebPhase === 'stage:GamePicker', null, { timeout: 900000 }).catch(() => log('host picker wait timed out'));
   await guest.page.waitForFunction(() => window.__fnwebPhase === 'stage:GamePicker', null, { timeout: 900000 }).catch(() => log('guest picker wait timed out'));
   log('both at the picker behind the lobby');
-  await host.page.click('#fnweb-lobby-start');
+  await host.page.evaluate(() => globalThis.__fnweb_mp_text_send(JSON.stringify({ t: 'start' })));
   for (const c of clients) await c.page.waitForFunction(() => window.__fnwebPhase === 'playing', null, { timeout: 900000 });
   log('both playing');
   await sleep(8000);
   await shot(host, 'spawn'); await shot(guest, 'spawn');
   log('host sees: ' + grep(host, /\[mp\] remote pawn/).join(' | '));
   log('guest sees: ' + grep(guest, /\[mp\] remote pawn/).join(' | '));
-  const consoleCmd = async (c, cmd) => { await c.page.keyboard.press('F2'); await sleep(400); await c.page.keyboard.type(cmd, { delay: 20 }); await c.page.keyboard.press('Enter'); await sleep(400); await c.page.keyboard.press('F2'); await sleep(400); };
+  const consoleCmd = async (c, cmd) => { await c.page.keyboard.press('Backquote'); await sleep(400); await c.page.keyboard.type(cmd, { delay: 20 }); await c.page.keyboard.press('Enter'); await sleep(400); await c.page.keyboard.press('Backquote'); await sleep(400); };
   for (const c of [host, guest]) { await c.page.bringToFront(); await c.page.mouse.click(640, 380); await sleep(400); await consoleCmd(c, 'giveresources 500'); await consoleCmd(c, 'giveathenafullkit'); await consoleCmd(c, 'giveathenaammo'); }
   await guest.page.bringToFront();
   await guest.page.mouse.click(640, 380);

@@ -99,7 +99,7 @@ pub fn prewarm() {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let out: Mutex<std::collections::HashMap<String, Result<Arc<Material>, String>>> = Mutex::new(Default::default());
             std::thread::scope(|sc| {
-                for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6) {
+                for _ in 0..if cfg!(target_arch = "wasm32") { 2 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6) } {
                     sc.spawn(|| loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(p) = paths.get(i) else { break };
@@ -111,6 +111,20 @@ pub fn prewarm() {
             (cooked, out.into_inner().unwrap_or_default(), heightmaps)
         });
         for h in &heightmaps { fn_fx::gpu::predecode_texture(&set, h); }
+        let mut textures: Vec<String> = vec![];
+        for m in mats.values().flatten() { for k in 0..m.uniform.textures2d.len() { if let Some((p, _)) = m.texture_slot(k) { if !textures.contains(&p) { textures.push(p); } } } }
+        let t1 = std::time::Instant::now();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..if cfg!(target_arch = "wasm32") { 2 } else { 4 } {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(path) = textures.get(i) else { break };
+                    fn_fx::gpu::predecode_texture(&set, path);
+                });
+            }
+        });
+        eprintln!("[landscape] prewarm: {} of {} material textures decoded in {:.0} ms", textures.iter().filter(|t| fn_fx::gpu::is_predecoded(t)).count(), textures.len(), t1.elapsed().as_secs_f32() * 1000.);
         eprintln!("[landscape] prewarm: {} components, {} materials parsed, {} heightmaps decoded in {:.0} ms", cooked.as_ref().map_or(0, |c| c.len()), mats.len(), heightmaps.len(), t0.elapsed().as_secs_f32() * 1000.);
         if let Ok(mut g) = PRELOADED.lock() { *g = Some(Preloaded { cooked: Some(cooked), mats }); }
     });
@@ -119,7 +133,6 @@ pub fn prewarm() {
 
 /// LOADING SCREEN: builds the landscape's GPU data once [`prewarm`] is done (so the first frame of play does not); true when built or not needed.
 pub fn prebuild_step(fx: &mut FxRenderer) -> bool {
-    if cfg!(target_arch = "wasm32") { return true; }
     if prewarm_running() { return false; }
     if fn_terrain::world().is_none() { return true; }
     let Ok(mut g) = STATE.lock() else { return true };
@@ -147,14 +160,15 @@ fn f4(v: Option<&serde_json::Value>, d: [f32; 4]) -> [f32; 4] { v.and_then(|x| x
 struct Cooked { level: String, name: String, props: serde_json::Value, proxy: serde_json::Value }
 
 fn cooked_components(set: &PakSet) -> Result<Vec<Cooked>, String> {
-    let persistent = fn_fx::data::PackageJson::load(set, MAP)?;
+    let keep = |c: &str| c.starts_with("LevelStreaming") || c == "Landscape" || c == "LandscapeStreamingProxy" || c == "LandscapeComponent";
+    let persistent = fn_pak::without_retain(|| fn_fx::data::PackageJson::load_classes(set, MAP, keep))?;
     let mut levels = vec![MAP.to_owned()];
     for e in persistent.exports.iter().filter(|e| e.class.starts_with("LevelStreaming")) {
         if let Some(wa) = e.props.get("WorldAsset").and_then(|v| v.as_str()) { levels.push(fn_fx::data::long_package(wa).to_owned()); }
     }
     let mut out = vec![];
     for lv in levels {
-        let pkg = if lv == MAP { None } else { Some(fn_fx::data::PackageJson::load(set, &lv)?) };
+        let pkg = if lv == MAP { None } else { Some(fn_pak::without_retain(|| fn_fx::data::PackageJson::load_classes(set, &lv, keep))?) };
         let pkg = pkg.as_ref().unwrap_or(&persistent);
         let proxy = pkg.exports.iter().find(|e| e.class == "Landscape" || e.class == "LandscapeStreamingProxy").map(|e| e.props.clone()).unwrap_or_default();
         if pkg.exports.iter().filter(|e| e.class == "Landscape" || e.class == "LandscapeStreamingProxy").count() > 1 { return Err(format!("{lv}: more than one landscape actor (component order not resolved)")); }

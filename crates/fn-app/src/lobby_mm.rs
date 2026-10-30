@@ -31,8 +31,12 @@ pub struct Matchmaking { step: Step, t: f32, pub local_ready: bool }
 impl Matchmaking {
     pub fn start() -> Matchmaking { Matchmaking { step: Step::CheckingForUpdates, t: 0.0, local_ready: false } }
     pub fn step(&self) -> Step { self.step }
-    pub fn tick(&mut self, dt: f32, load_fraction: f32) {
+    pub fn tick(&mut self, dt: f32, load_fraction: f32) { self.tick_party(dt, load_fraction, false) }
+    pub fn tick_party(&mut self, dt: f32, load_fraction: f32, hold_for_party: bool) { self.tick_queue(dt, load_fraction, hold_for_party, false) }
+    pub fn tick_queue(&mut self, dt: f32, load_fraction: f32, hold_for_party: bool, hold_for_match: bool) {
         self.t += dt;
+        if hold_for_party && self.step == Step::WaitingForReady { self.t = self.t.min(self.step.hold()); return; }
+        if hold_for_match && self.step == Step::FindingMatch { self.t = self.t.min(self.step.hold()); return; }
         if self.step == Step::LoadingContent {
             if load_fraction >= 1.0 { self.step = Step::Done; }
             return;

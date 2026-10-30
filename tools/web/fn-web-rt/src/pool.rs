@@ -10,7 +10,7 @@
 //! matters: a job the MAIN thread waits for (its file reads are made by workers) must find a worker at once, because while the main thread waits no
 //! new worker can start, and workers can be taken for good (rayon's pool, the audio stream thread) or blocked on jobs still queued (nested
 //! `thread::scope`s). A pool that stopped growing at 40 deadlocked that way on the first loading step (verification/browser/launch6), so the cap
-//! ([`soft_cap`], 96) is only a guard against runaway growth; every worker costs its stack in the wasm heap (4 MiB, `WORKER_STACK` in
+//! ([`soft_cap`], 96) is only a guard against runaway growth; every worker costs its stack in the wasm heap (2 MiB, `WORKER_STACK` in
 //! fnweb-boot.js) and the pool never shrinks. Past the cap only a queue that makes NO progress (jobs waiting, no worker idle, no job started for two
 //! 50 ms ticks of [`tick`]) adds workers.
 use std::cell::Cell;
@@ -112,7 +112,7 @@ pub unsafe fn spawn_job(job: *mut u8) -> bool {
     let pending = PENDING.load(Ordering::SeqCst);
     let total = WORKERS.load(Ordering::SeqCst) + pending;
     let cap = soft_cap();
-    if idle + pending < queued + 2 && total < cap {
+    if idle + pending < queued.min(8) + 2 && total < cap {
         request(4.min(cap - total));
     }
     true

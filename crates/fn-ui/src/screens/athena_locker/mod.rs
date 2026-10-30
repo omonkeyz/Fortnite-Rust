@@ -12,6 +12,7 @@
 //! Native glue in this module (each piece says what it stands in for): the item cards (`card.rs`), the tile view grid (`grid`), slot / tile state from [`LockerView`].
 //! Offline there is no account profile: `LockerView::items` is supplied by the caller (the offline profile's owned items).
 pub mod anim;
+pub mod banner;
 pub mod card;
 pub mod controller;
 pub mod hit;
@@ -83,6 +84,11 @@ pub struct LockerView {
     pub picker_t: f32,
     /// first visible row of the picker grid
     pub scroll_row: usize,
+    pub null_tile: [bool; 3],
+    pub selected: [Option<usize>; 3],
+    pub banner_icon: String,
+    pub banner_color: String,
+    pub banner_editor: Option<banner::EditorView>,
 }
 impl LockerView {
     pub fn picker_visible(&self) -> bool { self.picking.is_some() || self.picker_t > 0.0 }
@@ -109,6 +115,11 @@ pub struct LockerWidgets {
     /// grid metrics of the last `apply`: (columns, visible rows, total rows)
     pub grid: (usize, usize, usize),
     pub log: Vec<String>,
+    tile_offset: [usize; 3],
+    tv_size: std::cell::Cell<Option<[f32; 2]>>,
+    pub banner_slot: Option<usize>,
+    pub banner: banner::BannerUi,
+    scale_hint: std::cell::Cell<f32>,
 }
 
 impl LockerWidgets {
@@ -122,9 +133,12 @@ impl LockerWidgets {
         let picker = ui.find_in(tab, "SelectionPicker");
         let tile_view = ui.find_in(tab, "PickerTileView");
         let header = ui.find_in(tab, "HeaderItemType");
+        let banner_slot = ui.find_in(tab, "BannerSlot");
+        if let Some(b) = banner_slot { mark_common_button(ui, b); }
+        let banner = banner::BannerUi::load(&ui.store.clone());
         let mut log = vec![];
         // the native item card gets its size from `BPItemCardSize` / `SlottedItemCardSize`: it is a leaf with a fixed desired size (see `card`)
-        let mut lw = LockerWidgets { tab, slots, slot_cards, slot_empty, picker, tile_view, header, tracks: vec![], anim_widgets: vec![], tiles: Default::default(), tile_size: None, cards: vec![], grid: (1, 1, 0), log: vec![] };
+        let mut lw = LockerWidgets { tab, slots, slot_cards, slot_empty, picker, tile_view, header, tracks: vec![], anim_widgets: vec![], tiles: Default::default(), tile_size: None, cards: vec![], grid: (1, 1, 0), log: vec![], tile_offset: [0; 3], tv_size: std::cell::Cell::new(None), banner_slot, banner, scale_hint: std::cell::Cell::new(1.0) };
         for (i, c) in slot_cards.iter().enumerate() {
             if let Some(c) = *c {
                 let size = ui.w[slots[i]].props.get("SlottedItemCardSize").and_then(|v| v.as_str()).map(card::size_name).unwrap_or("L");
@@ -145,20 +159,37 @@ impl LockerWidgets {
         Some(lw)
     }
 
+    pub fn apply_banner(&mut self, ui: &mut Ui, uic: &mut UiContext, view: &LockerView, scale: f32) {
+        self.scale_hint.set(scale);
+        let icon = if view.banner_icon.is_empty() { banner::DEFAULT_ICON } else { view.banner_icon.as_str() };
+        let color = if view.banner_color.is_empty() { banner::DEFAULT_COLOR } else { view.banner_color.as_str() };
+        self.banner.apply(ui, uic, view.banner_editor.as_ref(), (icon, color), scale);
+        self.banner.apply_banners(ui, icon, color, view.banner_editor.as_ref());
+    }
+
     pub fn is_open_anim_widget(&self, id: usize) -> bool { self.anim_widgets.contains(&Some(id)) }
 
     /// Slot button widget of `slot`.
     pub fn slot_widget(&self, slot: Slot) -> usize { self.slots[slot.index()] }
     /// `Some((slot, item index))` for a pooled tile button.
     pub fn tile_of(&self, id: usize) -> Option<(Slot, usize)> {
-        for s in Slot::ALL { if let Some(i) = self.tiles[s.index()].iter().position(|t| t.0 == id) { return Some((s, i)); } }
+        for s in Slot::ALL {
+            if let Some(i) = self.tiles[s.index()].iter().position(|t| t.0 == id) {
+                let off = self.tile_offset[s.index()];
+                return Some((s, if i < off { usize::MAX } else { i - off }));
+            }
+        }
         None
     }
     pub fn slot_of(&self, id: usize) -> Option<Slot> { Slot::ALL.into_iter().find(|s| self.slots[s.index()] == id) }
     pub fn tile_view(&self) -> Option<usize> { self.tile_view }
 
     /// Tile button of `(slot, index)`.
-    pub fn tile_button(&self, slot: Slot, i: usize) -> Option<usize> { self.tiles[slot.index()].get(i).map(|t| t.0) }
+    pub fn tile_button(&self, slot: Slot, i: usize) -> Option<usize> {
+        let t = if i == usize::MAX { 0 } else { i + self.tile_offset[slot.index()] };
+        self.tiles[slot.index()].get(t).map(|t| t.0)
+    }
+    pub fn tile_offset(&self, slot: Slot) -> usize { self.tile_offset[slot.index()] }
 
     fn ensure_tiles(&mut self, ui: &mut Ui, slot: Slot, n: usize) {
         let Some(tv) = self.tile_view else { return };
@@ -166,7 +197,7 @@ impl LockerWidgets {
             let Some(t) = ui.add_class_instance(TILE_CLASS, Some(tv), "", json!({}), None) else { self.log.push("cannot compose a picker tile".into()); return };
             mark_common_button(ui, t);
             let card_w = ui.find_in(t, "ItemWidget");
-            if let Some(c) = card_w { card::make_card_leaf(ui, c, "L"); }
+            if let Some(c) = card_w { card::make_card_leaf(ui, c, "M"); }
             // `UpdateBangState`: no bang (account item "seen" state is runtime data)
             self.tiles[slot.index()].push((t, card_w));
         }
@@ -213,7 +244,7 @@ impl LockerWidgets {
             let item = view.equipped[i].and_then(|k| view.items[i].get(k));
             if let Some(e) = self.slot_empty[i] { ui.w[e].vis = if item.is_some() { Vis::Collapsed } else { Vis::Visible }; }
             if let Some(c) = self.slot_cards[i] {
-                ui.w[c].vis = if item.is_some() { Vis::Visible } else { Vis::Collapsed };
+                ui.w[c].vis = Vis::Visible;
                 if let Some(item) = item { self.cards.push(card::CardSpec { widget: c, slot: s, item: item.clone(), clip: None }); }
             }
         }
@@ -221,7 +252,9 @@ impl LockerWidgets {
         for s in Slot::ALL { if Some(s) != view.picking { for t in &self.tiles[s.index()] { ui.w[t.0].vis = Vis::Collapsed; } } }
         let (Some(slot), Some(tv)) = (view.picking, self.tile_view) else { return };
         let items = &view.items[slot.index()];
-        self.ensure_tiles(ui, slot, items.len());
+        let off = view.null_tile[slot.index()] as usize;
+        self.tile_offset[slot.index()] = off;
+        self.ensure_tiles(ui, slot, items.len() + off);
         // tile geometry: the desired size of one tile (card + button padding), one pass with a scratch layout
         if self.tile_size.is_none() {
             if let Some(&(t0, _)) = self.tiles[slot.index()].first() {
@@ -235,24 +268,38 @@ impl LockerWidgets {
         let tsz = self.tile_size.unwrap_or([128.0, 128.0]);
         // the grid area: PickerTileView = picker rect minus the CommonBorder padding (24 / 72 / 24 / 24 of `AthenaCustomizationPicker.CommonBorder_0`) inside the
         // canvas slot (offsets 32) at its open position
-        let pw = (1.0 * viewport[0] * 0.5 - 64.0).max(1.0) - 48.0;
-        let ph = viewport[1] - 64.0 - 72.0 - 24.0;
+        let measured = self.tv_size.get().map(|v| [v[0] / scale.max(1e-3), v[1] / scale.max(1e-3)]);
+        let pw = measured.map_or((1.0 * viewport[0] * 0.5 - 64.0).max(1.0) - 48.0, |m| m[0]);
+        let ph = measured.map_or(viewport[1] - 64.0 - 72.0 - 24.0, |m| m[1]);
         let cols = ((pw / tsz[0]).floor() as usize).max(1);
         let vis_rows = ((ph / tsz[1]).floor() as usize).max(1);
-        let total_rows = items.len().div_ceil(cols);
+        let count = items.len() + off;
+        let total_rows = count.div_ceil(cols);
+        let pad = if count > cols { (pw - 0.001 - cols as f32 * tsz[0]) / cols as f32 } else { 0.0 };
         self.grid = (cols, vis_rows, total_rows);
         let first = view.scroll_row.min(total_rows.saturating_sub(vis_rows));
         // one `OverlaySlot` placement per tile: whole rows only, so nothing needs clipping
         ui.w[tv].class = "Overlay".into();
-        for (i, item) in items.iter().enumerate() {
-            let (btn, cardw) = self.tiles[slot.index()][i];
-            let (row, col) = (i / cols, i % cols);
+        for t in 0..count.min(self.tiles[slot.index()].len()) {
+            let (btn, cardw) = self.tiles[slot.index()][t];
+            let (row, col) = (t / cols, t % cols);
             let shown = row >= first && row < first + vis_rows;
             ui.w[btn].vis = if shown { Vis::Visible } else { Vis::Collapsed };
             ui.w[btn].slot_class = "OverlaySlot".into();
-            ui.w[btn].slot = json!({ "Padding": { "Left": col as f32 * tsz[0], "Top": (row - first.min(row)) as f32 * tsz[1], "Right": 0.0, "Bottom": 0.0 }, "HorizontalAlignment": "HAlign_Left", "VerticalAlignment": "VAlign_Top" });
+            ui.w[btn].slot = json!({ "Padding": { "Left": col as f32 * (tsz[0] + pad) + pad * 0.5, "Top": (row - first.min(row)) as f32 * tsz[1], "Right": 0.0, "Bottom": 0.0 }, "HorizontalAlignment": "HAlign_Left", "VerticalAlignment": "VAlign_Top" });
+            if t < off {
+                let (l, tp) = (col as f32 * (tsz[0] + pad) + pad * 0.5, (row - first.min(row)) as f32 * tsz[1]);
+                let [tw, th] = self.tv_size.get().map(|v| [v[0] / scale.max(1e-3), v[1] / scale.max(1e-3)]).unwrap_or([pw, ph]);
+                ui.w[btn].slot = json!({ "Padding": { "Left": l, "Top": tp, "Right": (tw - l - tsz[0]).max(0.0), "Bottom": (th - tp - tsz[1]).max(0.0) }, "HorizontalAlignment": "HAlign_Fill", "VerticalAlignment": "VAlign_Fill" });
+                ui.w[btn].btn_state = if view.selected[slot.index()].is_none() { BtnState::Selected } else { BtnState::Normal };
+                if let Some(rw) = ui.find_in(btn, "RootWidgetSwitcher") { ui.w[rw].props["ActiveWidgetIndex"] = json!(1); }
+                if let Some(c) = cardw { ui.w[c].vis = Vis::Collapsed; }
+                continue;
+            }
+            let i = t - off;
+            let item = &items[i];
             // tile state: the equipped item is the selected tile (`bSelectable`)
-            ui.w[btn].btn_state = if view.equipped[slot.index()] == Some(i) { BtnState::Selected } else { BtnState::Normal };
+            ui.w[btn].btn_state = if view.selected[slot.index()] == Some(i) { BtnState::Selected } else { BtnState::Normal };
             if let Some(rw) = ui.find_in(btn, "RootWidgetSwitcher") { ui.w[rw].props["ActiveWidgetIndex"] = json!(0); }
             if let Some(c) = cardw { ui.w[c].vis = Vis::Visible; if shown { self.cards.push(card::CardSpec { widget: c, slot, item: item.clone(), clip: None }); } }
         }
@@ -260,6 +307,8 @@ impl LockerWidgets {
 
     /// Paint the item cards (call after the generic paint, with the pixel rectangle of each widget by id).
     pub fn paint_cards(&self, ui: &Ui, uic: &mut UiContext, mats: &mut card::CardMats, out: &mut crate::draw::RenderList, rects: &[Rect], missing: &mut Vec<String>) {
+        if let Some(r) = self.tile_view.and_then(|tv| rects.get(tv)) { if r.w > 0.0 && r.h > 0.0 { self.tv_size.set(Some([r.w, r.h])); } }
+        self.banner.note_tile_view_rect(self.banner.tile_view().and_then(|tv| rects.get(tv).copied()), self.scale_hint.get());
         for spec in &self.cards {
             if !card::effectively_visible(ui, spec.widget) { continue; }
             let Some(r) = rects.get(spec.widget).copied() else { continue };

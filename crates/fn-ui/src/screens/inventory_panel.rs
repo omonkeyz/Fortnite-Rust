@@ -19,6 +19,7 @@
 //! * `HandleDrop` (X): stack > 1 -> `CreateQuantitySelectorWidget(item, "Drop")` -> `QuantitySelector.SetSplitData(stack / 2, stack, item, "Drop Items", "Drop")`
 //!   in the modal layer; confirm -> `HandleDropItemConfirmationCallback` -> `DropItem(item, CurrentValue)`; cancel (row `Cancel`, PC key Escape) -> `DropItem(item, 0)`;
 //!   `DropItem` advances the selection first when the whole stack goes (`AdvanceSelection` 0x142db5fb0: next tile, else the previous one).
+use crate::assets::TexInfo;
 use crate::draw::{Cmd, MaterialKind, RenderList, TextureId};
 use crate::layout::{dpi_scale, Rect};
 use crate::scene::UiContext;
@@ -48,6 +49,13 @@ pub const DRAG_START_UNITS: f32 = 5.; // UE default drag trigger distance
 pub const RARITY_NAMES: [&str; 5] = ["Common", "Uncommon", "Rare", "Epic", "Legendary"];
 /// The tile view filter (`FUN_142db1690`): WeaponMelee, WeaponRanged, Ammo, Trap, WorldResource.
 pub const TILE_TYPES: [u8; 5] = [16, 17, 1, 14, 19];
+
+pub fn scale_to_fit(r: Rect, w: f32, h: f32) -> Rect {
+    if w <= 0. || h <= 0. { return r; }
+    let s = (r.w / w).min(r.h / h);
+    let (dw, dh) = (w * s, h * s);
+    Rect::new(r.x + (r.w - dw) * 0.5, r.y + (r.h - dh) * 0.5, dw, dh)
+}
 
 /// One inventory entry as the panel shows it (the game side fills it from its live inventory, see `fn-app/src/inventory.rs`).
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -415,9 +423,10 @@ impl InventoryPanel {
     /// The item card over `r` (the port's translated item card shader) + the stack count.
     pub(crate) fn card(ctx: &mut UiContext, out: &mut RenderList, r: Rect, it: &InvItem, count: bool) {
         let hero = mat_tex(ctx, "T-Card-Hero-Anim-Triangle.png", true).id;
-        let icon = if it.icon.is_empty() { TextureId::NONE } else { mat_tex(ctx, &it.icon, false).id };
+        let icon = if it.icon.is_empty() { TexInfo::NONE } else { mat_tex(ctx, &it.icon, false) };
         let c = RARITY[it.rarity.min(4) as usize];
-        out.material(MaterialKind::ItemCard { colors: [c[0], c[1], c[2], c[3]], icon, hero_tri: hero }, r, WHITE, false);
+        out.material(MaterialKind::ItemCard { colors: [c[0], c[1], c[2], c[3]], icon: TextureId::NONE, hero_tri: hero }, r, WHITE, false);
+        if icon.id != TextureId::NONE { out.sprite(icon.id, scale_to_fit(r, icon.w as f32, icon.h as f32), WHITE); }
         if count && it.count > 1 {
             let s = r.h.min(r.w) / 124.;
             let px = atlas_px(crate::screens::quickbar::KEY_FONT, s.max(0.5));

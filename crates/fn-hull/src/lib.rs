@@ -15,10 +15,10 @@ use glam::Vec3;
 #[derive(Clone, Debug, Default)]
 pub struct Hull {
     pub verts: Vec<Vec3>,
-    pub tris: Vec<[u32; 3]>,
+    pub tris: std::sync::Arc<[[u32; 3]]>,
     pub planes: Vec<(Vec3, f32)>,
     /// Unique undirected edges (vertex index pairs), for exact segment-vs-hull distances.
-    pub edges: Vec<[u32; 2]>,
+    pub edges: std::sync::Arc<[[u32; 2]]>,
     /// Bounding sphere (centre of the AABB, radius to the farthest vertex) and AABB.
     pub center: Vec3,
     pub radius: f32,
@@ -244,7 +244,40 @@ impl Hull {
         let mut edges: Vec<[u32; 2]> = tris.iter().flat_map(|t| [[t[0].min(t[1]), t[0].max(t[1])], [t[1].min(t[2]), t[1].max(t[2])], [t[2].min(t[0]), t[2].max(t[0])]]).collect();
         edges.sort_unstable();
         edges.dedup();
-        Hull { verts: vs, tris, planes, edges, center, radius, min: lo, max: hi }
+        vs.shrink_to_fit();
+        Hull { verts: vs, tris: tris.into(), planes, edges: edges.into(), center, radius, min: lo, max: hi }
+    }
+
+    pub fn reflected_topology(&self) -> Hull {
+        Hull { tris: self.tris.iter().map(|t| [t[0], t[2], t[1]]).collect(), ..self.clone() }
+    }
+
+    pub fn mapped_shared(&self, f: impl Fn(Vec3) -> Vec3) -> Hull {
+        let verts: Vec<Vec3> = self.verts.iter().map(|&v| f(v)).collect();
+        if verts.is_empty() {
+            return Hull::finish(verts, self.tris.to_vec());
+        }
+        let centroid = verts.iter().copied().sum::<Vec3>() / verts.len() as f32;
+        let mut planes = Vec::with_capacity(self.tris.len());
+        let (mut outward, mut inward) = (0usize, 0usize);
+        for t in self.tris.iter() {
+            let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let n = (b - a).cross(c - a).normalize_or_zero();
+            let side = n.dot(centroid - a);
+            if side > 0. { inward += 1; } else if side < 0. { outward += 1; }
+            planes.push((n, n.dot(a)));
+        }
+        if inward > 0 || outward == 0 {
+            return Hull::finish(verts, self.tris.to_vec());
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for v in &verts {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        let center = (lo + hi) * 0.5;
+        let radius = verts.iter().map(|v| (*v - center).length()).fold(0., f32::max);
+        Hull { verts, tris: self.tris.clone(), planes, edges: self.edges.clone(), center, radius, min: lo, max: hi }
     }
 
     /// The same hull with every vertex passed through `f` (must be affine). A reflection (axis swap, negative scale) needs `flip = true`.
@@ -274,7 +307,7 @@ impl Hull {
             return m;
         }
         let mut best = f32::MAX;
-        for t in &self.tris {
+        for t in self.tris.iter() {
             let q = closest_on_triangle(p, self.verts[t[0] as usize], self.verts[t[1] as usize], self.verts[t[2] as usize]);
             best = best.min((p - q).length_squared());
         }
@@ -360,7 +393,7 @@ impl Hull {
         if db < best.0 {
             best = (db, 1.);
         }
-        for e in &self.edges {
+        for e in self.edges.iter() {
             let (s, dist) = segment_segment(a, b, self.verts[e[0] as usize], self.verts[e[1] as usize]);
             if dist < best.0 {
                 best = (dist, s);
@@ -709,7 +742,7 @@ mod tests {
             assert!(h.planes.iter().all(|(n, d)| n.dot(c) - d < 0.), "centroid inside every plane");
             // closed surface: every directed edge has its reverse
             let mut e: Vec<(u32, u32)> = vec![];
-            for t in &h.tris {
+            for t in h.tris.iter() {
                 e.extend([(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]);
             }
             assert!(e.iter().all(|&(a, b)| e.contains(&(b, a))), "case {case}: open mesh");

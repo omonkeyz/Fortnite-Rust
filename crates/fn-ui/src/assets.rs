@@ -40,9 +40,12 @@ pub struct Texture {
     pub rgba: Arc<Vec<u8>>,
     pub sampler: Sampler,
     pub version: u32,
+    pub cpu: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Texture {
-    pub fn new(w: u32, h: u32, rgba: Vec<u8>, sampler: Sampler) -> Self { assert_eq!(rgba.len(), (w * h * 4) as usize); Texture { w, h, rgba: Arc::new(rgba), sampler, version: 0 } }
+    pub fn new(w: u32, h: u32, rgba: Vec<u8>, sampler: Sampler) -> Self { assert_eq!(rgba.len(), (w * h * 4) as usize); Texture { w, h, rgba: Arc::new(rgba), sampler, version: 0, cpu: Default::default() } }
+    pub fn has_pixels(&self) -> bool { self.rgba.len() >= (self.w * self.h * 4) as usize }
+    pub fn mark_cpu(&self) { self.cpu.store(true, std::sync::atomic::Ordering::Relaxed); }
     /// Premultiplied copy: `c = (c * a + 127) / 255` (identical to the old runtime's `premultiply`).
     pub fn premultiplied(&self) -> Vec<u8> { premultiply_rgba8(&self.rgba) }
 }
@@ -72,7 +75,21 @@ impl TextureStore {
     pub fn info(&self, id: TextureId) -> TexInfo { self.get(id).map(|t| TexInfo { id, w: t.w, h: t.h }).unwrap_or(TexInfo::NONE) }
     /// Replace the pixels (same or new size) and bump the version.
     pub fn replace(&mut self, id: TextureId, w: u32, h: u32, rgba: Vec<u8>) {
-        if let Some(Some(t)) = self.slots.get_mut(id.0 as usize) { let v = t.version.wrapping_add(1); *t = Texture { w, h, rgba: Arc::new(rgba), sampler: t.sampler, version: v }; }
+        if let Some(Some(t)) = self.slots.get_mut(id.0 as usize) { let v = t.version.wrapping_add(1); *t = Texture { w, h, rgba: Arc::new(rgba), sampler: t.sampler, version: v, cpu: t.cpu.clone() }; }
+    }
+    pub fn name_of(&self, id: TextureId) -> Option<&str> { self.names.iter().find(|(_, v)| **v == id).map(|(k, _)| k.as_str()) }
+    pub fn evict_pixels(&mut self, ids: &[u32], min_px: u64) -> (usize, u64) {
+        let (mut n, mut bytes) = (0usize, 0u64);
+        for &i in ids {
+            let id = TextureId(i);
+            if i <= 1 || self.name_of(id).is_none() { continue; }
+            let Some(Some(t)) = self.slots.get_mut(i as usize) else { continue };
+            if (t.w as u64) * (t.h as u64) < min_px || !t.has_pixels() || t.cpu.load(std::sync::atomic::Ordering::Relaxed) || Arc::strong_count(&t.rgba) > 1 { continue; }
+            bytes += t.rgba.len() as u64;
+            t.rgba = Arc::new(Vec::new());
+            n += 1;
+        }
+        (n, bytes)
     }
     pub fn remove(&mut self, id: TextureId) { if id.0 > 1 { if let Some(s) = self.slots.get_mut(id.0 as usize) { *s = None; } } }
     pub fn len(&self) -> usize { self.slots.iter().filter(|s| s.is_some()).count() }
@@ -212,8 +229,9 @@ impl UiAssets {
         };
         self.cache.insert(key, info); info
     }
-    pub fn release_large(&mut self, min_px: u64) -> (usize, u64) {
-        let big: Vec<(String, TexInfo)> = self.cache.iter().filter(|(_, t)| t.id != TextureId::NONE && t.w as u64 * t.h as u64 >= min_px).map(|(k, t)| (k.clone(), *t)).collect();
+    pub fn release_large(&mut self, min_px: u64) -> (usize, u64) { self.release_large_keep(min_px, &[]) }
+    pub fn release_large_keep(&mut self, min_px: u64, keep: &[TextureId]) -> (usize, u64) {
+        let big: Vec<(String, TexInfo)> = self.cache.iter().filter(|(_, t)| t.id != TextureId::NONE && t.w as u64 * t.h as u64 >= min_px && !keep.contains(&t.id)).map(|(k, t)| (k.clone(), *t)).collect();
         let mut bytes = 0u64;
         for (k, t) in &big { self.cache.remove(k); bytes += t.w as u64 * t.h as u64 * 4; self.store.names.retain(|_, id| *id != t.id); self.store.remove(t.id); }
         (big.len(), bytes)

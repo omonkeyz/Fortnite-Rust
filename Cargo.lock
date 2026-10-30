@@ -670,6 +670,7 @@ dependencies = [
  "fn-animgraph",
  "fn-audio",
  "fn-audio-sink",
+ "fn-bots",
  "fn-building",
  "fn-camera",
  "fn-combat",
@@ -685,10 +686,12 @@ dependencies = [
  "fn-matshader",
  "fn-mesh",
  "fn-movement",
+ "fn-nav",
  "fn-net",
  "fn-pak",
  "fn-particles",
  "fn-pose",
+ "fn-postfx",
  "fn-propdata",
  "fn-props",
  "fn-render",
@@ -755,6 +758,14 @@ dependencies = [
  "fn-audio",
  "fn-live",
  "glam",
+]
+
+[[package]]
+name = "fn-bots"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "serde_json",
 ]
 
 [[package]]
@@ -877,6 +888,7 @@ dependencies = [
  "fn-ueio",
  "glam",
  "image",
+ "miniz_oxide 0.8.9",
  "pollster",
  "serde_json",
  "wgpu",
@@ -1001,6 +1013,16 @@ dependencies = [
  "fn-testdata",
  "glam",
  "serde_json",
+]
+
+[[package]]
+name = "fn-nav"
+version = "0.1.0"
+dependencies = [
+ "fn-live",
+ "fn-terrain",
+ "glam",
+ "image",
 ]
 
 [[package]]
@@ -1130,6 +1152,7 @@ dependencies = [
  "glam",
  "image",
  "log",
+ "miniz_oxide 0.8.9",
  "pollster",
  "wasm-bindgen-futures",
  "wgpu",

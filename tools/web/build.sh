@@ -97,6 +97,7 @@ if grep -qE 'getDataViewMemory0\(\)\.set[A-Za-z0-9]+\(arg[0-9]+ \+' "$OUT/pkg/$L
 # 4. the page
 cp "$REPO/tools/web/www/"*.js "$OUT/"
 # remote mode's start-up prefetch list (file paths + byte ranges of a recorded load, no file contents; see www/fnweb-prefetch.js)
+[ -f "$REPO/tools/web/www/fnweb-psowarm.json" ] && [ "$MODE" != smoke ] && cp "$REPO/tools/web/www/fnweb-psowarm.json" "$OUT/"
 [ -f "$REPO/tools/web/www/fnweb-boot-manifest.json" ] && [ "$MODE" != smoke ] && cp "$REPO/tools/web/www/fnweb-boot-manifest.json" "$OUT/"
 if [ "$MODE" = smoke ]; then cp "$REPO/tools/web/www/smoke.html" "$OUT/index.html"; else cp "$REPO/tools/web/www/index.html" "$OUT/index.html"; fi
 sed -i "s/__FNWEB_LIB__/$LIB/g" "$OUT/"*.js "$OUT/index.html"

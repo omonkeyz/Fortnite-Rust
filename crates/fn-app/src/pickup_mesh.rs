@@ -73,9 +73,11 @@ fn pick<'a>(tex: &'a [(String, String)], exact: &[&str], contains: &[&str]) -> O
     tex.iter().find(|(n, _)| { let l = n.to_ascii_lowercase(); contains.iter().any(|c| l.contains(c)) })
 }
 
-fn load_image(src: &ClipSourceDir, path: &str) -> Result<RgbaImage, String> {
+type Cooked = Option<std::sync::Arc<fn_render::mesh::CookedTexture>>;
+fn load_image(src: &ClipSourceDir, path: &str) -> Result<(RgbaImage, Cooked), String> {
     let t = fn_pose::loadout_material::load_texture(src, path)?;
-    RgbaImage::from_raw(t.image.width as u32, t.image.height as u32, t.image.to_rgba8()).ok_or_else(|| format!("{path}: bad decoded size"))
+    let img = RgbaImage::from_raw(t.image.width as u32, t.image.height as u32, t.image.to_rgba8()).ok_or_else(|| format!("{path}: bad decoded size"))?;
+    Ok((img, crate::br_character::cooked_texture(&t.source)))
 }
 
 /// Loads the mesh of `def` (skeletal first, then static) with its material textures.
@@ -131,7 +133,7 @@ pub fn load(set: &fn_pak::PakSet, def: &ItemDef) -> Result<MeshAsset, String> {
     if secs.is_empty() { return Err(format!("{path}: no drawable section")); }
     let centre = ue_to_gltf_position(bounds.origin);
     let mut notes = vec![];
-    let mut cache: HashMap<String, (Option<RgbaImage>, Option<RgbaImage>)> = HashMap::new();
+    let mut cache: HashMap<String, (Option<(RgbaImage, Cooked)>, Option<(RgbaImage, Cooked)>)> = HashMap::new();
     let mut prims = vec![];
     for s in secs {
         let (diffuse, normal) = match &s.material {
@@ -151,7 +153,7 @@ pub fn load(set: &fn_pak::PakSet, def: &ItemDef) -> Result<MeshAsset, String> {
             SkinnedVertex { pos: p, normal: s.nrm[i], uv: s.uv[i], joints: [0; 4], weights: [1., 0., 0., 0.] }
         }).collect();
         let two_sided = s.material.as_deref().is_some_and(|m| fn_pose::br_character::material_two_sided(&src, m).unwrap_or(false)); // shadow-pass culling (UE4.16 ShadowDepthRendering.cpp:1059)
-        prims.push(SkinnedPrimitive { vertices, indices: s.idx, material: MaterialImages { diffuse, normal, spec: None, mask: None, ue: None, two_sided, cooked: Default::default() }, kind: MaterialKind::Prop });
+        prims.push(SkinnedPrimitive { vertices, indices: s.idx, material: MaterialImages { cooked: [diffuse.as_ref().and_then(|d| d.1.clone()), normal.as_ref().and_then(|n| n.1.clone()), None, None], diffuse: diffuse.map(|d| d.0), normal: normal.map(|n| n.0), spec: None, mask: None, ue: None, two_sided }, kind: MaterialKind::Prop });
     }
     Ok(MeshAsset { prims, radius_cm: bounds.radius, extent_cm: bounds.extent, origin_cm: bounds.origin, notes, source: long_of(&path).to_owned() })
 }

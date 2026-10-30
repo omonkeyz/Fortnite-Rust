@@ -153,24 +153,85 @@ pub fn fnweb_bench_take() -> Vec<f32> { BENCH.with(|b| b.borrow_mut().take().unw
 pub fn fnweb_bench_state() -> Vec<f32> { BENCH_STATE.with(|s| s.borrow().to_vec()) }
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn fnweb_bench_yaw(yaw: f32) { BENCH_YAW.with(|y| y.set(Some(yaw))); }
+thread_local! { static BENCH_PITCH_SET: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) }; }
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn fnweb_bench_pitch(pitch: f32) { BENCH_PITCH_SET.with(|p| p.set(pitch.is_finite().then_some(pitch))); }
 
 fn bench_frame(app: &mut App, raw_dt: f32) {
     if let Some(y) = BENCH_YAW.with(|y| y.take()) { app.sim.yaw = y.rem_euclid(360.); }
     static PITCH: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     if let Some(p) = *PITCH.get_or_init(|| std::env::var("FNWEB_BENCH_PITCH").ok().and_then(|v| v.parse().ok())) { app.sim.pitch = p; }
+    if let Some(p) = BENCH_PITCH_SET.with(|p| p.get()) { app.sim.pitch = p; }
     let menu = app.menu_open() as u8 as f32 + 2. * app.inventory_open() as u8 as f32;
     let feet = app.sim.feet();
     let frames = FRAMES.with(|f| f.borrow().0) as f32;
     BENCH_STATE.with(|s| *s.borrow_mut() = [app.sim.x, feet.y, app.sim.z, app.sim.yaw, menu, app.input.captured as u8 as f32, frames, raw_dt * 1000.]);
-    if BENCH.with(|b| b.borrow().is_none()) { return; }
     let cpu = FRAME_T0.with(|t| t.get()).map_or(0., |t| t.elapsed().as_secs_f32() * 1000.);
+    if BENCH.with(|b| b.borrow().is_none()) {
+        static TAGS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TAGS.get_or_init(|| std::env::var("FNWEB_HITCH_TAGS").is_ok_and(|v| v == "1") || std::env::var("FNWEB_SECTIONS_LOG").is_ok_and(|v| v == "1")) { hitch_tag(app, raw_dt * 1000., cpu, 0., 0, 0., fn_web_rt::vfs::timing().1 as f32); }
+        return;
+    }
     let last = BENCH_GPU_FRAME.with(|g| g.get());
     let gpu = app.scene.as_ref().map(|sc| sc.renderer.last_pass_timings()).filter(|t| t.supported && t.span_ms > 0. && t.frame != last).map_or(0., |t| { BENCH_GPU_FRAME.with(|g| g.set(t.frame)); t.span_ms });
     let poi = fn_web_rt::POI_KINDS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
     let dpoi = poi.saturating_sub(BENCH_POI.with(|p| p.replace(poi)));
     let pending = app.scene.as_mut().map_or(0, |s| s.renderer.fx().pending_pipelines()) as f32;
     let wait = fn_web_rt::vfs::timing().1 as f32;
+    hitch_tag(app, raw_dt * 1000., cpu, gpu, dpoi, pending, wait);
     BENCH.with(|b| if let Some(v) = b.borrow_mut().as_mut() { v.extend_from_slice(&[raw_dt * 1000., cpu, gpu, app.sim.x, feet.y, app.sim.z, menu, dpoi as f32, pending, wait]); });
+}
+
+pub(super) fn pre_counters() -> (f32, f32, f32) { (fn_web_rt::mem::MAIN_LOCK_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000., fn_web_rt::vfs::timing().1 as f32, fn_web_rt::mem::GROW_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.) }
+
+fn sections_avg(secs: &[(&'static str, f32)]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("FNWEB_SECTIONS_LOG").is_ok_and(|v| v == "1")) { return; }
+    thread_local! { static ACC: RefCell<(u32, Vec<(&'static str, f32)>)> = const { RefCell::new((0, Vec::new())) }; }
+    ACC.with(|a| {
+        let mut a = a.borrow_mut();
+        a.0 += 1;
+        for &(k, v) in secs { match a.1.iter_mut().find(|e| e.0 == k) { Some(e) => e.1 += v, None => a.1.push((k, v)) } }
+        if a.0 >= 600 {
+            let n = a.0 as f32;
+            let mut v: Vec<(&str, f32)> = a.1.iter().map(|&(k, t)| (k, t / n)).collect();
+            v.sort_by(|x, y| y.1.total_cmp(&x.1));
+            eprintln!("[sections] ms/frame {}", v.iter().take(14).map(|(k, t)| format!("{k} {t:.3}")).collect::<Vec<_>>().join(", "));
+            a.0 = 0; a.1.clear();
+        }
+    });
+}
+
+fn hitch_tag(app: &mut App, iv: f32, cpu: f32, gpu: f32, dpoi: u64, pending: f32, wait: f32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    thread_local! { static PREV: RefCell<(String, f32, i64, usize, i64, f32)> = const { RefCell::new((String::new(), 0., 0, 0, 0, 0.)) }; }
+    let secs = crate::statics_render::take_frame_sections();
+    sections_avg(&secs);
+    let (lock, grows, grow_us) = (fn_web_rt::mem::MAIN_LOCK_WAIT_US.load(Relaxed), fn_web_rt::mem::GROWS.load(Relaxed), fn_web_rt::mem::GROW_US.load(Relaxed));
+    let lr = fn_web_rt::mem::LOCK_REPORT.swap(0, Relaxed);
+    if lr != 0 { eprintln!("[heaplock main] waited {} ms, holder changes {}, last holder worker {}", lr >> 32, (lr >> 16) & 0xffff, (lr & 0xffff) - 2); }
+    thread_local! { static MH: std::cell::Cell<(u32, usize)> = const { std::cell::Cell::new((0, 0)) }; }
+    static MH_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *MH_ON.get_or_init(|| std::env::var("FNWEB_HITCH_TAGS").is_ok_and(|v| v == "1")) { MH.with(|m| { let (n, last) = m.get(); let st = fn_web_rt::mem::main_heap_stats(); if n >= 2400 || (st.1 != last && n >= 120) { eprintln!("[mainheap] region used {:.1} MB, fallback spins {}, allocs {}, deferred frees {}, main grows denied {}", st.0 as f64 / 1048576., st.1, st.2, st.3, fn_web_rt::mem::GROW_DENIED.load(std::sync::atomic::Ordering::Relaxed)); m.set((0, st.1)); } else { m.set((n + 1, last)); } }); }
+    PREV.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.1 == 0. && p.2 == 0 && p.3 == 0 { p.2 = lock; p.3 = grows; p.4 = grow_us; p.5 = wait; fn_web_rt::mem::GROW_MAX_US.store(0, Relaxed); }
+        let (dl, dg, dgu, dw) = (lock - p.2, grows - p.3, grow_us - p.4, wait - p.5);
+        p.2 = lock; p.3 = grows; p.4 = grow_us; p.5 = wait;
+        if iv > 50. && p.1 < 30. && cpu < 30. { eprintln!("[hitchtag] gap iv {iv:.0} ms: prev cpu {:.0}, this cpu {cpu:.0}, gpu {gpu:.1}, pend {pending}, grows {dg} ({:.1} ms), prev: {}", p.1, dgu as f32 / 1000., p.0); }
+        if cpu > 30. || iv > 50. || fn_render::fx::frame_upload_bytes() > (4 << 20) {
+            let mut s: Vec<(&str, f32)> = secs.iter().filter(|e| e.1 >= 1.).map(|e| (e.0, e.1)).collect();
+            s.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut r: Vec<(String, f32)> = app.scene.as_ref().and_then(|sc| sc.last_stats.as_ref()).map(|st| st.passes.iter().filter(|x| x.encode_ms >= 1.).map(|x| (x.name.clone(), x.encode_ms)).collect()).unwrap_or_default();
+            r.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let gi = if dg > 0 { let m = &fn_web_rt::mem::GROW_MAX_US; format!(" [grow max {:.1} ms, main {}, want {} KB, free {} MB, largest {} KB]", m.swap(0, Relaxed) as f32 / 1000., fn_web_rt::mem::GROW_MAIN.load(Relaxed), fn_web_rt::mem::GROW_WANT_KB.load(Relaxed), fn_web_rt::mem::GROW_FREE_KB.load(Relaxed) >> 10, fn_web_rt::mem::GROW_LARGEST_KB.load(Relaxed)) } else { String::new() };
+            let tag = format!("sections [{}] render [{}] lock {:.1} ms, grows {dg} ({:.1} ms){gi}, poi {dpoi}, pend {pending}, filewait {dw:.0} ms, upload {:.1} MB",
+                s.iter().take(6).map(|(k, v)| format!("{k} {v:.0}")).collect::<Vec<_>>().join(", "), r.iter().take(4).map(|(k, v)| format!("{k} {v:.0}")).collect::<Vec<_>>().join(", "), dl as f32 / 1000., dgu as f32 / 1000., fn_render::fx::frame_upload_bytes() as f32 / 1048576.);
+            if cpu > 30. || iv > 50. { eprintln!("[hitchtag] f={} iv {iv:.0} cpu {cpu:.0}: {tag}", FRAMES.with(|f| f.borrow().0)); }
+            p.0 = tag;
+        } else { p.0.clear(); }
+        p.1 = cpu;
+    });
 }
 
 /// Called once per `play_frame`, after the frame was presented.
@@ -191,6 +252,7 @@ pub(super) fn after_frame(app: &mut App, raw_dt: f32) {
         let _ = FIRST_FRAME.set(Instant::now());
         eprintln!("[webtex] {}", fn_fx::webtex::low_stats());
         fn_fx::gpu::enable_upgrades();
+        fn_fx::gpu::note_play_started();
         crate::landscape_render::prewarm();
     }
     if let Some(scene) = app.scene.as_mut() { fn_fx::gpu::upgrade_step(scene.renderer.fx(), 4 << 20); }
@@ -209,6 +271,7 @@ pub(super) fn after_frame(app: &mut App, raw_dt: f32) {
     // MEMORY: the file block cache serves the load and the first in-game frames' lazy loads; 15 s into play a small one is enough
     if FIRST_FRAME.get().is_some_and(|t| t.elapsed().as_secs_f32() > 15.) && !CACHE_TRIMMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         fn_web_rt::vfs::set_cache_mb(16);
+        fn_pak::webcook::set_cache_budget(16 << 20);
     }
     if !enabled() || app.run.is_some() { return; }
     if app.settings.video.preset != fn_settings::Preset::Auto {

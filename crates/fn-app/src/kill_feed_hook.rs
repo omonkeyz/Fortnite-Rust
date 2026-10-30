@@ -1,12 +1,12 @@
 use fn_ui::screens::kill_feed::{Combatant, DeathCause, Elimination, KillFeed, Killer, CHEAT_MESSAGES};
 use std::sync::Mutex;
 
-struct State { feed: KillFeed, now: f32, local_name: String, alive: bool, kills: u32, zero_vitals: bool, elims: u32 }
+struct State { feed: KillFeed, now: f32, local_name: String, alive: bool, kills: u32, zero_vitals: bool, elims: u32, death: Option<(DeathCause, Killer)>, won: bool }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|p| p.into_inner());
-    let st = g.get_or_insert_with(|| State { feed: KillFeed::new(), now: 0., local_name: String::new(), alive: true, kills: 0, zero_vitals: false, elims: 0 });
+    let st = g.get_or_insert_with(|| State { feed: KillFeed::new(), now: 0., local_name: String::new(), alive: true, kills: 0, zero_vitals: false, elims: 0, death: None, won: false });
     f(st)
 }
 
@@ -30,12 +30,14 @@ pub fn push_markup(markup: &str) { with(|s| { let now = s.now; s.feed.push_marku
 pub fn add_cheat_messages() { for m in CHEAT_MESSAGES { push_markup(m); } }
 
 pub fn local_damaged(cause: DeathCause, killer: Killer, health_after: f32) {
-    let died = with(|s| { if s.alive && health_after <= 0. { s.alive = false; true } else { false } });
+    let died = with(|s| { if s.alive && health_after <= 0. { s.alive = false; s.death = Some((cause, killer.clone())); true } else { false } });
     if died { push(Elimination { killer, victim: local(), cause, dbno: false }); }
 }
 
+pub fn note_local_death(cause: DeathCause, killer: Killer) { with(|s| { s.alive = false; if s.death.is_none() { s.death = Some((cause, killer)); } }); }
+
 pub fn force_local_death(cause: DeathCause) -> Option<String> {
-    with(|s| { s.alive = false; s.zero_vitals = true; });
+    with(|s| { s.alive = false; s.zero_vitals = true; s.death = Some((cause, Killer::Themself)); });
     let e = Elimination { killer: Killer::Themself, victim: local(), cause, dbno: false };
     let m = e.markup();
     push(e);
@@ -45,7 +47,7 @@ pub fn force_local_death(cause: DeathCause) -> Option<String> {
 pub fn frame(world_time: f32, local_health: Option<f32>) -> Vec<String> {
     with(|s| {
         s.now = world_time;
-        if local_health.map_or(false, |h| h > 0.) { s.alive = true; }
+        if local_health.map_or(false, |h| h > 0.) { s.alive = true; s.death = None; }
         s.feed.tick(world_time);
         s.feed.lines()
     })
@@ -75,3 +77,11 @@ mod tests {
         assert!(frame(20., Some(0.)).is_empty());
     }
 }
+
+pub fn local_death() -> Option<(DeathCause, Killer)> { with(|s| s.death.clone()) }
+
+pub fn local_name() -> String { with(|s| if s.local_name.is_empty() { "Player".to_owned() } else { s.local_name.clone() }) }
+
+pub fn set_won(won: bool) { with(|s| s.won = won); }
+
+pub fn won() -> bool { with(|s| s.won) }

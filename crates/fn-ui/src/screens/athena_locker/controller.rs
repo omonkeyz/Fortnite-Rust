@@ -18,10 +18,13 @@ pub enum UiEvent {
     Cancel,
     PlaylistChanged(usize),
     FillChanged(usize),
+    OptionChanged { id: &'static str, selected: usize },
     PickerOpened(Slot),
     PickerClosed,
     /// an item tile was clicked: `index` into `LockerView::items[slot]`
     Equip { slot: Slot, index: usize },
+    Preview { slot: Slot, index: usize },
+    BannerApply { icon: String, color: String },
     /// `HoveredSlateSoundOverride.ResourceObject` of the button the pointer entered
     HoverSound(String),
     /// `PressedSlateSoundOverride.ResourceObject` of the button that was pressed
@@ -30,7 +33,7 @@ pub enum UiEvent {
 
 /// What a button is (the widget roles the screens react to).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role { Tab(usize), Play, Cancel, PlaylistArrow(i8), FillArrow(i8), Slot(Slot), Tile(Slot, usize), Other }
+pub enum Role { Tab(usize), Play, Cancel, PlaylistArrow(i8), FillArrow(i8), OptionArrow(usize, i8), Slot(Slot), Tile(Slot, usize), BannerSlot, Banner(super::banner::BannerButton), Other }
 
 #[derive(Default)]
 pub struct Controller {
@@ -57,6 +60,8 @@ impl Controller {
         if let Some(i) = lobby.tab_widgets().iter().position(|&t| t == id) { return Role::Tab(i); }
         if let Some(l) = lobby.locker() {
             if let Some(s) = l.slot_of(id) { return Role::Slot(s); }
+            if l.banner_slot == Some(id) { return Role::BannerSlot; }
+            if let Some(b) = l.banner.button_of(id) { return Role::Banner(b); }
             if let Some((s, i)) = l.tile_of(id) { return Role::Tile(s, i); }
         }
         let ui = &lobby.ui;
@@ -68,14 +73,21 @@ impl Controller {
                 if ui.find_in(r, "ButtonRight") == Some(id) { return if fill { Role::FillArrow(1) } else { Role::PlaylistArrow(1) }; }
             }
         }
+        for (i, &(_, r)) in lobby.option_rows().iter().enumerate() {
+            if ui.find_in(r, "ButtonLeft") == Some(id) { return Role::OptionArrow(i, -1); }
+            if ui.find_in(r, "ButtonRight") == Some(id) { return Role::OptionArrow(i, 1); }
+        }
         Role::Other
     }
 
-    fn button_at(lobby: &AthenaLobbyUi, frame: &Frame, x: f32, y: f32) -> Option<usize> { hit::button_under(&lobby.ui, lobby.root, &frame.id_rects, x, y) }
+    fn button_at(lobby: &AthenaLobbyUi, frame: &Frame, st: &LobbyState, x: f32, y: f32) -> Option<usize> {
+        let modal = st.locker.banner_editor.as_ref().and(lobby.locker().and_then(|l| l.banner.modal()));
+        hit::button_under(&lobby.ui, modal.unwrap_or(lobby.root), &frame.id_rects, x, y)
+    }
 
     /// The pointer moved (pixels): hover state + hover sound.
     pub fn pointer_move(&mut self, lobby: &AthenaLobbyUi, frame: &Frame, st: &mut LobbyState, x: f32, y: f32) {
-        let over = Self::button_at(lobby, frame, x, y);
+        let over = Self::button_at(lobby, frame, st, x, y);
         if over != self.hover {
             if let Some(id) = over { if let Some(c) = sound_of(lobby, id, "HoveredSlateSoundOverride") { self.events.push(UiEvent::HoverSound(c)); } }
             self.hover = over;
@@ -88,7 +100,7 @@ impl Controller {
 
     /// Left mouse button (pixels). A click is a press and a release over the same button.
     pub fn pointer_button(&mut self, lobby: &AthenaLobbyUi, frame: &Frame, st: &mut LobbyState, x: f32, y: f32, down: bool) {
-        let over = Self::button_at(lobby, frame, x, y);
+        let over = Self::button_at(lobby, frame, st, x, y);
         if down {
             self.pressed = over;
             st.press_widget = over;
@@ -117,6 +129,9 @@ impl Controller {
                 st.playlist = (st.playlist as i32 + d as i32).rem_euclid(3) as usize;
                 self.events.push(UiEvent::PlaylistChanged(st.playlist));
             }
+            Role::OptionArrow(i, d) => {
+                if let Some(o) = st.options.get_mut(i) { o.step(d); self.events.push(UiEvent::OptionChanged { id: o.id, selected: o.selected }); }
+            }
             Role::FillArrow(_) => {
                 // only the Squad playlist lets the player change the fill (`team_fill_rule`: the rotator is disabled otherwise, and disabled buttons are never returned by the hit test)
                 st.team_fill = 1 - st.team_fill.min(1);
@@ -124,21 +139,58 @@ impl Controller {
             }
             Role::Slot(s) => self.open_picker(lobby, st, s),
             Role::Tile(s, i) => {
-                st.locker.equipped[s.index()] = Some(i);
-                self.events.push(UiEvent::Equip { slot: s, index: i });
-                // `OnCosmeticChangeSaveEvent` -> `EndPickingCustomization(true)`
-                self.close_picker(st);
+                let pick = (i != usize::MAX).then_some(i);
+                if st.locker.selected[s.index()] == pick {
+                    st.locker.equipped[s.index()] = pick;
+                    self.events.push(UiEvent::Equip { slot: s, index: i });
+                    self.close_picker(st);
+                } else {
+                    st.locker.selected[s.index()] = pick;
+                    self.events.push(UiEvent::Preview { slot: s, index: i });
+                }
             }
+            Role::BannerSlot => {
+                let Some(l) = lobby.locker() else { return };
+                let icon = if st.locker.banner_icon.is_empty() { super::banner::DEFAULT_ICON.to_owned() } else { st.locker.banner_icon.clone() };
+                let color = if st.locker.banner_color.is_empty() { super::banner::DEFAULT_COLOR.to_owned() } else { st.locker.banner_color.clone() };
+                st.locker.banner_editor = Some(super::banner::EditorView { color_page: false, cat: l.banner.data.icon_cat_of(&icon), icon, color, scroll_row: 0 });
+            }
+            Role::Banner(b) => self.banner_click(lobby, st, b),
             Role::Other => {}
+        }
+    }
+
+    fn banner_click(&mut self, lobby: &AthenaLobbyUi, st: &mut LobbyState, b: super::banner::BannerButton) {
+        use super::banner::BannerButton as B;
+        let Some(l) = lobby.locker() else { return };
+        let Some(e) = st.locker.banner_editor.as_mut() else { return };
+        match b {
+            B::EditIcon => { e.color_page = false; e.cat = l.banner.data.icon_cat_of(&e.icon); e.scroll_row = 0; }
+            B::EditColor => { e.color_page = true; e.cat = l.banner.data.color_cat_of(&e.color); e.scroll_row = 0; }
+            B::Left | B::Right => {
+                let n = l.banner.categories(e.color_page).max(1);
+                e.cat = if b == B::Right { (e.cat + 1) % n } else { (e.cat + n - 1) % n };
+                e.scroll_row = 0;
+            }
+            B::Tile(i) => { if let Some(row) = l.banner.tile_row(e, i) { if e.color_page { e.color = row; } else { e.icon = row; } } }
+            B::Apply => {
+                let (icon, color) = (e.icon.clone(), e.color.clone());
+                st.locker.banner_icon = icon.clone();
+                st.locker.banner_color = color.clone();
+                self.events.push(UiEvent::BannerApply { icon, color });
+            }
+            B::Close => st.locker.banner_editor = None,
         }
     }
 
     /// `BeginPickingCustomization(category)`: the picker slides in, centred on the equipped item (`CenterSelectedItemTileWidget`).
     pub fn open_picker(&mut self, lobby: &AthenaLobbyUi, st: &mut LobbyState, slot: Slot) {
         st.locker.picking = Some(slot);
+        st.locker.selected = st.locker.equipped;
         let cols = lobby.locker().map(|l| l.grid.0).unwrap_or(1).max(1);
         let vis = lobby.locker().map(|l| l.grid.1).unwrap_or(1).max(1);
-        let row = st.locker.equipped[slot.index()].map(|i| i / cols).unwrap_or(0);
+        let off = lobby.locker().map(|l| l.tile_offset(slot)).unwrap_or(0);
+        let row = st.locker.equipped[slot.index()].map(|i| (i + off) / cols).unwrap_or(0);
         st.locker.scroll_row = row.saturating_sub(vis / 2);
         self.events.push(UiEvent::PickerOpened(slot));
     }
@@ -150,12 +202,20 @@ impl Controller {
 
     /// `HandleCancel` (the "Cancel" input action, Escape): ends picking. Returns whether the key was used.
     pub fn cancel(&mut self, st: &mut LobbyState) -> bool {
+        if st.locker.banner_editor.take().is_some() { return true; }
         if st.locker.picking.is_some() { self.close_picker(st); true } else { false }
     }
 
     /// Mouse wheel over the picker: whole rows. `rows` > 0 scrolls down.
     pub fn wheel(&mut self, lobby: &AthenaLobbyUi, frame: &Frame, st: &mut LobbyState, x: f32, y: f32, rows: i32) {
         let Some(l) = lobby.locker() else { return };
+        if let (Some(e), Some(tv)) = (st.locker.banner_editor.as_mut(), l.banner.tile_view()) {
+            if frame.id_rects.get(tv).is_some_and(|r: &Rect| r.contains(x, y)) {
+                let (_, vis, total) = l.banner.grid;
+                e.scroll_row = (e.scroll_row as i32 + rows).clamp(0, total.saturating_sub(vis) as i32) as usize;
+            }
+            return;
+        }
         let Some(tv) = l.tile_view() else { return };
         let inside = frame.id_rects.get(tv).is_some_and(|r: &Rect| r.contains(x, y));
         if !inside || st.locker.picking.is_none() { return; }

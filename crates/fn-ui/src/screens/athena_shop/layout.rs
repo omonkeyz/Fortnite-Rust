@@ -28,16 +28,15 @@ pub struct Layout {
 
 pub struct Ctx<'a> { pub ui: &'a mut Ui, pub uic: &'a mut UiContext, pub lay: Layout }
 
-/// Slate font `Size` is in points rendered at 96 DPI: `FT_Set_Char_Size(face, 0, Size * 64, 96, 96)` (UE4.16 `FontCacheFreeType.cpp:64`, `FreeTypeConstants::HorizontalDPI = 96`,
-/// `FontCacheFreeType.h:41`), i.e. the em is `Size * 96 / 72` pixels (times the DPI scale). Measured on the real 1.8 shop screenshot: every text is 1.31 - 1.36 x the plain size.
-pub fn text_px(size: f32, scale: f32) -> u32 { crate::screens::atlas_px(size * 96.0 / 72.0, scale) }
+pub fn text_px(size: f32, scale: f32) -> u32 { crate::screens::atlas_px(size, scale) }
 
 impl<'a> Ctx<'a> {
     pub fn text_style(&mut self, id: usize) -> TextStyle {
         let store = self.ui.store.clone();
         let cls = self.ui.w[id].text_style.clone().or_else(|| self.ui.w[id].props.get("Style").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_owned()));
-        let mut st = match cls { Some(c) => self.ui.styles.text(&store, &c), None => TextStyle::plain() };
+        let mut st = match cls { Some(c) => self.ui.styles.text(&store, &c), None => { let mut t = TextStyle::plain(); if let Some(f) = self.ui.w[id].props.get("Font") { t.apply_font(f); } t } };
         if let Some(sc) = self.ui.w[id].props.get("ShadowOffset").and_then(|_| jvec::<2>(self.ui.w[id].props.get("ShadowOffset"))) { st.shadow_offset = sc; st.uses_shadow = true; if st.shadow_color[3] == 0.0 { st.shadow_color = [0.0, 0.0, 0.0, 1.0]; } }
+        if let Some(c) = jvec::<4>(self.ui.w[id].props.get("ShadowColorAndOpacity")) { st.shadow_color = c; }
         st
     }
 

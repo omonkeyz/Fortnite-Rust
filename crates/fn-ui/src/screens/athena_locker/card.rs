@@ -22,8 +22,9 @@ use std::collections::HashMap;
 
 /// Card baking budget: the generic material evaluator runs the cooked pixel shader on the CPU, so a frame bakes at most `max_per_frame` new cards (the rest pop in on
 /// the following frames; `pending` tells the application to keep drawing).
-pub struct CardMats { pub max_per_frame: usize, pub baked: usize, pub pending: bool }
-impl Default for CardMats { fn default() -> Self { CardMats { max_per_frame: 4, baked: 0, pending: false } } }
+pub struct CardMats { pub max_per_frame: usize, pub baked: usize, pub pending: bool, jobs: HashMap<String, std::sync::mpsc::Receiver<(u32, u32, Vec<u8>)>>, templates: HashMap<String, SlateMat> }
+impl Default for CardMats { fn default() -> Self { CardMats { max_per_frame: 4, baked: 0, pending: false, jobs: HashMap::new(), templates: HashMap::new() } } }
+pub const CARD_JOBS: usize = 16;
 
 /// Desired size (Slate units) per `EFortItemCardSize` (XXS XS S M L XL; the enum has a seventh XXL that reuses XL) of a COSMETIC card. RECOVERED from the exe:
 /// `UFortMultiSizeItemCard::RebuildWidget` (RVA 0x3050b90) builds an `SBox` whose Width/HeightOverride come from the size lookup `0x2fa66e0`, which reads two
@@ -109,7 +110,14 @@ pub fn draw_card(ui: &Ui, uic: &mut UiContext, mats: &mut CardMats, out: &mut Re
     let tid: TextureId = match uic.assets.store.named(&key) {
         Some(t) => t,
         None => {
-            if mats.baked >= mats.max_per_frame { mats.pending = true; return; }
+            if let Some(rx) = mats.jobs.get(&key) {
+                match rx.try_recv() {
+                    Ok((tw, th, px)) => { mats.jobs.remove(&key); uic.assets.store.insert_named(&key, Texture::new(tw, th, px, Sampler::LINEAR)) }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => { mats.pending = true; return; }
+                    Err(_) => { mats.jobs.remove(&key); return; }
+                }
+            } else {
+            if mats.baked >= mats.max_per_frame || mats.jobs.len() >= CARD_JOBS { mats.pending = true; return; }
             mats.baked += 1;
             let res = format!("/Game/UI/Foundation/Items/Materials/M-Item-Card-Cosmetic-Inst-{size}.M-Item-Card-Cosmetic-Inst-{size}");
             let mut ov = Overrides::default();
@@ -119,14 +127,24 @@ pub fn draw_card(ui: &Ui, uic: &mut UiContext, mats: &mut CardMats, out: &mut Re
             let mut tex = HashMap::new();
             if let Some(i) = &spec.item.icon { tex.insert("Icon".to_owned(), i.clone()); }
             let store = ui.store.clone();
-            match SlateMat::load_with(&store, &mut uic.assets, &res, &ov, &tex) {
+            let made = match mats.templates.get(&res) {
+                Some(t) => Ok(t.respecialize(&store, &mut uic.assets, &ov, &tex)),
+                None => SlateMat::load_with(&store, &mut uic.assets, &res, &ov, &tex).map(|m| { mats.templates.insert(res.clone(), m.respecialize(&store, &mut uic.assets, &Overrides::default(), &HashMap::new())); m }),
+            };
+            match made {
                 Ok(m) if m.is_ready() => {
                     for wm in &m.warnings { let s = format!("card material: {wm}"); if !missing.contains(&s) { missing.push(s); } }
-                    let px = m.raster(w, h, (rect.w, rect.h), (rect.w, rect.h), [0.0; 4], false, [1.0; 4], false, 0.0);
-                    uic.assets.store.insert_named(&key, Texture::new(w, h, px, Sampler::LINEAR))
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (rw, rh) = (rect.w, rect.h);
+                    if std::thread::Builder::new().name("locker-card".into()).spawn(move || { let px = m.raster(w, h, (rw, rh), (rw, rh), [0.0; 4], false, [1.0; 4], false, 0.0); let _ = tx.send((w, h, px)); }).is_ok() {
+                        mats.jobs.insert(key, rx);
+                    }
+                    mats.pending = true;
+                    return;
                 }
                 Ok(_) => { missing.push(format!("{res}: no pixel shader")); return; }
                 Err(e) => { let s = format!("{res}: {e}"); if !missing.contains(&s) { missing.push(s); } return; }
+            }
             }
         }
     };

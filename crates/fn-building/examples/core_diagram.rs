@@ -53,7 +53,7 @@ fn main() {
     for q in world.iter() {
         let c = match q.material { Material::Wood => [150, 90, 30], Material::Stone => [90, 90, 90], Material::Metal => [40, 90, 170] };
         for hull in placement::piece_hulls(&cat, q) {
-            for e in &hull.edges { let (a, b) = (hull.verts[e[0] as usize], hull.verts[e[1] as usize]); line(&mut img, top(a), top(b), c); line(&mut img, side(a), side(b), c); }
+            for e in hull.edges.iter() { let (a, b) = (hull.verts[e[0] as usize], hull.verts[e[1] as usize]); line(&mut img, top(a), top(b), c); line(&mut img, side(a), side(b), c); }
         }
     }
     img.save(&a[2]).expect("png");

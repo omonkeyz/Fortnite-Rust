@@ -5,6 +5,7 @@ pub mod explosive;
 pub mod shoot;
 pub mod spread;
 pub mod surface;
+pub mod tracer;
 pub use data::{br_weapon_wids, load, GunHit, StatRow};
 pub use shoot::{fire, FireContext, Impact, Policy, Projectile, Shot, ShotReport, Zone};
 pub use spread::{DamageKind, RandomStream, SpreadInputs, SpreadState};

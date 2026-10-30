@@ -24,6 +24,7 @@ struct PostParams {
     // POSTFX SETTINGS (effect_settings.rs): scene colour fringe, xy = FringeUVParams (.x scales the G sample position, .y the R one about the view
     // centre), z = 1 when USE_COLOR_FRINGE (SceneFringeIntensity > 0.01 after r.SceneColorFringeQuality, PostProcessTonemap.cpp:620)
     fringe: vec4<f32>,
+    scene_tint: vec4<f32>,
 }
 struct ExposureState { ev: f32, target_ev: f32, exposure: f32, avg_luminance: f32 }
 
@@ -236,7 +237,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var bloom = vec3<f32>(0.0);
     if (pp.bloom.z > 0.5 && !blurred) { bloom = bloom_color(uv); }
     // PostProcessTonemap.usf: LinearColor = SceneColor * ColorScale0 + CombinedBloom * ColorScale1; LinearColor *= ExposureScale
-    c = (c + bloom) * exposure;
+    c = (c * pp.scene_tint.rgb + bloom) * exposure;
     if (pp.vignette.y > 0.5) { c = c * vignette_mask(uv); }
     if (debug_mode == 5) { return vec4<f32>(vec3<f32>(vignette_mask(uv)), 1.0); }
     if (debug_mode == 2) { return vec4<f32>(clamp(raw_scene, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0); }   // the AO pass wrote the raw AO term in this mode

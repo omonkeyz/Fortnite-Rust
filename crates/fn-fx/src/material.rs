@@ -24,6 +24,7 @@ pub struct MaterialFlags {
     /// STORM TAA (2026-10-07): `UMaterial::bEnableResponsiveAA` (root material only, no instance override in 4.16; `FMaterialResource::ShouldEnableResponsiveAA`).
     /// A translucent draw of such a material tags its pixels for the responsive temporal AA blend (TranslucentRendering.cpp:531-557), e.g. `M_SafeZoneSphere`.
     pub responsive_aa: bool,
+    pub domain: String,
 }
 
 impl MaterialFlags {
@@ -135,7 +136,7 @@ fn obj_path(v: &Value) -> Option<String> { v.as_str().map(|s| s.to_owned()).filt
 fn num(v: &Value) -> Option<f64> { v.as_f64() }
 
 fn flags_from(props: &Value, base: Option<&MaterialFlags>) -> MaterialFlags {
-    let mut f = base.cloned().unwrap_or(MaterialFlags { blend: "BLEND_Opaque".into(), shading: "MSM_DefaultLit".into(), two_sided: false, disable_depth_test: false, opacity_mask_clip: 0.3333, translucency_lighting_mode: "TLM_VolumetricNonDirectional".into(), separate_translucency: true, responsive_aa: false });
+    let mut f = base.cloned().unwrap_or(MaterialFlags { blend: "BLEND_Opaque".into(), shading: "MSM_DefaultLit".into(), two_sided: false, disable_depth_test: false, opacity_mask_clip: 0.3333, translucency_lighting_mode: "TLM_VolumetricNonDirectional".into(), separate_translucency: true, responsive_aa: false, domain: "MD_Surface".into() });
     let s = |k: &str| props.get(k).and_then(|v| v.as_str()).map(|s| s.to_owned());
     if let Some(v) = s("BlendMode") { f.blend = v; }
     if let Some(v) = s("ShadingModel") { f.shading = v; }
@@ -145,6 +146,7 @@ fn flags_from(props: &Value, base: Option<&MaterialFlags>) -> MaterialFlags {
     if let Some(v) = s("TranslucencyLightingMode") { f.translucency_lighting_mode = v; }
     if let Some(v) = props.get("bEnableSeparateTranslucency").and_then(|v| v.as_bool()) { f.separate_translucency = v; }
     if let Some(v) = props.get("bEnableResponsiveAA").and_then(|v| v.as_bool()) { f.responsive_aa = v; } // STORM TAA
+    if let Some(v) = s("MaterialDomain") { f.domain = v; }
     f
 }
 
@@ -248,9 +250,37 @@ fn collect_textures(set: &PakSet, pkg: &PackageJson, expressions: &[Value], out:
     Ok(())
 }
 
+static PRELOADED: std::sync::Mutex<Option<HashMap<String, Material>>> = std::sync::Mutex::new(None);
+static PRELOAD_QUEUE: std::sync::Mutex<std::collections::VecDeque<String>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+pub static IS_MAIN_THREAD: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+pub fn preload(install: std::path::PathBuf, paths: Vec<String>, threads: usize) {
+    if let Ok(mut q) = PRELOAD_QUEUE.lock() { q.extend(paths); }
+    for _ in 0..threads.max(1) {
+        let dir = install.clone();
+        let _ = std::thread::Builder::new().name("material preload".into()).spawn(move || {
+            let Ok(set) = PakSet::open_install(&dir) else { return };
+            loop {
+                let Some(p) = PRELOAD_QUEUE.lock().ok().and_then(|mut q| q.pop_front()) else { break };
+                if PRELOADED.lock().map_or(true, |g| g.as_ref().map_or(false, |m| m.contains_key(&p))) { continue; }
+                if let Ok(m) = Material::load_uncached(&set, &p) { if let Ok(mut g) = PRELOADED.lock() { g.get_or_insert_with(HashMap::new).insert(p, m); } }
+            }
+        });
+    }
+}
+
 impl Material {
     /// Loads `object_path` (`/Game/.../Name.Name`, a `Material` or `MaterialInstanceConstant`) and everything above it.
     pub fn load(set: &PakSet, object_path: &str) -> Result<Material, String> {
+        if let Some(m) = PRELOADED.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(object_path).cloned())) { return Ok(m); }
+        let main = IS_MAIN_THREAD.get().map_or(false, |f| f());
+        if main { if let Ok(mut q) = PRELOAD_QUEUE.lock() { q.retain(|p| p != object_path); } }
+        let t = std::time::Instant::now();
+        let r = Material::load_uncached(set, object_path);
+        if main { eprintln!("[matrec] {:.1} {object_path}", t.elapsed().as_secs_f32() * 1000.); }
+        if main { if let (Ok(m), Ok(mut g)) = (r.as_ref(), PRELOADED.lock()) { g.get_or_insert_with(HashMap::new).insert(object_path.to_owned(), m.clone()); } }
+        r
+    }
+    fn load_uncached(set: &PakSet, object_path: &str) -> Result<Material, String> {
         let t0 = std::time::Instant::now(); // LOAD TIME probe (FN_FX_TIMING=1)
         let mut chain: Vec<(String, Arc<PackageJson>)> = vec![];
         let mut cur = object_path.to_owned();

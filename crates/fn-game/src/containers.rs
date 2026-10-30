@@ -156,10 +156,11 @@ impl ClassDef {
 }
 
 /// Reads a container class (short name) and its Blueprint parents from the paks (`CONTAINER_DIR`, or `package` when given).
-pub fn load_class(set: &PakSet, class: &str) -> Result<ClassDef, String> {
+pub fn load_class(set: &PakSet, class: &str) -> Result<ClassDef, String> { load_class_at(set, &format!("{CONTAINER_DIR}/{class}"), class) }
+pub fn load_class_at(set: &PakSet, package: &str, class: &str) -> Result<ClassDef, String> {
     let mut chain = vec![];
     let mut props = serde_json::Map::new();
-    let mut cur = format!("{CONTAINER_DIR}/{class}");
+    let mut cur = package.to_owned();
     for _ in 0..8 {
         let pd = PackageData::load(set, &cur).map_err(|e| format!("{cur}: {e}"))?;
         let pkg = pd.package().map_err(|e| format!("{cur}: {e}"))?;
@@ -197,7 +198,7 @@ pub enum SearchState { #[default] Idle, Searching, Searched }
 pub enum SearchEvent { Begin, Interrupted, Complete }
 /// One frame of input for a container: the Use binding held / pressed this frame, whether the interaction trace has this container, the search time.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SearchInput { pub use_down: bool, pub use_pressed: bool, pub focused: bool, pub duration: f32 }
+pub struct SearchInput { pub use_down: bool, pub use_pressed: bool, pub focused: bool, pub duration: f32, pub cancel: bool }
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Search { pub state: SearchState, pub elapsed: f32, pub duration: f32 }
 impl Search {
@@ -216,7 +217,7 @@ impl Search {
                 }
             }
             SearchState::Searching => {
-                if !i.use_down || !i.focused { self.state = SearchState::Idle; self.elapsed = 0.; ev.push(SearchEvent::Interrupted); }
+                if !i.use_down || !i.focused || i.cancel { self.state = SearchState::Idle; self.elapsed = 0.; ev.push(SearchEvent::Interrupted); }
                 else {
                     self.elapsed += dt;
                     if self.elapsed > self.duration { self.state = SearchState::Searched; ev.push(SearchEvent::Complete); } // PlayerTick @14083ee10: `now - start > RequiredDuration`
@@ -341,6 +342,31 @@ pub fn search_text() -> &'static str { "Search" }
 /// Cleanup of a finished / cancelled hold: the `LongInteractAudioComponent` `FadeOut(1.0, 0)` (`FUN_1408262e0`).
 pub const SEARCH_LOOP_FADE: f32 = 1.0;
 
+pub const JIGGLE_LOOT_MAGNITUDE: &str = "/Game/GameplayCurves/SeachLootVertexJiggleMagnitude";
+pub const JIGGLE_LOOT_ANGLE: &str = "/Game/GameplayCurves/SeachLootVertexJiggleAngle";
+pub const JIGGLE_EMPTY_MAGNITUDE: &str = "/Game/GameplayCurves/SeachEmptyLootVertexJiggleMagnitude";
+pub const JIGGLE_EMPTY_ANGLE: &str = "/Game/GameplayCurves/SeachEmptyLootVertexJiggleAngle";
+pub const BOUNCE_WINDOW: f32 = 5.0;
+
+pub fn bounce_radius(d: &ClassDef) -> f32 {
+    let o = d.props.get("SearchBounceRadiusOverride").and_then(|v| v.as_f64()).map_or(-1., |v| v as f32);
+    if o > 0. { o } else { d.loot_spawn_location[2] }
+}
+pub fn bounce_center(d: &ClassDef, t: glam::Vec3, q: glam::Quat, s: glam::Vec3) -> glam::Vec3 { t + q * (glam::Vec3::from(d.loot_spawn_location) * s) }
+
+pub fn jiggle(mag: &dyn Fn(f32) -> f32, mag_range: (f32, f32), angle: &dyn Fn(f32) -> f32, angle_range: (f32, f32), since: f32, pawn_yaw: f32) -> (glam::Vec3, f32) {
+    let clamp = |t: f32, (lo, hi): (f32, f32)| { let mut x = lo; if lo <= t { x = t; if hi <= t { x = hi; } } x };
+    let a = angle(clamp(since + angle_range.0, angle_range));
+    let k = 1.0 / 0.625f32.sqrt();
+    let (x0, z0) = (0.75 * k, 0.25 * k);
+    let mut v = glam::Vec3::new((-x0 - x0) * a + x0, 0., z0);
+    let l2 = v.length_squared();
+    if l2 != 1.0 { v = if l2 >= 1e-8 { v / l2.sqrt() } else { glam::Vec3::ZERO }; }
+    let r = glam::Quat::from_rotation_z((pawn_yaw + 90.).to_radians());
+    let v = (r * v) * -mag(clamp(since + mag_range.0, mag_range));
+    (v, mag(clamp(since, mag_range)))
+}
+
 /// `ABuildingContainer` ctor (@140458c60) defaults of the Athena toss (no Blueprint overrides them): `LootTossDirection_Athena` (pitch 65, yaw 90, roll 0),
 /// `LootTossSpeed_Athena` 550 cm/s, `LootTossConeHalfAngle_Athena` 60 degrees.
 pub const TOSS_PITCH: f32 = 65.;
@@ -352,16 +378,18 @@ pub const TOSS_CONE_HALF_ANGLE: f32 = 60.;
 /// `LootSpawnLocation` (the live client's value, no tier set applied); the launch direction = the actor rotation x `LootTossDirection_Athena`, jittered uniformly in the
 /// `LootTossConeHalfAngle_Athena` cone, at `LootTossSpeed_Athena`; it lands where that ballistic path (gravity `gravity_cm`, cm/s^2) meets the container's
 /// base height. The pickup then flies the port's toss arc to that point (`fn_game::pickups`).
+pub fn toss_speed(d: Option<&ClassDef>) -> f32 { d.and_then(|d| d.props.get("LootTossSpeed_Athena")).and_then(|v| v.as_f64()).map_or_else(|| fn_live::f32("FN_TOSS_SPEED", TOSS_SPEED), |v| v as f32) }
+pub fn toss_cone(d: Option<&ClassDef>) -> f32 { d.and_then(|d| d.props.get("LootTossConeHalfAngle_Athena")).and_then(|v| v.as_f64()).map_or_else(|| fn_live::f32("FN_TOSS_CONE_HALF_ANGLE", TOSS_CONE_HALF_ANGLE), |v| v as f32) }
 pub fn toss_launch(d: Option<&ClassDef>, t: glam::Vec3, q: glam::Quat, s: glam::Vec3, rng: &mut Rng) -> (glam::Vec3, glam::Vec3) {
     use glam::{Mat3, Vec3};
     let loc = d.map(|d| d.loot_spawn_location).unwrap_or([0., 0., 100.]);
     let a = t + q * (Vec3::from(loc) * s);
     let base = Mat3::from_quat(q) * Mat3::from_rotation_z(fn_live::f32("FN_TOSS_YAW", TOSS_YAW).to_radians()) * Mat3::from_rotation_y(-fn_live::f32("FN_TOSS_PITCH", TOSS_PITCH).to_radians());
-    let cos_max = fn_live::f32("FN_TOSS_CONE_HALF_ANGLE", TOSS_CONE_HALF_ANGLE).to_radians().cos();
+    let cos_max = toss_cone(d).to_radians().cos();
     let cz = 1. - rng.next_f32() * (1. - cos_max);
     let sz = (1. - cz * cz).max(0.).sqrt();
     let phi = rng.next_f32() * std::f32::consts::TAU;
-    (a, base * Vec3::new(cz, sz * phi.cos(), sz * phi.sin()) * fn_live::f32("FN_TOSS_SPEED", TOSS_SPEED))
+    (a, base * Vec3::new(cz, sz * phi.cos(), sz * phi.sin()) * toss_speed(d))
 }
 
 pub fn toss_points(d: Option<&ClassDef>, tier: i32, t: glam::Vec3, q: glam::Quat, s: glam::Vec3, rng: &mut Rng, gravity_cm: f32) -> (glam::Vec3, glam::Vec3) {
@@ -371,12 +399,12 @@ pub fn toss_points(d: Option<&ClassDef>, tier: i32, t: glam::Vec3, q: glam::Quat
     let a = t + q * (Vec3::from(loc) * s);
     let base = Mat3::from_quat(q) * Mat3::from_rotation_z(fn_live::f32("FN_TOSS_YAW", TOSS_YAW).to_radians()) * Mat3::from_rotation_y(-fn_live::f32("FN_TOSS_PITCH", TOSS_PITCH).to_radians());
     // a uniform direction in the cone about the local X axis
-    let cos_max = fn_live::f32("FN_TOSS_CONE_HALF_ANGLE", TOSS_CONE_HALF_ANGLE).to_radians().cos();
+    let cos_max = toss_cone(d).to_radians().cos();
     let cz = 1. - rng.next_f32() * (1. - cos_max);
     let sz = (1. - cz * cz).max(0.).sqrt();
     let phi = rng.next_f32() * std::f32::consts::TAU;
     let dir = base * Vec3::new(cz, sz * phi.cos(), sz * phi.sin());
-    let v = dir * fn_live::f32("FN_TOSS_SPEED", TOSS_SPEED);
+    let v = dir * toss_speed(d);
     let g = gravity_cm.max(1.);
     // z(t) = a.z + v.z t - g t^2 / 2 = t.z
     let dz = a.z - t.z;
@@ -402,7 +430,7 @@ pub fn rarity_color2(set: &PakSet) -> Result<Vec<[f32; 4]>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn inp(down: bool, pressed: bool, focused: bool) -> SearchInput { SearchInput { use_down: down, use_pressed: pressed, focused, duration: 1.3 } }
+    fn inp(down: bool, pressed: bool, focused: bool) -> SearchInput { SearchInput { use_down: down, use_pressed: pressed, focused, duration: 1.3, cancel: false } }
 
     #[test] fn a_held_search_completes_after_its_duration() {
         let mut s = Search::default();
@@ -459,6 +487,51 @@ mod tests {
             assert!((got - want).abs() < 0.015, "{}: {got:.3} vs {want:.3}", r.loot_package);
         }
     }
+    fn dist(t: &LootTables, id: &str, cat: Option<i32>, p: f64, out: &mut HashMap<(String, i32), f64>, depth: u32) {
+        if depth > 8 { return; }
+        let rows: Vec<&PackageRow> = t.package_rows(id).filter(|r| cat.map_or(true, |c| r.category == c) && r.weight > 0.).collect();
+        let total: f64 = rows.iter().map(|r| r.weight as f64).sum();
+        for r in rows {
+            let q = p * r.weight as f64 / total;
+            if !r.call.is_empty() { dist(t, &r.call, None, q, out, depth + 1); } else if !r.item.is_empty() && r.count > 0 { *out.entry((r.item.clone(), r.count)).or_default() += q; }
+        }
+    }
+    fn check_group(t: &LootTables, group: &str, n: usize, seed: u64) {
+        let tiers: Vec<&TierRow> = t.tiers_of(group).collect();
+        let wt: f64 = tiers.iter().map(|r| r.weight as f64).sum();
+        let ncat = tiers.iter().map(|r| r.category_min.iter().filter(|m| **m > 0).count()).max().unwrap_or(0);
+        let mut want: Vec<HashMap<(String, i32), f64>> = vec![HashMap::new(); ncat];
+        for r in &tiers {
+            assert_eq!(r.num_drops.fract(), 0., "{}: whole drops", r.name);
+            for c in 0..ncat { let mut m = HashMap::new(); dist(t, &r.loot_package, Some(c as i32), r.weight as f64 / wt, &mut m, 0); for (k, v) in m { *want[c].entry(k).or_default() += v * r.category_min[c] as f64; } }
+        }
+        let per_cat: Vec<usize> = tiers[0].category_min.iter().take(ncat).map(|m| *m as usize).collect();
+        let mut got: Vec<HashMap<(String, i32), f64>> = vec![HashMap::new(); ncat];
+        let mut rng = Rng::new(seed);
+        for _ in 0..n {
+            let d = t.roll(group, &mut rng);
+            assert_eq!(d.len(), per_cat.iter().sum::<usize>(), "{group}: {d:?}");
+            let mut k = 0;
+            for (c, m) in per_cat.iter().enumerate() { for _ in 0..*m { *got[c].entry((d[k].item.clone(), d[k].count)).or_default() += 1.; k += 1; } }
+        }
+        for c in 0..ncat {
+            let total_w: f64 = want[c].values().sum();
+            assert!((total_w - per_cat[c] as f64).abs() < 1e-6, "{group} category {c}: expected mass {total_w}");
+            for k in got[c].keys() { assert!(want[c].contains_key(k), "{group} category {c}: {k:?} is not in the tables"); }
+            for (k, p) in &want[c] {
+                let pn = p / per_cat[c] as f64;
+                let f = got[c].get(k).copied().unwrap_or(0.) / (n * per_cat[c]) as f64;
+                let sigma = (pn * (1. - pn) / (n * per_cat[c]) as f64).sqrt();
+                assert!((f - pn).abs() <= 4. * sigma + 1e-3, "{group} category {c} {k:?}: {f:.4} vs {pn:.4} (4 sigma {:.4})", 4. * sigma);
+            }
+            eprintln!("{group} category {c}: {} outcomes match the tables", want[c].len());
+        }
+    }
+    #[test] fn ten_thousand_rolls_follow_the_cooked_probabilities() {
+        let Some(t) = tables() else { eprintln!("no 1.8 install: skipped"); return };
+        check_group(&t, "Loot_AthenaTreasure", 10_000, 11);
+        check_group(&t, "Loot_AthenaAmmoLarge", 10_000, 12);
+    }
     #[test] fn the_ammo_box_roll_gives_ammo() {
         let Some(t) = tables() else { return };
         let mut rng = Rng::new(7);
@@ -491,6 +564,26 @@ mod tests {
         assert!(searched_mesh(&chest, 0).unwrap().ends_with("TreasureChestLootTier1_Searched"));
         assert!(searched_mesh(&ammo, 1).unwrap().ends_with("Loot_AmmoCase_Tier1_Searched"));
         assert!(load_class(&set, "Tiered_Chest_3_Child").unwrap().is_a("Tiered_Chest_6_Parent"));
+    }
+    #[test] fn a_change_of_equipment_interrupts_the_search() {
+        let mut s = Search::default();
+        s.update(&inp(true, true, true), 0.016);
+        let mut c = inp(true, false, true);
+        c.cancel = true;
+        assert_eq!(s.update(&c, 0.016), vec![SearchEvent::Interrupted]);
+    }
+    #[test] fn the_jiggle_follows_the_exe_drive() {
+        let mag = |t: f32| t;
+        let (v, h) = jiggle(&mag, (0., 1.), &|_| 0.5, (0., 1.), 0.25, 0.);
+        assert!((v - glam::Vec3::new(0., 0., -0.25)).length() < 1e-5, "{v}");
+        assert!((h - 0.25).abs() < 1e-6);
+        let (v, _) = jiggle(&mag, (0., 1.), &|_| 0., (0., 1.), 0.5, 0.);
+        let k = 1.0 / 0.625f32.sqrt();
+        assert!((v - glam::Vec3::new(0., 0.75 * k, 0.25 * k) * -0.5).length() < 1e-5, "yaw + 90 turns the tilt to +Y: {v}");
+        let (v, h) = jiggle(&mag, (0.2, 1.), &|_| 0.5, (0., 1.), 5.0, 0.);
+        assert!((v.z + 1.0).abs() < 1e-5 && (h - 1.0).abs() < 1e-6, "clamped to the last key");
+        let (_, h) = jiggle(&mag, (0.2, 1.), &|_| 0.5, (0., 1.), 0.1, 0.);
+        assert!((h - 0.2).abs() < 1e-6, "the base drive clamps without the key offset");
     }
     #[test] fn the_toss_leaves_the_front_upwards_and_lands_on_the_base() {
         let mut rng = Rng::new(9);

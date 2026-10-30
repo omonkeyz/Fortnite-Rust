@@ -204,7 +204,8 @@ fn build_world(job: Job, p: Arc<Progress>, plan: Plan) -> Result<Box<Scene>, Str
     let loadout = if let Some(set) = &paks {
         let i = plan.loadout.ok_or("no starter loadout progress unit")?;
         p.begin(i);
-        let resources = fn_pose::loadout::Resources::load(&ClipSourceDir::Pak(set))?;
+        let mut resources = fn_pose::loadout::Resources::load(&ClipSourceDir::Pak(set))?;
+        crate::emote_hook::absorb(set, &mut resources);
         eprintln!("[loadout] loaded {} original item definitions, {} role bindings, {} montages, {} composites, {} sequences", resources.items.len(), resources.bindings.len(), resources.montages.len(), resources.composites.len(), resources.sequences.len());
         eprintln!("[loadout] recovered {} inherited weapon core groups and {} original blendspaces",resources.core_anims.len(),resources.blendspaces.len());
         eprintln!("[loadout] retained {} original gun material packages with full section/parent references",resources.materials.len());
@@ -269,7 +270,7 @@ fn build_world(job: Job, p: Arc<Progress>, plan: Plan) -> Result<Box<Scene>, Str
                 let sky_dir = roots.find("dome_optimized.bin").and_then(|f| f.parent()).ok_or("Missing asset: dome_optimized.bin")?;
                 let sky = SkyAssets::load(sky_dir)?;
                 let mut current: Option<usize> = None;
-                let r = Renderer::new_with_progress(&device, &queue, format, &RendererAssets { sky, ground_texture: ground }, &mut |label| {
+                let r = Renderer::new_with_progress(&device, &queue, format, &RendererAssets { sky, ground_texture: ground, ground_mips: None }, &mut |label| {
                     if let Some(c) = current.take() { p.end(c); }
                     if let Some(i) = renderer_units.iter().copied().find(|&i| p.with(|c, _| c.units[i].label == label)) { p.begin(i); current = Some(i); }
                 })?;
@@ -534,6 +535,7 @@ impl Loader {
                 let mut scratch = RenderList::new();
                 ui.hud.set_state(&fn_ui::screens::hud::HudState::default());
                 ui.hud.present(&mut ui.ctx, 1920., 1080., &mut scratch);
+                fn_ui::screens::game_phase::prewarm(&mut ui.ctx);
                 self.progress.end(self.plan.hud);
                 Ui::Brushes { files: fn_ui::menu::lower::brush_files().into_iter().collect(), i: 0 }
             }
@@ -673,7 +675,7 @@ pub mod cosmetic {
         let t = Instant::now();
         let hero = item.hero.clone().ok_or_else(|| format!("{} has no HeroDefinition", item.id))?;
         let src = ClipSourceDir::Pak(set);
-        let ch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fn_pose::br_character::BrCharacter::load(&src, &hero))).map_err(|_| format!("{hero}: the character loader panicked"))??;
+        let ch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fn_pose::br_character::with_cooked_only(|| fn_pose::br_character::BrCharacter::load(&src, &hero)))).map_err(|_| format!("{hero}: the character loader panicked"))??;
         let part_anim = crate::part_anim_glue::build(&ch, &src);
         let parts = ch.parts.iter().map(|p| p.def.package.clone()).collect();
         let model = crate::br_character::from_character(&ch);
@@ -716,7 +718,7 @@ pub mod cosmetic {
             }
             let vertices = (0..p.positions.len()).map(|i| SkinnedVertex { pos: p.positions[i], normal: p.normals[i], uv: p.uvs[i], joints: p.joints[i], weights: p.weights[i] }).collect();
             let two_sided = mat.as_deref().is_some_and(|m| fn_pose::br_character::material_two_sided(&src, m).unwrap_or(false)); // shadow-pass culling (UE4.16 ShadowDepthRendering.cpp:1059)
-            prims.push(SkinnedPrimitive { vertices, indices: p.indices.clone(), material: MaterialImages { diffuse: rgba(&diffuse), normal: rgba(&normal), spec: rgba(&spec), mask: rgba(&mask), ue: None, two_sided, cooked: Default::default() }, kind: MaterialKind::Prop });
+            prims.push(SkinnedPrimitive { vertices, indices: p.indices.clone(), material: MaterialImages { diffuse: rgba(&diffuse), normal: rgba(&normal), spec: rgba(&spec), mask: rgba(&mask), ue: None, two_sided, cooked: [&diffuse, &normal, &spec, &mask].map(|t| t.as_ref().and_then(crate::br_character::cooked_of)) }, kind: MaterialKind::Prop });
         }
         make_rigid(&mut prims);
         Ok(PickDecoded { item: item.clone(), mesh: ps.weapon_mesh.clone(), set: ps, prims, notes, ms: t.elapsed().as_millis(), upload_ms: 0 })
@@ -1040,7 +1042,7 @@ pub mod cosmetic {
             let roots = AssetRoots::open(vec![PathBuf::from(dir)]);
             let sky = fn_render::SkyAssets::load(roots.find("dome_optimized.bin").and_then(|f| f.parent()).expect("dome_optimized.bin")).unwrap();
             let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-            let renderer = Renderer::new(&gpu.device, &gpu.queue, format, &RendererAssets { sky, ground_texture: roots.load_rgba("T_Grasslands_D.png").unwrap() }).unwrap();
+            let renderer = Renderer::new(&gpu.device, &gpu.queue, format, &RendererAssets { sky, ground_texture: roots.load_rgba("T_Grasslands_D.png").unwrap(), ground_mips: None }).unwrap();
             let set = fn_game::cosmetic_swap::paks().unwrap();
             let src = ClipSourceDir::Pak(&set);
             let first = crate::br_character::from_character(&fn_pose::br_character::BrCharacter::load(&src, fn_pose::br_character::DEFAULT_HERO).unwrap());

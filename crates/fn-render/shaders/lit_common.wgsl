@@ -558,3 +558,198 @@ fn output_hdr(lit_in: vec3<f32>, amb_in: vec3<f32>, world_pos: vec3<f32>, cam: v
     let lit_pos = max(lit, vec3<f32>(0.0));
     return vec4<f32>(lit_pos, clamp(amb_luma / max(luma709(lit_pos), 1e-4), 0.0, 1.0));
 }
+const SM_UNLIT: u32 = 0u;
+const SM_DEFAULT_LIT: u32 = 1u;
+const SM_SUBSURFACE: u32 = 2u;
+const SM_PREINTEGRATED_SKIN: u32 = 3u;
+const SM_CLEAR_COAT: u32 = 4u;
+const SM_SUBSURFACE_PROFILE: u32 = 5u;
+const SM_TWOSIDED_FOLIAGE: u32 = 6u;
+const SM_HAIR: u32 = 7u;
+const SM_CLOTH: u32 = 8u;
+const SM_EYE: u32 = 9u;
+
+// DecodeShadingModelId (DeferredShadingCommon.usf:285): GBufferB.a = (ShadingModelID | SelectiveOutputMask) / 255
+fn sm_decode_id(gbuffer_b_a: f32) -> u32 { return u32(round(clamp(gbuffer_b_a, 0.0, 1.0) * 255.0)) & 0xFu; }
+// IsSubsurfaceModel (DeferredShadingCommon.usf:295)
+fn sm_is_subsurface(id: u32) -> bool {
+    return id == SM_SUBSURFACE || id == SM_PREINTEGRATED_SKIN || id == SM_SUBSURFACE_PROFILE || id == SM_TWOSIDED_FOLIAGE || id == SM_HAIR || id == SM_EYE;
+}
+fn sm_subsurface_color(custom: vec4<f32>) -> vec3<f32> { return custom.rgb * custom.rgb; }
+
+// SubsurfaceShadingSubsurface (ShadingModels.usf:606)
+fn sm_shading_subsurface(custom: vec4<f32>, gbuffer_ao: f32, l: vec3<f32>, v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let sss = sm_subsurface_color(custom);
+    let opacity = custom.a;
+    let h = normalize(v + l);
+    let in_scatter = pow(clamp(dot(l, -v), 0.0, 1.0), 12.0) * mix(3.0, 0.1, opacity);
+    let normal_contribution = clamp(dot(n, h) * opacity + 1.0 - opacity, 0.0, 1.0);
+    let back_scatter = gbuffer_ao * normal_contribution / (3.14159265 * 2.0);
+    return sss * mix(back_scatter, 1.0, in_scatter);
+}
+// SubsurfaceShadingTwoSided (ShadingModels.usf:625)
+fn sm_shading_two_sided(sss: vec3<f32>, l: vec3<f32>, v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let wrap = 0.5;
+    let nol = clamp((dot(-n, l) + wrap) / ((1.0 + wrap) * (1.0 + wrap)), 0.0, 1.0);
+    let vol = clamp(dot(v, -l), 0.0, 1.0);
+    let a = 0.6;
+    let a2 = a * a;
+    let d = (vol * a2 - vol) * vol + 1.0;
+    let ggx = (a2 / 3.14159265) / (d * d);
+    return nol * ggx * sss;
+}
+// SubsurfaceShading (ShadingModels.usf:726) for the models this port draws; PREINTEGRATED_SKIN (needs the PreintegratedSkinBRDF texture), HAIR and EYE return 0
+// here: no material of the audited foliage / character set uses them (docs/spec/material_coverage.md), they are reported instead of approximated.
+fn sm_subsurface_shading(id: u32, custom: vec4<f32>, gbuffer_ao: f32, l: vec3<f32>, v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (id == SM_SUBSURFACE) { return sm_shading_subsurface(custom, gbuffer_ao, l, v, n); }
+    if (id == SM_TWOSIDED_FOLIAGE) { return sm_shading_two_sided(sm_subsurface_color(custom), l, v, n); }
+    return vec3<f32>(0.0);
+}
+struct LocalLightGpu {
+    pos_inv_radius: vec4<f32>,
+    color_falloff: vec4<f32>,
+    dir_min_rough: vec4<f32>,
+    spot_source: vec4<f32>,
+    flags: vec4<f32>,
+}
+@group(0) @binding(23) var<storage, read> ll_lights: array<LocalLightGpu>;
+@group(0) @binding(24) var<storage, read> ll_grid: array<u32>;
+@group(0) @binding(25) var ll_ies: texture_2d<f32>;
+var<private> g_ll_scatter: vec3<f32> = vec3<f32>(0.0);
+fn ll_cell(world: vec3<f32>) -> vec2<u32> {
+    let nx = ll_grid[0];
+    let ny = ll_grid[1];
+    let nz = ll_grid[2];
+    if (ll_grid[7] == 0u) { return vec2<u32>(0u, 0u); }
+    let pv = camera.view * vec4<f32>(world, 1.0);
+    let depth = -pv.z;
+    if (depth <= 0.0) { return vec2<u32>(0u, 0u); }
+    let ndc = vec2<f32>(pv.x / (depth * camera.proj.x), pv.y / (depth * camera.proj.y));
+    let px = clamp((ndc.x * 0.5 + 0.5) * camera.viewport.x, 0.0, camera.viewport.x - 1.0);
+    let py = clamp((0.5 - ndc.y * 0.5) * camera.viewport.y, 0.0, camera.viewport.y - 1.0);
+    let zp = vec3<f32>(bitcast<f32>(ll_grid[4]), bitcast<f32>(ll_grid[5]), bitcast<f32>(ll_grid[6]));
+    let zs = min(u32(max(0.0, log2(depth * 100.0 * zp.x + zp.y) * zp.z)), nz - 1u);
+    let cx = min(u32(px) >> ll_grid[3], nx - 1u);
+    let cy = min(u32(py) >> ll_grid[3], ny - 1u);
+    let c = (zs * ny + cy) * nx + cx;
+    return vec2<u32>(ll_grid[8u + 2u * c], ll_grid[8u + 2u * c + 1u]);
+}
+fn ll_d_ggx(r: f32, noh: f32) -> f32 {
+    let a = r * r;
+    let a2 = a * a;
+    let d = (noh * a2 - noh) * noh + 1.0;
+    return a2 / (3.14159265 * d * d);
+}
+fn ll_vis(r: f32, nov: f32, nol: f32) -> f32 {
+    let a = r * r;
+    let sv = nol * (nov * (1.0 - a) + a);
+    let sl = nov * (nol * (1.0 - a) + a);
+    return 0.5 / (sv + sl);
+}
+fn ll_f_schlick(spec: vec3<f32>, voh: f32) -> vec3<f32> {
+    let fc = pow(1.0 - voh, 5.0);
+    return clamp(50.0 * spec.g, 0.0, 1.0) * fc + (1.0 - fc) * spec;
+}
+fn local_lighting(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, diffuse_color: vec3<f32>, spec_color: vec3<f32>, roughness: f32, id: u32, custom: vec4<f32>, gbuffer_ao: f32) -> vec3<f32> {
+    g_ll_scatter = vec3<f32>(0.0);
+    let cell = ll_cell(world);
+    if (cell.y == 0u) { return vec3<f32>(0.0); }
+    let p = world * 100.0;
+    var total = vec3<f32>(0.0);
+    for (var k = 0u; k < cell.y; k = k + 1u) {
+        let li = ll_grid[cell.x + k];
+        let l = ll_lights[li];
+        var to_light = l.pos_inv_radius.xyz - p;
+        let d2 = dot(to_light, to_light);
+        var ld = to_light * inverseSqrt(d2);
+        var dist_att = 1.0;
+        var nol = 0.0;
+        var mask = 0.0;
+        let inv_r = l.pos_inv_radius.w;
+        let src_r = l.spot_source.z;
+        let src_len = l.spot_source.w;
+        if (l.flags.x > 0.5) {
+            if (src_len > 0.0) {
+                let l01 = l.dir_min_rough.xyz * src_len;
+                let t0 = to_light - 0.5 * l01;
+                let t1 = to_light + 0.5 * l01;
+                let ls0 = dot(t0, t0);
+                let ls1 = dot(t1, t1);
+                let r0 = inverseSqrt(ls0);
+                let r1 = inverseSqrt(ls1);
+                dist_att = 1.0 / ((ls0 * r0 * ls1 * r1 + dot(t0, t1)) * 0.5 + 1.0);
+                nol = clamp(0.5 * (dot(n, t0) * r0 + dot(n, t1) * r1), 0.0, 1.0);
+            } else {
+                dist_att = 1.0 / (d2 + 1.0);
+                nol = clamp(dot(n, ld), 0.0, 1.0);
+                if (src_r > 0.0) {
+                    nol = dot(n, ld);
+                    let sin_a2 = clamp(src_r * src_r / d2, 0.0, 1.0);
+                    let sin_a = sqrt(sin_a2);
+                    if (nol < sin_a) {
+                        nol = max(nol, -sin_a);
+                        nol = (sin_a + nol) * (sin_a + nol) / (4.0 * sin_a);
+                    }
+                }
+            }
+            let m0 = clamp(1.0 - (d2 * inv_r * inv_r) * (d2 * inv_r * inv_r), 0.0, 1.0);
+            mask = m0 * m0;
+        } else {
+            nol = clamp(dot(n, ld), 0.0, 1.0);
+            let wl = to_light * inv_r;
+            mask = pow(1.0 - clamp(dot(wl, wl), 0.0, 1.0), l.color_falloff.w);
+        }
+        let sc = clamp((dot(ld, l.dir_min_rough.xyz) - l.spot_source.x) * l.spot_source.y, 0.0, 1.0);
+        let spot = sc * sc;
+        if (!(mask > 0.0 && spot > 0.0)) { continue; }
+        let atten = dist_att * mask * spot;
+        let lobe_r = max(roughness, l.dir_min_rough.w);
+        let m = lobe_r * lobe_r;
+        var energy = 1.0;
+        var r = 2.0 * dot(v, n) * n - v;
+        let inv_dist = inverseSqrt(dot(to_light, to_light));
+        r = normalize(mix(n, r, (1.0 - m) * (sqrt(1.0 - m) + m)));
+        if (src_len > 0.0) {
+            let line_angle = clamp(src_len * inv_dist, 0.0, 1.0);
+            energy = energy * m / clamp(m + 0.5 * line_angle, 0.0, 1.0);
+            let l01 = l.dir_min_rough.xyz * src_len;
+            let l0 = to_light - 0.5 * l01;
+            let a = src_len * src_len;
+            let b = dot(r, l01);
+            let t = clamp(dot(l0, b * r - l01) / (a - b * b), 0.0, 1.0);
+            to_light = l0 + t * l01;
+        }
+        if (src_r > 0.0) {
+            let sphere_angle = clamp(src_r * inv_dist, 0.0, 1.0);
+            let e = m / clamp(m + 0.5 * sphere_angle, 0.0, 1.0);
+            energy = energy * e * e;
+            let closest = dot(to_light, r) * r;
+            let c2r = closest - to_light;
+            to_light = to_light + c2r * clamp(src_r * inverseSqrt(dot(c2r, c2r)), 0.0, 1.0);
+        }
+        ld = normalize(to_light);
+        let h = normalize(v + ld);
+        let nol_s = clamp(dot(n, ld), 0.0, 1.0);
+        let nov = clamp(abs(dot(n, v)) + 1e-5, 0.0, 1.0);
+        let noh = clamp(dot(n, h), 0.0, 1.0);
+        let voh = clamp(dot(v, h), 0.0, 1.0);
+        let d = ll_d_ggx(lobe_r, noh) * energy;
+        let vis = ll_vis(lobe_r, nov, nol_s);
+        let f = ll_f_schlick(spec_color, voh);
+        let diffuse = diffuse_color * (1.0 / 3.14159265);
+        let lcm = l.color_falloff.xyz * (nol * atten);
+        var c = (diffuse + (d * vis) * f) * lcm;
+        let sss = sm_subsurface_shading(id, custom, gbuffer_ao, ld, v, n) * l.color_falloff.xyz * atten;
+        c = c + sss;
+        var profile = 1.0;
+        if (l.flags.y >= 0.0) {
+            let neg = normalize(p - l.pos_inv_radius.xyz);
+            let ang = asin(clamp(dot(neg, l.dir_min_rough.xyz), -1.0, 1.0));
+            let rows = f32(textureDimensions(ll_ies).y);
+            profile = textureSampleLevel(ll_ies, sky_refl_samp, vec2<f32>(ang / 3.14159265 + 0.5, (l.flags.y + 0.5) / rows), 0.0).r;
+        }
+        total = total + c * profile;
+        g_ll_scatter = g_ll_scatter + (1.0 / 3.14159265) * lcm * profile;
+    }
+    return total;
+}

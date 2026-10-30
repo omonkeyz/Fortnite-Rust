@@ -93,6 +93,7 @@ impl AdsDriver {
         let modes = self.gun.and_then(|g| self.modes.get(g));
         sim.ads.base = modes.map(|m| m.0); sim.ads.target = modes.map(|m| m.1);
         sim.ads.weight = f.weight; sim.ads.active = f.camera_active; sim.ads.hide_pawn = f.pawn_hidden; sim.ads.speed_cap_cm = f.speed_cap_cm;
+        if sim.dbno { sim.ads.base = Some(&fn_camera::DBNO); sim.ads.target = None; sim.ads.weight = 0.; sim.ads.active = false; sim.ads.hide_pawn = false; sim.ads.speed_cap_cm = None; }
         let k = if f.aiming { f.look_scale } else { 1. };
         inp.yaw_delta *= k; inp.pitch_delta *= k;
     }

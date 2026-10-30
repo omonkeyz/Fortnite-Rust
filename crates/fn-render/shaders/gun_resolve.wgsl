@@ -30,7 +30,7 @@ fn gun_resolve(world: vec3<f32>, n: vec3<f32>, indirect: vec3<f32>, base: vec3<f
     // ReflectionApplyPS reads it; GBufferAO = 1 (the cooked WeaponMat_Base PS writes AO = 1, docs/spec/pickup_visual_gaps.md section 1).
     reflection_inputs(n, v, world, spec_color, clamp(roughness_in, 0.0, 1.0), 1.0);
     // sun_radiance carries the Lambert 1/pi (scene.wgsl); the specular lobe is not divided by pi, so its light colour is sun_radiance * pi
-    let lit = indirect + diffuse_color * sun * nl * vis + sun * GUN_PI * ggx_spec_color(n, v, l, clamp(roughness_in, 0.0, 1.0), spec_color) * vis;
+    let lit = indirect + diffuse_color * sun * nl * vis + sun * GUN_PI * ggx_spec_color(n, v, l, clamp(roughness_in, 0.0, 1.0), spec_color) * vis + local_lighting(world, n, v, diffuse_color, spec_color, clamp(roughness_in, 0.0, 1.0), SM_DEFAULT_LIT, vec4<f32>(0.0), 1.0);
     return output_hdr(lit, indirect, world, cam);
 }
 

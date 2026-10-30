@@ -7,7 +7,7 @@ use fn_hitreg::{fire, load, FireContext, GunHit, Impact, Projectile, Shot, Sprea
 use fn_weapons::recovered_recoil::{CrtRand, RecoilState, RecoilStats}; // RECOIL HOOK: recovered native recoil (fn-weapons/RECOIL.md)
 use std::sync::Mutex;
 
-struct State { guns: Vec<GunHit>, spread: Vec<SpreadState>, held: Option<usize>, recoil: Vec<RecoilState>, crt: CrtRand, now: f32, last: Vec<u32>, flying: Vec<(usize, Projectile)> }
+struct State { guns: Vec<GunHit>, spread: Vec<SpreadState>, held: Option<usize>, recoil: Vec<RecoilState>, crt: CrtRand, now: f32, last: Vec<u32>, flying: Vec<(usize, Projectile, u64)> }
 /// Firearms installed after start-up (`weapon_runtime`): (gun index, hit data read by the weapon's load worker); appended in gun-index order once the starters' state exists.
 static EXTRA: Mutex<Vec<(usize, GunHit)>> = Mutex::new(Vec::new());
 pub fn add_gun(g: usize, hit: GunHit) { if let Ok(mut q) = EXTRA.lock() { q.push((g, hit)); } }
@@ -51,9 +51,11 @@ fn start(install: std::path::PathBuf, wids: Vec<String>) {
 static INSTALL: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /// The game install (called once when the loadout resources arrive).
 pub fn set_install(dir: Option<std::path::PathBuf>) { if let Ok(mut i) = INSTALL.lock() { *i = dir; } }
+pub fn gun_by_row(row: &str) -> Option<GunHit> { STATE.lock().ok()?.as_ref()?.guns.iter().find(|g| g.row == row).cloned() }
 pub fn install_dir() -> Option<std::path::PathBuf> { INSTALL.lock().ok().and_then(|i| i.clone()) }
 /// RECOIL HOOK: `inp` = this frame's look input (the `DeltaRot` of `AFortPlayerController::UpdateRotation`), `gamepad` = `IsUsingGamepad`.
 pub fn on_arms(sim: &mut GameSim, arms: &Arms, aiming: bool, dt: f32, inp: &mut FrameInput, gamepad: bool) {
+    fn_hitreg::shoot::set_pawn_damage_gate(sim.damage_enabled());
     let install = INSTALL.lock().ok().and_then(|i| i.clone());
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if st.is_none() {
@@ -97,12 +99,19 @@ pub fn on_arms(sim: &mut GameSim, arms: &Arms, aiming: bool, dt: f32, inp: &mut 
             // RECOIL HOOK: AddRecoil (RVA 0x917930) once per shot; LastFireTime = TimeSeconds
             let crt = &mut s.crt; s.recoil[g].on_fire(s.now); s.recoil[g].add_recoil(&recoil_stats(&gun.stats), aiming, gamepad, ATHENA_RECOIL, &mut || crt.next());
             if fn_hitreg::explosive::def_of(gun).is_some() { if let Some(l) = fn_hitreg::explosive::launch(gun, &sim.world, &shot, &mut s.spread[g], &ctx, seed) { crate::rocket_hook::fire_local(gun, l); } continue; }
-            if let Some(p) = Projectile::launch(gun, &sim.world, &shot, &mut s.spread[g], &ctx, seed) { crate::mp_hook::on_cartridge(&gun.row, shot.eye, shot.forward, &[]); s.flying.push((g, p)); continue; }
+            if let Some(p) = Projectile::launch(gun, &sim.world, &shot, &mut s.spread[g], &ctx, seed) { crate::mp_hook::on_cartridge(&gun.row, shot.eye, shot.forward, &[]); let key = crate::gunfx_hook::projectile_spawn(gun, p.pos, p.vel); s.flying.push((g, p, key)); continue; }
             let mut pawns = crate::mp_hook::pawn_targets();
-            let rep = if pawns.is_empty() { fire(gun, &mut sim.world, &shot, &mut s.spread[g], &ctx, seed) } else { fn_hitreg::shoot::fire_at(gun, &mut sim.world, &mut pawns, &Default::default(), &shot, &mut s.spread[g], &ctx, seed) };
-            crate::mp_hook::on_cartridge(&gun.row, shot.eye, shot.forward, &rep.pawn_hits);
+            pawns.extend(crate::bots_hook::pawn_targets());
+            let rep = if pawns.is_empty() { fire(gun, &mut sim.world, &shot, &mut s.spread[g], &ctx, seed) } else { fn_hitreg::shoot::fire_at(gun, &mut sim.world, &mut pawns, &crate::mp_hook::pawn_fire(), &shot, &mut s.spread[g], &ctx, seed) };
+            crate::bots_hook::on_player_hits(&gun.row, &rep.pawn_hits);
+            let mp_hits: Vec<_> = rep.pawn_hits.iter().filter(|h| !crate::bots_hook::is_bot(h.id)).cloned().collect();
+            crate::mp_hook::on_cartridge(&gun.row, shot.eye, shot.forward, &mp_hits);
+            crate::supply_drop_hook::on_shot(shot.eye, shot.forward, rep.impacts.iter().map(|i| i.distance_m).reduce(f32::min), gun.stats.dmg[0] * rep.pellets.max(1) as f32);
             eprintln!("[hitreg f{:05}] {} fired {} pellet(s) spread {:.2} deg{}: {} impact(s) {} miss(es){}", sim.frames, gun.row, rep.pellets, rep.spread_deg, if rep.from_muzzle { " (muzzle)" } else { "" }, rep.impacts.len(), rep.misses,
                 rep.impacts.first().map_or(String::new(), |i| format!("; first {:.1} m prop {:?} surface {} damage {} destroyed {}", i.distance_m, i.prop, i.surface, i.damage, i.destroyed)));
+            let start = crate::muzzle_hook::muzzle_ue(g).unwrap_or_else(|| glam::Vec3::from(fn_particles::sim::game_to_ue(rep.start.to_array())));
+            crate::gunfx_hook::on_shot(gun, &rep.tracer_ends, start, false);
+            for i in &rep.impacts { crate::gunfx_hook::on_impact(gun, i); }
             if let Ok(mut q) = IMPACTS.lock() { q.extend(rep.impacts.into_iter().map(|i| (g, i))); }
         }
     }
@@ -111,19 +120,25 @@ pub fn on_arms(sim: &mut GameSim, arms: &Arms, aiming: bool, dt: f32, inp: &mut 
     while left > 1e-6 && !s.flying.is_empty() {
         let h = left.min(1. / 120.); left -= h;
         let mut done = vec![];
-        for (i, (g, p)) in s.flying.iter_mut().enumerate() {
+        for (i, (g, p, key)) in s.flying.iter_mut().enumerate() {
             let gun = &s.guns[*g];
             let mut pawns = crate::mp_hook::pawn_targets();
-            let (hit, phits) = if pawns.is_empty() { (p.step(gun, &mut sim.world, h, grav, 1000., 1), vec![]) } else { p.step_at(gun, &mut sim.world, &mut pawns, &Default::default(), h, grav, 1000., 1) };
+            pawns.extend(crate::bots_hook::pawn_targets());
+            let (hit, phits) = if pawns.is_empty() { (p.step(gun, &mut sim.world, h, grav, 1000., 1), vec![]) } else { p.step_at(gun, &mut sim.world, &mut pawns, &crate::mp_hook::pawn_fire(), h, grav, 1000., 1) };
+            crate::bots_hook::on_player_hits(&gun.row, &phits);
+            let phits: Vec<_> = phits.into_iter().filter(|h| !crate::bots_hook::is_bot(h.id)).collect();
             if !phits.is_empty() { crate::mp_hook::on_projectile_hits(&gun.row, &phits); }
             if let Some(imp) = hit {
                 eprintln!("[hitreg f{:05}] {} projectile hit {:.1} m prop {:?} surface {} damage {} destroyed {}", sim.frames, gun.row, imp.distance_m, imp.prop, imp.surface, imp.damage, imp.destroyed);
+                crate::gunfx_hook::on_impact(gun, &imp);
+                crate::gunfx_hook::projectile_end(*key, gun, Some((imp.pos, imp.surface == fn_hitreg::shoot::SURFACE_PLAYER)));
                 if let Ok(mut q) = IMPACTS.lock() { q.push((*g, imp)); }
                 done.push(i);
-            } else if p.dead() { done.push(i); }
+            } else if p.dead() { crate::gunfx_hook::projectile_end(*key, gun, None); done.push(i); }
         }
         for i in done.into_iter().rev() { s.flying.swap_remove(i); }
     }
+    for (_, p, key) in &s.flying { crate::gunfx_hook::projectile_move(*key, p.pos, p.vel); }
     // RETICLE HOOK: SFortReticle reads heat * multiplier of the held weapon (after this frame's fire calls added their heat)
     if let Ok(mut r) = RETICLE_SPREAD.lock() { *r = held.map_or(0., |g| s.spread[g].heat * s.spread[g].mult); }
     // RECOIL HOOK: UpdateRecoil (vtable +0x760, RVA 0x936200) of the HELD firearm adds its step to the look delta; sim.begin_frame applies the delta to the view

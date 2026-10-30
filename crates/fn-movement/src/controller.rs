@@ -102,13 +102,15 @@ pub struct Controller {
     cmc: Cmc,
     exported: Exported,
     jump_key_prev: bool,
+    pub enhanced: Option<crate::enhanced::Enhanced>,
+    pub ext_block: Option<&'static str>,
     /// PERF (2026-10-08): the `hulls` list `cmc.scene.hulls` was last converted from (see `step`).
     hulls_cm_src: Vec<fn_hull::Hull>,
 }
 impl Default for Controller {
     fn default() -> Self {
         Controller { position: Vec2::ZERO, velocity: Vec2::ZERO, height: 0., vertical_speed: 0., crouched: false, wants_crouch: false, running: false, facing: 0., actor_yaw: None, turning: false, blockers: vec![], hulls: vec![], terrain: None,
-            cmc: Cmc::new(Params::default(), Scene::default(), Vec3::ZERO), exported: Exported::default(), jump_key_prev: false, hulls_cm_src: vec![] }
+            cmc: Cmc::new(Params::default(), Scene::default(), Vec3::ZERO), exported: Exported::default(), jump_key_prev: false, enhanced: None, ext_block: None, hulls_cm_src: vec![] }
     }
 }
 impl Controller {
@@ -135,6 +137,15 @@ impl Controller {
     /// `jump` (the key state of THIS frame) is a fresh press: true on the rising edge, before `step` consumes it.
     pub fn jump_edge(&self, jump: bool) -> bool { jump && !self.jump_key_prev }
     /// Read access to the movement component (tests, `--movement-test` logging).
+    pub fn launch(&mut self, launch_cm: glam::Vec3, xy_override: bool, z_override: bool) -> glam::Vec3 {
+        let cur = self.cmc.velocity;
+        let mut v = launch_cm;
+        if !xy_override { v.x += cur.x; v.y += cur.y; }
+        if !z_override { v.z += cur.z; }
+        self.cmc.launch(v);
+        v
+    }
+    pub fn velocity_cm(&self) -> glam::Vec3 { self.cmc.velocity }
     pub fn component(&self) -> &Cmc { &self.cmc }
     pub fn component_mut(&mut self) -> &mut Cmc { &mut self.cmc }
     /// Number of jumps the component has started (`DoJump` succeeded) since creation.
@@ -164,10 +175,39 @@ impl Controller {
         let f = self.actor_yaw.unwrap_or(self.facing).to_radians(); self.cmc.facing = Vec3::new(f.sin(), -f.cos(), 0.);
         // ASSUMED input layer (not engine code): a jump press whose crouch REQUEST is already off (key released / toggle cancelled on this very press) stands the capsule up
         // first. UE4.16 `CanJumpInternal` refuses while `bIsCrouched` (Character.cpp:265) and `CheckJumpInput` runs before `PerformMovement` un-crouches, so without this the press would be lost.
-        if jump && !self.jump_key_prev && !(self.cmc.p.jump_release_ignored && self.cmc.is_falling()) { if !self.cmc.p.jump_input_1p8 && self.cmc.is_crouched && !self.cmc.wants_crouch { self.cmc.un_crouch(); } self.cmc.jump(); }
+        let mut jump_consumed = false;
+        let mut clamber_pos = None;
+        let mut hurdle_pos = None;
+        let jump_edge = jump && !self.jump_key_prev;
+        if let Some(e) = self.enhanced.as_mut() {
+            let busy = e.hurdle.is_moving() || e.clamber.is_moving();
+            if e.slider.update(&mut self.cmc, self.wants_crouch, jump_edge, self.ext_block.is_some() || busy, dt) { self.cmc.un_crouch(); }
+            if self.cmc.is_sliding() { self.cmc.wants_crouch = true; } else if e.slider.stand_until_release { self.cmc.wants_crouch = false; }
+            if jump_edge && e.hurdle.try_start(&self.cmc, e.tac.active()) { jump_consumed = true; }
+            else if jump_edge { e.clamber.press(); }
+            if !jump_consumed { jump_consumed = e.clamber.try_start(&self.cmc); }
+            hurdle_pos = e.hurdle.advance(dt);
+            clamber_pos = e.clamber.advance(dt);
+            let jumped = self.cmc.jumped != e.last_jumps;
+            e.last_jumps = self.cmc.jumped;
+            let v = self.cmc.velocity;
+            let ti = crate::enhanced::TacInput { wants: run, sprint_style: run && (!self.cmc.is_crouched || self.cmc.is_sliding()) && input.length_squared() > 0., grounded: self.cmc.is_moving_on_ground() || hurdle_pos.is_some(), falling: self.cmc.is_falling() && hurdle_pos.is_none(), jumped,
+                speed_2d: hurdle_pos.map_or(Vec2::new(v.x, v.y).length(), |(p, _, _)| Vec2::new(p.x - self.cmc.loc.x, p.y - self.cmc.loc.y).length() / dt.max(1e-4)), blocked: self.ext_block.or(if clamber_pos.is_some() { Some("clambering") } else { None }), toggle: e.sprint_toggle };
+            e.tac.tick(&ti, dt);
+            e.tac_shake.tick(e.tac.phase == crate::enhanced::TacPhase::Active && !self.cmc.is_sliding(), dt);
+            self.cmc.ext = e.tac.multipliers();
+        } else {
+            if self.cmc.ext != crate::enhanced::ExtMultipliers::default() { self.cmc.ext = crate::enhanced::ExtMultipliers::default(); }
+            if self.cmc.slide.is_some() { self.cmc.slide = None; }
+        }
+        if jump_edge && !jump_consumed && clamber_pos.is_none() && hurdle_pos.is_none() && !(self.cmc.p.jump_release_ignored && self.cmc.is_falling()) { if !self.cmc.p.jump_input_1p8 && self.cmc.is_crouched && !self.cmc.wants_crouch { self.cmc.un_crouch(); } self.cmc.jump(); }
         if !jump && self.jump_key_prev && !self.cmc.p.jump_release_ignored { self.cmc.stop_jumping(); }
         self.jump_key_prev = jump;
-        self.cmc.tick(input, dt);
+        match (hurdle_pos, clamber_pos) {
+            (Some((p, done, v)), _) => { self.cmc.clamber_move(p); if done { self.cmc.clamber_finish(); self.cmc.velocity = v; } }
+            (None, Some((p, done, v))) => { self.cmc.clamber_move(p); if done { self.cmc.clamber_finish(); self.cmc.velocity = v; } }
+            (None, None) => self.cmc.tick(input, dt),
+        }
         self.running = run && !self.cmc.is_crouched && input.length_squared() > 0.;
         self.export();
     }

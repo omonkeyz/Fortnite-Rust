@@ -42,6 +42,7 @@ struct Inner {
     cues_ready: bool,
     loading_mix: Option<SoundMix>,
     suppress_mix: Option<SoundMix>,
+    killed_mix: Option<SoundMix>,
     /// A `set_music` request not carried out yet (`want` is its value; `None` = fade out).
     pending: bool,
     want: Option<MusicCue>,
@@ -66,6 +67,10 @@ impl MusicState {
         i.want = track;
         i.pending = true;
         i.apply(h);
+    }
+    pub(crate) fn push_killed(&self, h: &EngineHandle) {
+        let i = self.lock();
+        if let Some(m) = &i.killed_mix { h.pop_mix(&m.name); h.push_mix(m.clone()); }
     }
     pub(crate) fn set_loading_screen(&self, h: &EngineHandle, on: bool) {
         let mut i = self.lock();
@@ -142,11 +147,12 @@ impl SinkLoader {
                 None
             }
         };
-        let (loading, suppress) = (mix(lib, data::LOADING_MIX), mix(lib, data::MENU_SUPPRESS_MIX));
+        let (loading, suppress, killed) = (mix(lib, data::LOADING_MIX), mix(lib, data::MENU_SUPPRESS_MIX), mix(lib, data::PLAYER_KILLED_MIX));
         {
             let mut i = self.shared.music.lock();
             i.loading_mix = loading;
             i.suppress_mix = suppress;
+            i.killed_mix = killed;
             i.mixes_ready = true;
             i.apply_loading(&self.handle);
         }
@@ -172,6 +178,9 @@ impl EngineSink {
         self.shared.music.set_music(&self.handle, track);
     }
     /// The loading-screen sound mix on / off.
+    pub fn push_player_killed_mix(&self) {
+        self.shared.music.push_killed(&self.handle);
+    }
     pub fn set_loading_mix(&self, on: bool) {
         self.shared.music.set_loading_screen(&self.handle, on);
     }

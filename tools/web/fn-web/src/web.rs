@@ -30,9 +30,61 @@ pub fn window_attributes(mut a: winit::window::WindowAttributes) -> winit::windo
 }
 
 /// The start-up flow entered a stage (`Splash`, `StartupLoading`, `GamePicker`, `Loading`, `Finishing`, `Playing`): tell the page.
+pub fn heap_reserve_step() {
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    let target = *TARGET.get_or_init(|| std::env::var("FNWEB_HEAP_RESERVE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2880).min(2944) << 20);
+    if !fn_web_rt::mem::reserve_step(target, 64 << 20) {
+        DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        fn_web_rt::mem::deny_main_grow();
+        let tags = std::env::var("FNWEB_HITCH_TAGS").is_ok_and(|v| v == "1");
+        let _ = std::thread::Builder::new().name("heap headroom".into()).spawn(move || { let mut denied = 0; let mut tick = 0u32; loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            tick += 1;
+            if tags && tick % 25 == 0 { eprintln!("{}", fn_web_rt::mem::mem_map()); }
+            let d = fn_web_rt::mem::GROW_DENIED.load(std::sync::atomic::Ordering::Relaxed);
+            let below = ((core::arch::wasm32::memory_size(0) as u64) << 16) < (2944u64 << 20);
+            if fn_web_rt::mem::ensure_headroom(16 << 20, if below || d != denied { 16 << 20 } else { 0 }) { let (free, largest) = fn_web_rt::mem::arena_free(); eprintln!("[heap] headroom grow: wasm {} MB, arena free {} MB (largest {} MB)", ((core::arch::wasm32::memory_size(0) as u64) << 16) >> 20, free >> 20, largest >> 20); }
+            denied = d;
+        } });
+        let (free, largest) = fn_web_rt::mem::arena_free();
+        eprintln!("[heap] reserve done: wasm {} MB (target {} MB), arena free {} MB (largest {} MB), {:.0} ms growing", ((core::arch::wasm32::memory_size(0) as u64) << 16) >> 20, target >> 20, free >> 20, largest >> 20, fn_web_rt::mem::RESERVE_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.);
+    }
+}
+
 pub fn stage(name: &str) {
+    static PRELOAD: std::sync::Once = std::sync::Once::new();
+    if name == "Loading" { fn_render::fx::pso_prefetch(); }
+    if name == "StartupLoading" { start_ui_warm(); }
+    if name == "Lobby" { fn_web_rt::vfs::prefetch_bundles(["particles-pickup", "props", "particles-hurt", "particles-footfx", "particles-healfx", "particles-chests", "particles-elimfx", "particles-muzzle", "particles", "particles-building", "particles-rockets", "particles-traps", "particles-gunfx"].iter().map(|s| s.to_string()).collect()); }
+    filewarm(name);
+    if name == "GamePicker" && std::env::var("FNWEB_MATWARM").map_or(true, |v| v != "0") {
+        PRELOAD.call_once(|| {
+            let paths: Vec<String> = include_str!("../matwarm.txt").lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+            eprintln!("[matwarm] preloading {} materials on workers", paths.len());
+            fn_fx::material::preload(std::path::PathBuf::from("/fn/paks"), paths, 3);
+        });
+    }
     let f = js_sys::Reflect::get(&js_sys::global(), &"__fnweb_phase".into()).ok().and_then(|f| f.dyn_into::<js_sys::Function>().ok());
     if let Some(f) = f { let _ = f.call1(&JsValue::NULL, &format!("stage:{name}").into()); }
+}
+
+fn filewarm(name: &str) {
+    if std::env::var("FNWEB_FILEWARM").map_or(true, |v| v != "0") {
+        let groups: &[&str] = match name { "Splash" => &["StartupLoading"], "StartupLoading" => &["LoggingIn"], "LoggingIn" => &["GamePicker", "Lobby"], "Lobby" => &["Loading", "Finishing"], "Playing" => { fn_web_rt::vfs::prefetch_drop(); &["Play"] } _ => &[] };
+        let list: Vec<(String, u64, usize)> = include_str!("../filewarm.txt").lines().filter_map(|l| { let mut it = l.split('\t'); let (g, p, o, n) = (it.next()?, it.next()?, it.next()?, it.next()?); groups.contains(&g).then(|| Some((p.to_owned(), o.parse().ok()?, n.trim().parse().ok()?))).flatten() }).collect();
+        let keep: Vec<(String, u64, usize)> = include_str!("../filewarm.txt").lines().filter_map(|l| { let mut it = l.split('\t'); let (g, p, o, n, k) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?); (groups.contains(&g) && k.trim() == "k").then(|| Some((p.to_owned(), o.parse().ok()?, n.trim().parse().ok()?))).flatten() }).collect();
+        if !keep.is_empty() { fn_web_rt::vfs::prefetch_keep(keep); }
+        if !list.is_empty() { eprintln!("[filewarm] {name}: prefetching {} reads ({:.1} MB)", list.len(), list.iter().map(|x| x.2).sum::<usize>() as f64 / 1048576.); fn_web_rt::vfs::prefetch(list, 3); }
+    }
+}
+
+fn start_ui_warm() {
+    static PKGWARM: std::sync::Once = std::sync::Once::new();
+    if std::env::var("FNWEB_PKGWARM").map_or(true, |v| v != "0") { PKGWARM.call_once(|| { let list: Vec<String> = include_str!("../pkgwarm.txt").lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect(); if !list.is_empty() { eprintln!("[pkgwarm] preloading {} UI packages", list.len()); fn_ui::screens::athena_lobby::store::preload(std::path::PathBuf::from("/fn/paks"), list, 2); } }); }
+    static PAKIDX: std::sync::Once = std::sync::Once::new();
+    { PAKIDX.call_once(|| { let _ = std::thread::Builder::new().name("pak name index".into()).spawn(|| { if let Ok(s) = fn_pak::PakSet::open_install("/fn/paks") { let _ = s.by_file_name("fnweb.uasset"); } }); }); }
 }
 
 /// The game's event loop ended (Quit, Esc on a start-up screen, or a failure): tell the page.
@@ -56,6 +108,8 @@ fn page_fatal(text: &str) {
 /// Entry of the browser build (called once by the page after the worker pool is up). `args` is the native command line without the program name.
 #[wasm_bindgen]
 pub async fn fnweb_game_main(args: Vec<String>) -> Result<(), JsValue> {
+    let _ = fn_fx::material::IS_MAIN_THREAD.set(fn_web_rt::is_main_thread);
+    let _ = fn_ui::screens::athena_lobby::store::IS_MAIN_THREAD.set(fn_web_rt::is_main_thread);
     // panics: std's message (stderr -> console) plus the page's error overlay
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -72,6 +126,7 @@ pub async fn fnweb_game_main(args: Vec<String>) -> Result<(), JsValue> {
     // every "default install" fallback of the game honours FN_ROOT: point them at the launcher's paks folder
     fn_web_rt::env::set("FN_ROOT", Some("/fn/paks"));
     let url_env = fn_web_rt::env::import_url_params();
+    fn_web_rt::mem::main_heap_init(fn_web_rt::env::get("FNWEB_MAIN_HEAP_MB").and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) << 20);
     eprintln!("[web] fortnite-web {} starting: args {args:?}, url options {url_env:?}", env!("CARGO_PKG_VERSION"));
 
     // 1. the canvas
@@ -87,6 +142,19 @@ pub async fn fnweb_game_main(args: Vec<String>) -> Result<(), JsValue> {
     canvas.set_height(ch as u32);
     CANVAS.with(|c| *c.borrow_mut() = Some(canvas.clone()));
 
+    let args = crate::audio::strip_cli(args);
+    let opts = crate::cli::parse(&args).map_err(|e| { let m = format!("bad options: {e}"); page_fatal(&m); m })?;
+    crate::diag::set_dialogs(false);
+    let opts = crate::paths::apply_defaults(opts, &crate::assets::exe_dir(), &crate::paths::Known::developer());
+    crate::check_options(&opts).map_err(|e| { page_fatal(&e); e })?;
+    let run = crate::build_run(&opts).map_err(|e| { page_fatal(&e); e })?;
+    let (roots, source) = crate::resolve(&opts).map_err(|e| { let m = e.text().to_owned(); page_fatal(&m); m })?;
+    eprintln!("[assets] roots: {:?}  source: {}", roots.roots, match &source { crate::loader::Source::Dir => "asset tree (glTF + md5anim)".to_owned(), crate::loader::Source::Paks(p) => format!("paks {}", p.display()) });
+    { let r = roots.roots.clone(); let _ = std::thread::Builder::new().name("font warm".into()).spawn(move || fn_ui::text::warm_fonts(crate::assets::AssetRoots::open(r).ui_source().as_ref())); }
+    crate::check_settings_file(&opts);
+    start_ui_warm();
+    filewarm("Splash");
+
     // 2. WebGPU: adapter + device awaited on the main thread
     page_status("requesting the WebGPU device");
     let instance = fn_render::Gpu::create_instance();
@@ -98,15 +166,6 @@ pub async fn fnweb_game_main(args: Vec<String>) -> Result<(), JsValue> {
 
     // 3. the native start-up (main.rs run_main without the process / console parts)
     page_status("starting the game");
-    let args = crate::audio::strip_cli(args);
-    let opts = crate::cli::parse(&args).map_err(|e| { let m = format!("bad options: {e}"); page_fatal(&m); m })?;
-    crate::diag::set_dialogs(false);
-    let opts = crate::paths::apply_defaults(opts, &crate::assets::exe_dir(), &crate::paths::Known::developer());
-    crate::check_options(&opts).map_err(|e| { page_fatal(&e); e })?;
-    let run = crate::build_run(&opts).map_err(|e| { page_fatal(&e); e })?;
-    let (roots, source) = crate::resolve(&opts).map_err(|e| { let m = e.text().to_owned(); page_fatal(&m); m })?;
-    eprintln!("[assets] roots: {:?}  source: {}", roots.roots, match &source { crate::loader::Source::Dir => "asset tree (glTF + md5anim)".to_owned(), crate::loader::Source::Paks(p) => format!("paks {}", p.display()) });
-    crate::check_settings_file(&opts);
     let _ = std::thread::Builder::new().name("webtex index".into()).spawn(fn_fx::webtex::warm);
     let event_loop = winit::event_loop::EventLoop::new().map_err(|e| format!("cannot start the event loop: {e}"))?;
     let app = crate::app::App::new(opts, roots, source, run);

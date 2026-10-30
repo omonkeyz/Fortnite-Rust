@@ -25,11 +25,11 @@ class Client {
   close() { try { this.ws.close(); } catch (_) {} }
 }
 
-function state(seq, tms, x, y, z, vx = 0, vy = 0, vz = 0) {
+function state(seq, tms, x, y, z, vx = 0, vy = 0, vz = 0, flags = 0) {
   const b = new Uint8Array(45); const v = new DataView(b.buffer);
   b[0] = 0x01; v.setUint32(1, seq, true); v.setUint32(5, tms, true);
   [x, y, z, vx, vy, vz, 90, 0].forEach((f, i) => v.setFloat32(9 + i * 4, f, true));
-  v.setUint16(41, 0, true); b[43] = 1; b[44] = 0;
+  v.setUint16(41, flags, true); b[43] = 1; b[44] = 0;
   return b;
 }
 function fire(seq, weapon) {
@@ -92,6 +92,30 @@ async function main() {
   const lob = await h.until((x) => [...x.texts].reverse().find((m) => m.t === 'lobby' && m.players.length === 2));
   ok(!!lob, 'host sees lobby with 2 players');
   ok(!JSON.stringify(lob).includes('token'), 'lobby list leaks no tokens');
+  {
+    const HTTP = BASE.replace(/^ws/, 'http');
+    const pk = await fetch(HTTP + '/peek/' + w.code, { headers: { Origin: ORIGIN } });
+    const pj = await pk.json().catch(() => null);
+    ok(pk.status === 200 && pk.headers.get('access-control-allow-origin') === ORIGIN && pj && pj.open === true && pj.leader === 'HostPlayer' && pj.size === 2 && !JSON.stringify(pj).includes('token'), 'peek shows the open party, its leader and size (CORS for the page)');
+    const pn = await fetch(HTTP + '/peek/ZZZZZZ', { headers: { Origin: ORIGIN } }).then((r) => r.json()).catch(() => null);
+    ok(pn && pn.open === false, 'peek of an unknown code is closed');
+    const pb = await fetch(HTTP + '/peek/' + w.code, { headers: { Origin: 'https://evil.example' } });
+    ok(pb.status === 403, 'peek from a foreign origin rejected');
+  }
+  ok(lob.players.every((q) => q.ready === false && q.outfit === ''), 'members start not ready with no outfit');
+  a.send({ t: 'member', ready: true, outfit: '/Game/Athena/Heroes/HID_005_Athena_Commando_M.HID_005_Athena_Commando_M' });
+  const rl = await h.until((x) => [...x.texts].reverse().find((m) => m.t === 'lobby' && m.players.some((q) => q.slot === 1 && q.ready)));
+  ok(rl && rl.players.find((q) => q.slot === 1).outfit.endsWith('HID_005_Athena_Commando_M'), 'member ready + outfit reach the host');
+  const nLobby = h.texts.filter((m) => m.t === 'lobby').length;
+  a.send({ t: 'member', ready: true, outfit: '../../etc/passwd' });
+  await sleep(200);
+  ok(h.texts.filter((m) => m.t === 'lobby').length === nLobby, 'bad outfit path rejected');
+  h.send({ t: 'member', ready: false, playlist: 1 });
+  const pl = await a.until((x) => [...x.texts].reverse().find((m) => m.t === 'lobby' && m.players.some((q) => q.slot === 0 && q.playlist === 1)));
+  ok(!!pl, 'leader playlist reaches members');
+  a.send({ t: 'member', ready: false });
+  const ur = await h.until((x) => x.texts.filter((m) => m.t === 'lobby').slice(nLobby).find((m) => m.players.some((q) => q.slot === 1 && !q.ready)));
+  ok(ur && ur.players.find((q) => q.slot === 1).outfit.endsWith('HID_005_Athena_Commando_M'), 'unready keeps the outfit');
 
   const others = [];
   for (let i = 0; i < 14; i++) others.push(await join(w.code, 'Bot' + i));
@@ -138,7 +162,16 @@ async function main() {
     const w2 = await join(w.code, 'Walker');
     for (let i = 0; i < 30; i++) { w2.send(state(i, i * 50, 80 + i * 0.27, 2, 80)); await sleep(50); }
     ok(!w2.bins.some((b) => b[0] === 0x80), 'sprint speed (5.4 m/s) accepted');
-    r.close(); w2.close();
+    const bus = await join(w.code, 'BusRider');
+    bus.send(state(1, 0, 100, 2, 100)); await sleep(80);
+    bus.send(state(2, 60, 900, 800, -400, 0, 0, 0, 0x8000)); await sleep(80);
+    for (let i = 0; i < 20; i++) { bus.send(state(3 + i, 100 + i * 50, 900 + i * 4, 800 - i * 2, -400, 0, 0, 0, 0x8000)); await sleep(50); }
+    bus.send(state(30, 1200, 980, 30, -400)); await sleep(80);
+    for (let i = 0; i < 10; i++) { bus.send(state(31 + i, 1250 + i * 50, 980 + i * 0.2, 30, -400)); await sleep(50); }
+    ok(!bus.bins.some((b) => b[0] === 0x80), 'bus / skydive states (aerial flag 0x8000): boarding, flight and landing are not corrected');
+    bus.send(state(50, 2000, 1500, 30, -400)); await sleep(150);
+    ok(bus.bins.some((b) => b[0] === 0x80), 'on the ground again the normal teleport check applies');
+    r.close(); w2.close(); bus.close();
   }
   const full0 = await h.until((x) => lastHealth(x, 0));
   ok(full0 && full0.hp === 100 && full0.sh === 0, 'start broadcasts full vitals from the server');
@@ -182,10 +215,10 @@ async function main() {
   h.send(fire(9, 1));
   await sleep(150);
   ok(a.bins.filter((b) => b[0] === 0x02 && b[1] === 0).length === fired, 'a dead player cannot fire');
-  const sp = await h.until((x) => x.bins.find((b) => b[0] === 0x43 && b[2] === 0), 7000);
-  ok(!!sp, 'victim respawns after 5 s (SPAWN from the server)');
-  const back = await h.until((x) => { const v = lastHealth(x, 0); return v && !v.dead ? v : null; });
-  ok(back && back.hp === 100 && !back.dead, 'respawn restores 100 health');
+  const sp = await h.until((x) => x.bins.find((b) => b[0] === 0x43 && b[2] === 0), 6500);
+  ok(!sp, 'no respawn: the eliminated player gets no SPAWN within 6.5 s (Battle Royale)');
+  const still = lastHealth(h, 0);
+  ok(still && still.dead && still.hp === 0, 'the eliminated player stays dead');
 
   let relayedFires = 0;
   const before = h.bins.filter((b) => b[0] === 0x02).length;

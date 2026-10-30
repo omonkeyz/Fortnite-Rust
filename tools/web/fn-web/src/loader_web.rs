@@ -37,9 +37,11 @@ pub(super) struct CpuWorld {
 pub(super) enum Msg {
     RendererAssets(Result<RendererAssets, String>),
     Foliage(Option<FoliageCpu>),
-    Backdrop(Option<Result<fn_render::backdrop::BackdropData, String>>),
+    Backdrop(Option<Result<(fn_render::backdrop::BackdropData, fn_render::backdrop::BackdropPrep), String>>),
     World(Result<CpuWorld, String>),
 }
+
+const DEFERRED_BYTES_PER_FRAME: usize = 16 << 20;
 
 /// The main-thread side of the world load.
 pub(super) struct WorldBuild {
@@ -61,7 +63,7 @@ pub(super) struct WorldBuild {
     skipped: Vec<(String, String)>,
     foliage: Option<Option<FoliageCpu>>,
     grass: Option<Option<crate::foliage::Grass>>,
-    backdrop: Option<Option<Result<fn_render::backdrop::BackdropData, String>>>,
+    backdrop: Option<Option<Result<(fn_render::backdrop::BackdropData, fn_render::backdrop::BackdropPrep), String>>>,
     backdrop_applied: bool,
     world: Option<CpuWorld>,
     finished: bool,
@@ -93,6 +95,7 @@ impl WorldBuild {
     pub(super) fn step(&mut self, budget: Duration) {
         if self.finished { return; }
         let t0 = Instant::now();
+        if self.backdrop_applied && !fn_render::texture::pump_deferred(&self.queue, DEFERRED_BYTES_PER_FRAME) { return; }
         loop {
             match self.rx.try_recv() {
                 Ok(Msg::RendererAssets(Ok(a))) => self.assets = Some(a),
@@ -167,14 +170,14 @@ impl WorldBuild {
         if !self.backdrop_applied {
             let Some(b) = self.backdrop.take() else { return };
             match b {
-                Some(Ok(d)) => { crate::storm_hook::set_ground_ref(d.ground_ref_cm); renderer.set_backdrop(&d) }
+                Some(Ok((d, prep))) => { crate::storm_hook::set_ground_ref(d.ground_ref_cm); renderer.set_backdrop_prepared(&d, prep) }
                 Some(Err(e)) => eprintln!("[backdrop] {e}: no landscape / ocean"),
                 None => {}
             }
             self.backdrop_applied = true;
             return;
         }
-        // 5. the scene (character upload) once the workers delivered everything
+        if !fn_render::texture::pump_deferred(&self.queue, DEFERRED_BYTES_PER_FRAME) { return; }
         let Some(w) = self.world.take() else { return };
         let renderer = self.renderer.take().expect("checked");
         match assemble(renderer, w, &self.progress, &self.plan, self.lib.take(), std::mem::take(&mut self.meshes), std::mem::take(&mut self.skipped), self.grass.take().flatten()) {
@@ -222,7 +225,8 @@ fn cpu_world(source: Source, roots: Arc<AssetRoots>, clip_names: Vec<String>, pr
     let loadout = if let Some(set) = &paks {
         let i = plan.loadout.ok_or("no starter loadout progress unit")?;
         p.begin(i);
-        let resources = fn_pose::loadout::Resources::load(&ClipSourceDir::Pak(set))?;
+        let mut resources = fn_pose::loadout::Resources::load(&ClipSourceDir::Pak(set))?;
+        crate::emote_hook::absorb(set, &mut resources);
         eprintln!("[loadout] loaded {} original item definitions, {} role bindings, {} montages, {} composites, {} sequences", resources.items.len(), resources.bindings.len(), resources.montages.len(), resources.composites.len(), resources.sequences.len());
         p.end(i);
         Some(resources)
@@ -277,7 +281,10 @@ fn cpu_world(source: Source, roots: Arc<AssetRoots>, clip_names: Vec<String>, pr
                     let ground = roots.load_rgba("T_Grasslands_D.png")?;
                     p.end(tex_unit);
                     let sky_dir = roots.find("dome_optimized.bin").and_then(|f| f.parent()).ok_or("Missing asset: dome_optimized.bin")?;
-                    Ok(RendererAssets { sky: SkyAssets::load(sky_dir)?, ground_texture: ground })
+                    let mut sky = SkyAssets::load(sky_dir)?;
+                    sky.prepare_mips();
+                    let ground_mips = Some(fn_render::texture::mip_chain(&ground, true, fn_render::texture::MipFilter::Triangle));
+                    Ok(RendererAssets { sky, ground_texture: ground, ground_mips })
                 })();
                 let _ = tx.send(Msg::RendererAssets(r));
             });
@@ -322,6 +329,7 @@ fn cpu_world(source: Source, roots: Arc<AssetRoots>, clip_names: Vec<String>, pr
     });
     heap("backdrop");
     let ground_ref_cm = backdrop.as_ref().and_then(|r| r.as_ref().ok()).map(|d| d.ground_ref_cm);
+    let backdrop = backdrop.map(|r| r.map(|mut d| { let prep = fn_render::backdrop::prepare(&d); for m in &mut d.meshes { m.verts = Vec::new(); m.indices = Vec::new(); } (d, prep) }));
     let _ = tx.send(Msg::Backdrop(backdrop));
     // POI (native build_world): every POI sublevel's actors (statics_render draws them, streamed; their collision / building data go to the props)
     if let Some(j) = props_job.as_ref().filter(|j| j.poi) {
@@ -351,5 +359,7 @@ fn cpu_world(source: Source, roots: Arc<AssetRoots>, clip_names: Vec<String>, pr
     crate::br_character::take_female_clips(&mut fnclips);
     let clips: Box<dyn ClipLibrary + Send> = match source { Source::Dir => Box::new(md5), Source::Paks(_) => Box::new(fnclips) };
     heap("clips collected");
+    let (mut body, mut head, mut pickp) = (body, head, pickp);
+    for prims in [&mut body, &mut head, &mut pickp] { fn_render::mesh::prepare_mip_chains(prims); }
     Ok(CpuWorld { rig, body, head, pick: pickp, clips, loadout })
 }

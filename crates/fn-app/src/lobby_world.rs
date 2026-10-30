@@ -787,6 +787,7 @@ pub struct LightInst {
     pub cubemap: Option<String>,
     pub cubemap_angle_deg: f32,
     pub lower_hemisphere_color: [f32; 3],
+    pub occlusion_max_distance: f32,
     /// Where the component came from (`level actor`, `blueprint BP_X_C`).
     pub source: String,
 }
@@ -830,6 +831,7 @@ pub struct StaticInst {
     /// `bVisible && !bHiddenInGame && !actor.bHidden`.
     pub visible: bool,
     pub cast_shadow: bool,
+    pub affects_distance_field: bool,
     pub max_draw_distance: f32,
     pub translucency_sort_priority: i32,
     /// `level actor` or `blueprint <BP_X_C>`.
@@ -840,7 +842,7 @@ pub struct StaticInst {
 pub struct ParticleInst { pub actor: String, pub component: String, pub template: Option<String>, pub xf: Xf, pub visible: bool, pub auto_activate: bool }
 
 #[derive(Clone, Debug)]
-pub struct SkeletalInst { pub actor: String, pub mesh: Option<String>, pub xf: Xf, pub materials: Vec<Option<String>>, pub note: String }
+pub struct SkeletalInst { pub actor: String, pub mesh: Option<String>, pub xf: Xf, pub materials: Vec<Option<String>>, pub note: String, pub hidden: bool }
 
 #[derive(Clone, Debug)]
 pub struct CameraInfo {
@@ -963,6 +965,73 @@ pub struct LobbySceneData {
     pub item_preview: Option<Xf>,
     /// Non-lobby views: the `MaterialCollection0` uniform buffer of the view's materials (`read_mpc_defaults`); empty = none.
     pub mpc: Vec<[f32; 4]>,
+    pub matinee: Option<MatineeInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CurvePoint { pub t: f32, pub v: Vec3, pub arrive: Vec3, pub leave: Vec3, pub mode: String }
+
+#[derive(Clone, Debug)]
+pub struct MatineeAnimKey { pub start: f32, pub seq: String, pub start_offset: f32, pub end_offset: f32, pub rate: f32, pub looping: bool, pub reverse: bool }
+
+#[derive(Clone, Debug, Default)]
+pub struct MatineeGroup { pub name: String, pub actor: String, pub pos: Vec<CurvePoint>, pub euler: Vec<CurvePoint>, pub anims: Vec<MatineeAnimKey>, pub vis: Vec<(f32, bool)> }
+
+#[derive(Clone, Debug, Default)]
+pub struct MatineeInfo { pub actor: String, pub length: f32, pub looping: bool, pub play_on_load: bool, pub groups: Vec<MatineeGroup> }
+
+pub fn eval_interp_curve(pts: &[CurvePoint], t: f32) -> Option<Vec3> {
+    let first = pts.first()?;
+    if pts.len() == 1 || t <= first.t { return Some(first.v); }
+    let last = pts.last()?;
+    if t >= last.t { return Some(last.v); }
+    let i = pts.iter().rposition(|p| p.t <= t).unwrap_or(0).min(pts.len() - 2);
+    let (a, b) = (&pts[i], &pts[i + 1]);
+    let diff = b.t - a.t;
+    if diff <= 0.0 { return Some(b.v); }
+    let alpha = (t - a.t) / diff;
+    Some(match a.mode.as_str() {
+        "CIM_Constant" => a.v,
+        "CIM_Linear" => a.v.lerp(b.v, alpha),
+        _ => {
+            let (p0, t0, p1, t1) = (a.v, a.leave * diff, b.v, b.arrive * diff);
+            let (a2, a3) = (alpha * alpha, alpha * alpha * alpha);
+            p0 * (2.0 * a3 - 3.0 * a2 + 1.0) + t0 * (a3 - 2.0 * a2 + alpha) + t1 * (a3 - a2) + p1 * (-2.0 * a3 + 3.0 * a2)
+        }
+    })
+}
+
+impl MatineeInfo {
+    pub fn position(&self, scene_t: f32) -> f32 {
+        if self.length <= 0.0 { return 0.0; }
+        if self.looping { scene_t.rem_euclid(self.length) } else { scene_t.min(self.length) }
+    }
+}
+
+impl MatineeGroup {
+    pub fn transform(&self, t: f32) -> Option<(Vec3, [f32; 3])> {
+        let p = eval_interp_curve(&self.pos, t)?;
+        let e = eval_interp_curve(&self.euler, t).unwrap_or(Vec3::ZERO);
+        Some((p, [e.y, e.z, e.x]))
+    }
+    pub fn anim(&self, t: f32, length_of: impl Fn(&str) -> Option<f32>) -> Option<(&str, f32)> {
+        let i = self.anims.iter().rposition(|k| k.start <= t);
+        let k = match i { Some(i) => &self.anims[i], None => { let k = self.anims.first()?; return Some((&k.seq, k.start_offset)); } };
+        let len = length_of(&k.seq)?;
+        let end = (len - k.end_offset).max(k.start_offset);
+        let span = (end - k.start_offset).max(0.0);
+        let mut local = (t - k.start) * k.rate;
+        if k.looping && span > 0.0 { local = local.rem_euclid(span); } else { local = local.clamp(0.0, span); }
+        let at = if k.reverse { end - local } else { k.start_offset + local };
+        Some((&k.seq, at))
+    }
+    pub fn visible(&self, t: f32, first_loop: bool, initially_hidden: bool) -> bool {
+        match self.vis.iter().rev().find(|(kt, _)| *kt <= t) {
+            Some((_, show)) => *show,
+            None if first_loop || self.vis.is_empty() => !initially_hidden,
+            None => self.vis.last().map_or(!initially_hidden, |(_, show)| *show),
+        }
+    }
 }
 
 /// Actor property helper: the actor's own merged class defaults and instance values.
@@ -1136,6 +1205,7 @@ impl<'a> MapReader<'a> {
             cubemap: self.view.soft_or_hard_path(p.get("Cubemap")),
             cubemap_angle_deg: pv_f32(p, "SourceCubemapAngle").unwrap_or(0.),
             lower_hemisphere_color: pv_vec4(p, "LowerHemisphereColor").map(|c| [c[0], c[1], c[2]]).unwrap_or([0., 0., 0.]),
+            occlusion_max_distance: pv_f32(p, "OcclusionMaxDistance").unwrap_or(d.class1(sky, "OcclusionMaxDistance")),
             source: match &actor.class_path { Some(c) if c.starts_with("/Game/") => format!("blueprint {}", c.rsplit('.').next().unwrap_or(c)), _ => "level actor".into() },
         }
     }
@@ -1187,6 +1257,7 @@ impl<'a> MapReader<'a> {
                         actor: actor.name.clone(), component: cname, export: c, mesh, xf: self.world_xf(c), material_overrides: materials,
                         visible: self.comp_visible(&p, &actor),
                         cast_shadow: p.bool("CastShadow").unwrap_or(true) && p.bool("bCastDynamicShadow").unwrap_or(true),
+                        affects_distance_field: p.bool("bAffectDistanceFieldLighting").unwrap_or(true),
                         max_draw_distance: pv_f32(&p, "LDMaxDrawDistance").or(pv_f32(&p, "CachedMaxDrawDistance")).unwrap_or(0.),
                         translucency_sort_priority: p.int("TranslucencySortPriority").unwrap_or(0) as i32,
                         source: source.clone(),
@@ -1205,7 +1276,7 @@ impl<'a> MapReader<'a> {
                 "SkeletalMeshComponent" => out.skeletals.push(SkeletalInst {
                     actor: actor.name.clone(), mesh: self.view.soft_or_hard_path(p.get("SkeletalMesh")), xf: self.world_xf(c),
                     materials: paths_of_array(&self.view, p.get("OverrideMaterials")),
-                    note: "driven by MatineeActor_Halloween (InterpData_0, 120.25 s loop, bPlayOnLevelLoad): not played".into(),
+                    note: "driven by MatineeActor_Halloween (InterpData_0, 120.25 s loop, bPlayOnLevelLoad)".into(), hidden: actor.hidden,
                 }),
                 "WidgetComponent" => out.unrendered.push((class, tag, "UMG world widget (pad gadgets / add-player); belongs to the UI half".into())),
                 "TextRenderComponent" | "AudioComponent" | "ArrowComponent" | "BillboardComponent" | "BrushComponent" | "BoxComponent" | "TimelineComponent" => {}
@@ -1257,7 +1328,8 @@ impl<'a> MapReader<'a> {
             out.statics.push(StaticInst {
                 actor: actor.name.clone(), component: format!("{}[{k}]", self.view.name(c)), export: c, mesh: mesh.clone(),
                 xf: Xf { s, q, t }.compose(&parent), material_overrides: materials.clone(), visible,
-                cast_shadow: p.bool("CastShadow").unwrap_or(true), max_draw_distance: pv_f32(p, "LDMaxDrawDistance").unwrap_or(0.), translucency_sort_priority: 0,
+                cast_shadow: p.bool("CastShadow").unwrap_or(true) && p.bool("bCastDynamicShadow").unwrap_or(true), affects_distance_field: p.bool("bAffectDistanceFieldLighting").unwrap_or(true),
+                max_draw_distance: pv_f32(p, "LDMaxDrawDistance").unwrap_or(0.), translucency_sort_priority: 0,
                 source: format!("{source} (instanced foliage)"),
             });
         }
@@ -1287,6 +1359,77 @@ impl<'a> MapReader<'a> {
             for f in out.fogs.iter_mut() { if on.contains(&f.actor) { f.visible = true; } }
             for pt in out.particles.iter_mut() { if particles.contains(&pt.actor) { pt.visible = true; } }
         }
+    }
+
+    fn read_matinee(&self, out: &mut LobbySceneData) {
+        let Some(m) = (0..self.view.n()).find(|&i| self.view.class(i) == "MatineeActor") else { return };
+        let p = self.view.props(m);
+        let Some(data) = self.view.export_of(p.get("MatineeData")) else { out.missing.push(format!("{}: no MatineeData", self.view.name(m))); return };
+        let dp = self.view.props(data);
+        let mut info = MatineeInfo { actor: self.view.name(m).to_owned(), length: pv_f32(&dp, "InterpLength").unwrap_or(0.0), looping: p.bool("bLooping").unwrap_or(false), play_on_load: p.bool("bPlayOnLevelLoad").unwrap_or(false), groups: vec![] };
+        let actors: Vec<(String, String)> = match p.get("GroupActorInfos") {
+            Some(PropValue::Array(v)) => v.iter().filter_map(|e| match e {
+                PropValue::Struct { fields, .. } => {
+                    let g = fields.text("ObjectName")?.to_owned();
+                    let a = match fields.get("Actors") { Some(PropValue::Array(a)) => a.first().and_then(|o| self.view.export_of(Some(o))).map(|i| self.view.name(i).to_owned()), _ => None }?;
+                    Some((g, a))
+                }
+                _ => None,
+            }).collect(),
+            _ => vec![],
+        };
+        let curve = |v: Option<&PropValue>| -> Vec<CurvePoint> {
+            let Some(PropValue::Struct { fields, .. }) = v else { return vec![] };
+            let Some(PropValue::Array(pts)) = fields.get("Points") else { return vec![] };
+            pts.iter().filter_map(|pt| match pt {
+                PropValue::Struct { fields: f, .. } => {
+                    let v3 = |k: &str| match f.get(k) { Some(PropValue::Vec3(v)) => Vec3::from(*v), _ => Vec3::ZERO };
+                    Some(CurvePoint { t: pv_f32(f, "InVal").unwrap_or(0.0), v: v3("OutVal"), arrive: v3("ArriveTangent"), leave: v3("LeaveTangent"), mode: f.text("InterpMode").unwrap_or("CIM_Linear").to_owned() })
+                }
+                _ => None,
+            }).collect()
+        };
+        for gi in object_indices(dp.array("InterpGroups")) {
+            let gp = self.view.props(gi);
+            let gname = self.view.name(gi).to_owned();
+            let Some(actor) = actors.iter().find(|(g, _)| *g == gname).map(|(_, a)| a.clone()) else { out.missing.push(format!("{}: {gname} has no actor", info.actor)); continue };
+            let mut g = MatineeGroup { name: gp.text("GroupName").unwrap_or("").to_owned(), actor, ..Default::default() };
+            for ti in object_indices(gp.array("InterpTracks")) {
+                let tp = self.view.props(ti);
+                match self.view.class(ti).as_str() {
+                    "InterpTrackMove" => {
+                        for k in ["MoveFrame", "RotMode"] { if let Some(v) = tp.text(k) { out.missing.push(format!("{}: {} {k} = {v} (only IMF_World / IMR_Keyframed are evaluated)", info.actor, g.name)); } }
+                        g.pos = curve(tp.get("PosTrack"));
+                        g.euler = curve(tp.get("EulerTrack"));
+                    }
+                    "InterpTrackAnimControl" => {
+                        if let Some(PropValue::Array(keys)) = tp.get("AnimSeqs") {
+                            for k in keys {
+                                let PropValue::Struct { fields: f, .. } = k else { continue };
+                                let Some(seq) = self.view.path_of(f.get("AnimSeq")) else { continue };
+                                g.anims.push(MatineeAnimKey { start: pv_f32(f, "StartTime").unwrap_or(0.0), seq, start_offset: pv_f32(f, "AnimStartOffset").unwrap_or(0.0), end_offset: pv_f32(f, "AnimEndOffset").unwrap_or(0.0), rate: pv_f32(f, "AnimPlayRate").unwrap_or(1.0), looping: f.bool("bLooping").unwrap_or(false), reverse: f.bool("bReverse").unwrap_or(false) });
+                            }
+                        }
+                    }
+                    "InterpTrackVisibility" => {
+                        if let Some(PropValue::Array(keys)) = tp.get("VisibilityTrack") {
+                            for k in keys {
+                                let PropValue::Struct { fields: f, .. } = k else { continue };
+                                let t = pv_f32(f, "Time").unwrap_or(0.0);
+                                match f.text("Action").unwrap_or("EVTA_Hide") {
+                                    "EVTA_Show" => g.vis.push((t, true)),
+                                    "EVTA_Hide" => g.vis.push((t, false)),
+                                    other => out.missing.push(format!("{}: {} visibility action {other} not evaluated", info.actor, g.name)),
+                                }
+                            }
+                        }
+                    }
+                    other => out.missing.push(format!("{}: {} track {other} not evaluated", info.actor, g.name)),
+                }
+            }
+            info.groups.push(g);
+        }
+        out.matinee = Some(info);
     }
 
     fn collect_post_volumes(&self, out: &mut LobbySceneData) {
@@ -1464,6 +1607,7 @@ pub fn read_lobby_scene_from(set: &fn_pak::PakSet) -> Result<LobbySceneData, Str
     // ---- the chosen lobby level (every actor) ----
     let lobby = MapReader::open(set, map, offset_of(map))?;
     for a in lobby.actors() { lobby.collect_actor(a, &mut out); }
+    lobby.read_matinee(&mut out);
     lobby.apply_light_switcher(&mut out);
     lobby.collect_post_volumes(&mut out);
     // ---- the selector level (its post-process volume; its level blueprint has no renderable actor) ----
@@ -1523,6 +1667,7 @@ pub fn read_lobby_scene_from(set: &fn_pak::PakSet) -> Result<LobbySceneData, Str
         }
     }
     out.placements.sort_by_key(|p| p.player_id);
+    add_party_grid(&mut out);
     // PartyCharacterPlacementHelper (OnTeamMemberAdded / RefreshWidgets, the `PlayerOnPad` branch of its graph): a pad with a player sets TopSpotLight,
     // RimSpotLight, UnderlightBluePoint01/02 and UnderlightBlue01/02 visible (and the pad material's Occupied = 1); an empty pad keeps them hidden.
     for p in out.placements.iter().filter(|p| p.player_on_pad) {
@@ -1533,10 +1678,41 @@ pub fn read_lobby_scene_from(set: &fn_pak::PakSet) -> Result<LobbySceneData, Str
 
     // ---- post-process at the camera ----
     out.post = stack_post_settings(&out.post_volumes, cam_pos);
-    if !out.skeletals.is_empty() {
-        out.missing.push(format!("{} Matinee-driven skeletal actors (TrollGhost x3 on M_HalloweenTrollGhost, Taker on M_HalloweenTakerGhosts; InterpData_0 120.25 s loop with Move/AnimControl/Visibility tracks) are listed but not played", out.skeletals.len()));
+    if !out.skeletals.is_empty() && out.matinee.is_none() {
+        out.missing.push(format!("{} skeletal actors without a MatineeActor: not drawn", out.skeletals.len()));
     }
     Ok(out)
+}
+
+pub const GRID_FIRST_ID: i32 = 100;
+pub const GRID_SLOTS: usize = 12;
+pub const GRID_COLUMNS: usize = 4;
+pub const GRID_ROW_Y_CM: [f32; 3] = [125_060.0, 124_915.0, 124_770.0];
+pub const GRID_ROW_RISE_CM: f32 = 34.0;
+pub const GRID_COL_X_CM: [[f32; 4]; 2] = [[-186.0, -66.0, 64.0, 192.0], [-126.0, -6.0, 126.0, 252.0]];
+pub const GRID_CLEAR_CM: f32 = 95.0;
+pub fn is_grid_slot(player_id: i32) -> bool { player_id >= GRID_FIRST_ID }
+pub fn grid_row(player_id: i32) -> usize { ((player_id - GRID_FIRST_ID).max(0) as usize) / GRID_COLUMNS }
+
+fn add_party_grid(out: &mut LobbySceneData) {
+    let mut front: Vec<PlacementInfo> = out.placements.iter().filter(|p| !p.hidden && (0..4).contains(&p.player_id)).cloned().collect();
+    if front.len() != 4 { return; }
+    front.sort_by(|a, b| a.root.t.x.total_cmp(&b.root.t.x));
+    for k in 0..GRID_SLOTS {
+        let (row, col) = (k / GRID_COLUMNS, k % GRID_COLUMNS);
+        let tpl = &front[col];
+        let target = Vec3::new(GRID_COL_X_CM[row % 2][col], GRID_ROW_Y_CM[row], tpl.root.t.z + GRID_ROW_RISE_CM * (row + 1) as f32);
+        let d = target - tpl.root.t;
+        let id = GRID_FIRST_ID + k as i32;
+        let actor = format!("{}#grid{id}", tpl.actor);
+        let mv = |x: &Xf| Xf { t: x.t + d, q: x.q, s: x.s };
+        let statics: Vec<StaticInst> = out.statics.iter().filter(|s| s.actor == tpl.actor).map(|s| { let mut c = s.clone(); c.actor = actor.clone(); c.xf = mv(&s.xf); c }).collect();
+        let lights: Vec<LightInst> = out.lights.iter().filter(|l| l.actor == tpl.actor).map(|l| { let mut c = l.clone(); c.actor = actor.clone(); c.xf = mv(&l.xf); c.visible = false; c }).collect();
+        out.statics.extend(statics);
+        out.lights.extend(lights);
+        out.placements.push(PlacementInfo { actor, player_id: id, hidden: false, player_on_pad: false, root: mv(&tpl.root), character: mv(&tpl.character),
+            top_widget: mv(&tpl.top_widget), add_widget: mv(&tpl.add_widget), gadgets_widget: mv(&tpl.gadgets_widget), top_info: tpl.top_info.clone(), add_info: tpl.add_info.clone() });
+    }
 }
 
 pub fn read_lobby_scene(install: &Path) -> Result<LobbySceneData, String> {
@@ -1547,6 +1723,7 @@ const BG_MAIN_MAP: &str = "/Game/Maps/UI/Frontend_BG_Main";
 /// Radius (cm) around the camera of the `2SegGeoSphere1Unit` backdrop spheres (scale 3000): the backdrop actors of the second copy in `Frontend_BG_Main` (local offset
 /// y -10240, i.e. world y 30720 with the level's +40960) are the ones around the Cosmetics camera; the first copy is 10240 cm away behind the sphere's wall.
 const COSMETICS_ENV_RADIUS_CM: f32 = 5_000.0;
+pub const VAULT_PAWN_MESH_YAW: f32 = -90.0;
 
 /// The scene of the LOCKER (`EFrontEndCamera::Cosmetics`, byte 16 set by `AthenaCustomizationTab::OnActivated`): the camera actor `FrontendCamera_Cosmetics`
 /// (`FrontEndSettingsBP_31.Cameras`), the front-end backdrop around it (the duplicate of `Frontend_BG_Main`'s `GenericBackground` sphere / `S_UI_Backplate` / `S_UI_Sphere` actors placed at the
@@ -1582,12 +1759,20 @@ pub fn read_cosmetics_scene_from(set: &fn_pak::PakSet) -> Result<LobbySceneData,
             "VaultCharacterPlacementHelper_C" => {
                 let (Some(root), Some(place)) = (find("Root"), find("CharacterPlacement")) else { continue };
                 let wi = WidgetCompInfo { widget_class: String::new(), screen_space: true, pivot: [0.5, 0.5], draw_size: [500., 500.], draw_at_desired_size: false };
-                out.placements.push(PlacementInfo { actor: fe.view.name(a).to_owned(), player_id: 0, hidden: false, player_on_pad: false, root: fe.world_xf(root), character: fe.world_xf(place),
+                let pw = fe.world_xf(place);
+                let character = Xf::from_pyr(pw.t.to_array(), [0.0, pw.rotator_deg()[1] + VAULT_PAWN_MESH_YAW, 0.0], [1.0; 3]);
+                out.placements.push(PlacementInfo { actor: fe.view.name(a).to_owned(), player_id: 0, hidden: false, player_on_pad: false, root: fe.world_xf(root), character,
                     top_widget: Xf::IDENTITY, add_widget: Xf::IDENTITY, gadgets_widget: Xf::IDENTITY, top_info: wi.clone(), add_info: wi });
             }
             "VaultWeaponPlacementHelper_C" => { if let Some(place) = find("CharacterPlacement") { out.item_preview = Some(fe.world_xf(place)); } }
             "VaultCharacterLightingBP_C" => fe.collect_actor(a, &mut out),
             _ => {}
+        }
+    }
+    if out.camera.as_ref().is_some_and(|c| c.actor_class.starts_with("FrontendCamera_Manage")) {
+        let low_only = shadow_quality() == 0;
+        for l in out.lights.iter_mut().filter(|l| l.source.contains("VaultCharacterLightingBP")) {
+            l.visible = if l.component == "SkyLightLowSettings" { low_only } else { !low_only };
         }
     }
     if out.placements.is_empty() { return Err("no VaultCharacterPlacementHelper in the persistent level".into()); }
@@ -1804,6 +1989,23 @@ mod tests {
         if root.exists() { Some(root) } else { eprintln!("1.8 install missing: skipped"); None }
     }
     fn scene() -> Option<LobbySceneData> { Some(read_lobby_scene(&install()?).expect("lobby scene")) }
+    #[test]
+    fn halloween_matinee_drives_the_four_ghost_actors() {
+        let Some(d) = scene() else { return };
+        let m = d.matinee.as_ref().expect("MatineeActor_Halloween");
+        assert_eq!(m.actor, "MatineeActor_Halloween");
+        assert!(m.looping && m.play_on_load && near(m.length, 120.24581));
+        let names: Vec<&str> = m.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["TrollGhost", "ghostroll2", "ghosttroll3", "Taker"]);
+        for g in &m.groups { assert!(d.skeletals.iter().any(|k| k.actor == g.actor), "{} -> {} is not a skeletal actor", g.name, g.actor); }
+        let troll = &m.groups[0];
+        let (p, _) = troll.transform(0.05).unwrap();
+        assert!(p.distance(Vec3::new(-193.10884, 125163.5, 4.005684)) < 1e-2);
+        assert!(troll.visible(1.0, true, false) && !troll.visible(9.2, true, false));
+        assert_eq!(troll.anims[0].seq, "/Game/Characters/Enemies/Thief/Animation/jump_out.jump_out");
+        assert!(m.groups[3].visible(100.0, false, true));
+        assert!(!d.missing.iter().any(|x| x.contains("Matinee")), "{:?}", d.missing);
+    }
     fn near(a: f32, b: f32) -> bool { (a - b).abs() < 1e-3 * b.abs().max(1.) }
 
     #[test]

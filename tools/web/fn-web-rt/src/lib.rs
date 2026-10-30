@@ -15,6 +15,7 @@
 //!
 //! Everything is `#[cfg(target_arch = "wasm32")]`: natively this crate is empty.
 #![cfg(target_arch = "wasm32")]
+#![cfg_attr(target_arch = "wasm32", feature(stdarch_wasm_atomic_wait))]
 
 pub mod console;
 pub mod env;

@@ -10,9 +10,17 @@ class_name = "Lobby"
 name = "LIMITER"
 class_name = "Limiter"
 
+[[durable_objects.bindings]]
+name = "MM"
+class_name = "Matchmaker"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Lobby", "Limiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Matchmaker"]
 
 [vars]
 ALLOWED_ORIGINS = "https://fortniteog.lol,https://www.fortniteog.lol,http://127.0.0.1:8780,http://localhost:8780,http://127.0.0.1:8781,http://localhost:8781,http://127.0.0.1:8797,http://localhost:8797"

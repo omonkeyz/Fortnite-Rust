@@ -32,6 +32,7 @@ gltf = "1.4.1"
 bytemuck = { version = "1", features = ["derive"] }
 fn-live = { path = "../../../crates/fn-live" }
 fn-render = { path = "../../../crates/fn-render" }
+fn-postfx = { path = "../../../crates/fn-postfx" }
 fn-terrain = { path = "../../../crates/fn-terrain" }
 fn-hull = { path = "../../../crates/fn-hull" }
 fn-propdata = { path = "../../../crates/fn-propdata" }
@@ -66,6 +67,8 @@ fn-movement = { path = "../../../crates/fn-movement" }
 fn-console = { path = "../../../crates/fn-console" }
 fn-building = { path = "../../../crates/fn-building" }
 fn-net = { path = "../../../crates/fn-net" }
+fn-bots = { path = "../../../crates/fn-bots" }
+fn-nav = { path = "../../../crates/fn-nav" }
 gilrs = { version = "0.11", optional = true }
 # sound: fn-audio-sink's default "device" feature brings in cpal; its WebAudio host needs cpal's `wasm-bindgen` feature (without it cpal's
 # wasm32 host has no output device and the game runs silent). The page resumes the AudioContext on the first click / key (autoplay policy).

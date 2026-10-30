@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(hidden("video", video), vec!["ShowGrass"]);
         let game = &TABS.iter().find(|t| t.id == "game").unwrap().subs[0];
         assert_eq!(hidden("game", game), vec!["SafeZone", "First-PersonCamera", "ShowHeadAccessories", "ShowBackpack"]);
-        assert_eq!(visible_rows("game", game, &c).len(), 20);
+        assert_eq!(visible_rows("game", game, &c).len(), 17);
         let audio = &TABS.iter().find(|t| t.id == "audio").unwrap().subs[0];
         assert!(hidden("audio", audio).is_empty());
         // Save the World shows the grass / first-person / cosmetics rows and drops the controller ADS rows, voice chat and push to talk
